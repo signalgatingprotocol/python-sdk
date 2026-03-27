@@ -1,4 +1,4 @@
-# Signal Gating Protocol — Python SDK
+# Signal Gating Protocol - Python SDK
 
 Agent-native signal orchestration for autonomous AI systems.
 
