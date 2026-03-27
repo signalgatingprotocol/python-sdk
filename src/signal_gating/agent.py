@@ -24,6 +24,50 @@ LifecycleHook = Callable[[], Any]
 logger = logging.getLogger("signal_gating.agent")
 
 
+class AgentContext:
+    """Context passed to signal handlers, providing agent capabilities without closures.
+
+    Instead of closing over the agent variable:
+
+        @worker.on(TaskSignal)
+        async def handle(signal: TaskSignal):
+            await worker.emit(ResultSignal(...))  # requires closure
+
+    Use the context pattern:
+
+        @worker.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext):
+            await ctx.emit(ResultSignal(...))     # no closure needed
+            ctx.state["count"] = ctx.state.get("count", 0) + 1
+    """
+
+    __slots__ = ("_agent", "signal")
+
+    def __init__(self, agent: Agent, signal: Signal) -> None:
+        self._agent = agent
+        self.signal = signal
+
+    @property
+    def agent_name(self) -> str:
+        return self._agent.name
+
+    @property
+    def state(self) -> dict[str, Any]:
+        return self._agent.state
+
+    async def emit(self, signal: Signal) -> None:
+        """Emit a signal to all connected downstream agents."""
+        await self._agent.emit(signal)
+
+    async def reply(self, response: Signal) -> None:
+        """Reply to the current signal with a correlated response."""
+        await self._agent.reply(self.signal, response)
+
+    async def request(self, signal: Signal, timeout: float = 30.0) -> Signal:
+        """Emit a signal and wait for a correlated response."""
+        return await self._agent.request(signal, timeout=timeout)
+
+
 class DeadLetterQueue:
     """Collects signals that failed processing or were rejected by gates.
 
@@ -219,6 +263,27 @@ class Agent:
         self._handlers.setdefault(Signal, []).append(fn)
         return fn
 
+    def once(self, signal_type: type[T]) -> Callable[[Handler], Handler]:
+        """Register a handler that fires only once, then auto-removes itself.
+
+            @agent.once(StartupSignal)
+            async def handle(signal: StartupSignal):
+                print("First signal received — won't fire again")
+        """
+
+        def decorator(fn: Handler) -> Handler:
+            async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                result = await fn(*args, **kwargs)
+                handlers = self._handlers.get(signal_type, [])
+                if wrapper in handlers:
+                    handlers.remove(wrapper)
+                return result
+
+            self._handlers.setdefault(signal_type, []).append(wrapper)
+            return fn
+
+        return decorator
+
     def on_start(self, fn: LifecycleHook) -> LifecycleHook:
         """Register a hook called when the agent starts.
 
@@ -337,13 +402,32 @@ class Agent:
                 "Agent '%s': no handler for %s", self.name, type(signal).__name__
             )
 
+    def _handler_wants_context(self, handler: Handler) -> bool:
+        """Check if a handler's signature explicitly annotates a param as AgentContext."""
+        try:
+            hints = getattr(handler, "__annotations__", None)
+            if hints is None:
+                # Try to get from the underlying function
+                fn = getattr(handler, "__wrapped__", handler)
+                hints = getattr(fn, "__annotations__", {})
+            for ann in hints.values():
+                if ann is AgentContext or (isinstance(ann, str) and ann == "AgentContext"):
+                    return True
+            return False
+        except (ValueError, TypeError):
+            return False
+
     async def _run_handler_with_middleware(
         self, handler: Handler, signal: Signal
     ) -> None:
         """Execute a single handler wrapped in the middleware chain."""
 
         async def call_handler(sig: Signal) -> Signal | None:
-            await handler(sig)
+            if self._handler_wants_context(handler):
+                ctx = AgentContext(self, sig)
+                await handler(sig, ctx)
+            else:
+                await handler(sig)
             return sig
 
         chain: NextFn = call_handler
