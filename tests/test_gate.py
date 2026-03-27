@@ -1,5 +1,7 @@
 """Tests for Gate composability and factory methods."""
 
+import asyncio
+
 import pytest
 
 from signal_gating import Gate, Signal
@@ -145,3 +147,103 @@ async def test_complex_composition(signal):
     result = await pipeline.process(signal)
     assert result is not None
     assert result.priority == 15
+
+
+# --- New: Retry Gate ---
+
+
+async def test_retry_gate_passes_on_success():
+    inner = Gate.passthrough()
+    gate = Gate.retry(inner, max_attempts=3)
+    s = Signal(priority=5)
+    result = await gate.process(s)
+    assert result is not None
+    assert result.priority == 5
+
+
+async def test_retry_gate_retries_on_rejection():
+    call_count = 0
+
+    async def flaky(signal: Signal) -> Signal | None:
+        nonlocal call_count
+        call_count += 1
+        return signal if call_count >= 3 else None
+
+    inner = Gate(flaky, name="flaky")
+    gate = Gate.retry(inner, max_attempts=3, delay=0.01, backoff=1.0)
+    result = await gate.process(Signal())
+    assert result is not None
+    assert call_count == 3
+
+
+async def test_retry_gate_exhausts_attempts():
+    inner = Gate.block()
+    gate = Gate.retry(inner, max_attempts=2, delay=0.01)
+    result = await gate.process(Signal())
+    assert result is None
+
+
+# --- New: Circuit Breaker Gate ---
+
+
+async def test_circuit_breaker_closes_after_threshold():
+    inner = Gate.block()  # always rejects
+    gate = Gate.circuit_breaker(
+        inner, failure_threshold=3, recovery_timeout=0.1
+    )
+
+    # First 3 attempts go through the inner gate (all rejected)
+    for _ in range(3):
+        result = await gate.process(Signal())
+        assert result is None
+
+    # Now circuit is open — rejects without calling inner
+    result = await gate.process(Signal())
+    assert result is None
+
+
+async def test_circuit_breaker_recovers():
+    call_count = 0
+
+    async def recovering(signal: Signal) -> Signal | None:
+        nonlocal call_count
+        call_count += 1
+        # Start failing, then succeed
+        return signal if call_count > 3 else None
+
+    inner = Gate(recovering, name="recovering")
+    gate = Gate.circuit_breaker(
+        inner, failure_threshold=3, recovery_timeout=0.05
+    )
+
+    # Trip the breaker
+    for _ in range(3):
+        await gate.process(Signal())
+
+    # Wait for recovery timeout
+    await asyncio.sleep(0.06)
+
+    # Should enter half-open and succeed (call_count will be 4)
+    result = await gate.process(Signal())
+    assert result is not None
+
+
+# --- New: Timeout Gate ---
+
+
+async def test_timeout_gate_passes_fast_gate():
+    inner = Gate.passthrough()
+    gate = Gate.timeout(inner, seconds=1.0)
+    result = await gate.process(Signal())
+    assert result is not None
+
+
+async def test_timeout_gate_rejects_slow_gate():
+    async def slow(signal: Signal) -> Signal | None:
+        await asyncio.sleep(10)
+        return signal
+
+    inner = Gate(slow, name="slow")
+    gate = Gate.timeout(inner, seconds=0.01)
+    result = await gate.process(Signal())
+    assert result is None

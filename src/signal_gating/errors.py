@@ -42,3 +42,12 @@ class MeshError(SignalGatingError):
 
 class SignalValidationError(SignalGatingError):
     """Signal payload failed validation."""
+
+
+class CircuitOpenError(SignalGatingError):
+    """Circuit breaker is open — calls are being rejected."""
+
+    def __init__(self, gate_name: str, until: float):
+        self.gate_name = gate_name
+        self.until = until
+        super().__init__(f"Circuit '{gate_name}' is open until {until:.1f}")

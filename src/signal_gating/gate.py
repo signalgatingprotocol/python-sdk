@@ -16,11 +16,10 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from inspect import isawaitable
-from typing import Union
 
 from signal_gating.signal import Signal
 
-GateFn = Callable[[Signal], Union[Signal, None, Awaitable[Union[Signal, None]]]]
+GateFn = Callable[[Signal], Signal | None | Awaitable[Signal | None]]
 
 
 class Gate:
@@ -138,7 +137,8 @@ class Gate:
             for k in expired:
                 del seen[k]
             # Check for duplicate
-            key = f"{type(signal).__name__}:{signal.model_dump_json(exclude={'id', 'timestamp', 'trace_id'})}"
+            content = signal.model_dump_json(exclude={"id", "timestamp", "trace_id"})
+            key = f"{type(signal).__name__}:{content}"
             if key in seen:
                 return None
             seen[key] = now
@@ -159,6 +159,88 @@ class Gate:
     def by_priority(cls, min_priority: int = 0, name: str = "priority_filter") -> Gate:
         """Create a gate that only passes signals above a priority threshold."""
         return cls.filter(lambda s: s.priority >= min_priority, name=name)
+
+    @classmethod
+    def retry(
+        cls,
+        gate: Gate,
+        max_attempts: int = 3,
+        delay: float = 0.1,
+        backoff: float = 2.0,
+        name: str = "retry",
+    ) -> Gate:
+        """Wrap a gate with retry logic and exponential backoff."""
+
+        async def fn(signal: Signal) -> Signal | None:
+            last_result: Signal | None = None
+            current_delay = delay
+            for attempt in range(max_attempts):
+                last_result = await gate.process(signal)
+                if last_result is not None:
+                    return last_result
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff
+            return last_result
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def circuit_breaker(
+        cls,
+        gate: Gate,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 30.0,
+        name: str = "circuit_breaker",
+    ) -> Gate:
+        """Wrap a gate with circuit breaker pattern.
+
+        After `failure_threshold` consecutive rejections, the circuit opens
+        and rejects all signals for `recovery_timeout` seconds. Then it
+        enters half-open state and lets one signal through to test recovery.
+        """
+        state: dict[str, float | int | str] = {
+            "failures": 0,
+            "opened_at": 0.0,
+            "status": "closed",  # closed | open | half_open
+        }
+
+        async def fn(signal: Signal) -> Signal | None:
+            now = time.monotonic()
+            status = state["status"]
+
+            if status == "open":
+                elapsed = now - float(state["opened_at"])
+                if elapsed < recovery_timeout:
+                    return None
+                state["status"] = "half_open"
+
+            result = await gate.process(signal)
+
+            if result is not None:
+                state["failures"] = 0
+                state["status"] = "closed"
+                return result
+
+            state["failures"] = int(state["failures"]) + 1
+            if int(state["failures"]) >= failure_threshold:
+                state["status"] = "open"
+                state["opened_at"] = now
+            return None
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def timeout(cls, gate: Gate, seconds: float, name: str = "timeout") -> Gate:
+        """Wrap a gate with a timeout — rejects if processing takes too long."""
+
+        async def fn(signal: Signal) -> Signal | None:
+            try:
+                return await asyncio.wait_for(gate.process(signal), timeout=seconds)
+            except asyncio.TimeoutError:
+                return None
+
+        return cls(fn, name=name)
 
     @classmethod
     def passthrough(cls) -> Gate:

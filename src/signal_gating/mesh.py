@@ -10,6 +10,7 @@ from signal_gating.agent import Agent
 from signal_gating.errors import MeshError
 from signal_gating.gate import Gate
 from signal_gating.signal import Signal
+from signal_gating.tracing import Tracer
 
 logger = logging.getLogger("signal_gating.mesh")
 
@@ -26,7 +27,8 @@ class Edge:
 class Mesh:
     """A network of agents connected by gated edges.
 
-    The mesh manages agent lifecycles and signal routing:
+    The mesh manages agent lifecycles, signal routing, and observability.
+    When a tracer is attached, all signal flow is automatically traced.
 
         mesh = Mesh()
         mesh.add(planner)
@@ -35,12 +37,21 @@ class Mesh:
 
         async with mesh:
             await planner.emit(TaskSignal(task="build"))
+
+        # Inspect traces
+        for span in mesh.tracer.get_trace(trace_id):
+            print(f"{span.agent} -> {span.gate}: {span.action}")
     """
 
-    def __init__(self, agents: list[Agent] | None = None):
+    def __init__(
+        self,
+        agents: list[Agent] | None = None,
+        tracer: Tracer | None = None,
+    ):
         self._agents: dict[str, Agent] = {}
         self._edges: list[Edge] = []
         self._running = False
+        self.tracer = tracer or Tracer()
         for agent in agents or []:
             self.add(agent)
 
@@ -56,6 +67,7 @@ class Mesh:
         """Add an agent to the mesh."""
         if agent.name in self._agents:
             raise MeshError(f"Agent '{agent.name}' already exists in mesh")
+        agent._tracer = self.tracer  # noqa: SLF001
         self._agents[agent.name] = agent
 
     def get(self, name: str) -> Agent:
@@ -80,13 +92,29 @@ class Mesh:
 
         edge = Edge(src, tgt, gate)
         self._edges.append(edge)
+        tracer = self.tracer
 
         async def route(signal: Signal) -> None:
             if gate is not None:
                 result = await gate.process(signal)
                 if result is None:
+                    tracer.record(
+                        trace_id=signal.trace_id,
+                        signal_id=signal.id,
+                        agent=f"{src.name}->{tgt.name}",
+                        gate=gate.name,
+                        action="edge_rejected",
+                    )
                     return
                 signal = result
+            tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=signal.id,
+                agent=src.name,
+                gate="route",
+                action="routed",
+                target=tgt.name,
+            )
             await tgt.inbox.send(signal)
 
         src._add_output(route)
@@ -118,7 +146,11 @@ class Mesh:
             await agent.start()
         # Yield control so agent tasks can start running
         await asyncio.sleep(0)
-        logger.info(f"Mesh started with {len(self._agents)} agents, {len(self._edges)} edges")
+        logger.info(
+            "Mesh started with %d agents, %d edges",
+            len(self._agents),
+            len(self._edges),
+        )
 
     async def stop(self) -> None:
         """Stop all agents gracefully."""

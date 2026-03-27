@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar
 
@@ -14,8 +15,54 @@ from signal_gating.signal import Signal
 
 T = TypeVar("T", bound=Signal)
 Handler = Callable[..., Coroutine[Any, Any, Any]]
+NextFn = Callable[..., Coroutine[Any, Any, Signal | None]]
+Middleware = Callable[[Signal, NextFn], Coroutine[Any, Any, Signal | None]]
 
 logger = logging.getLogger("signal_gating.agent")
+
+
+class DeadLetterQueue:
+    """Collects signals that failed processing or were rejected by gates.
+
+    Every production agent system needs to know what went wrong and where.
+    The DLQ captures failed signals with context for debugging, replay, or alerting.
+    """
+
+    def __init__(self, max_size: int = 10000):
+        self._entries: list[dict[str, Any]] = []
+        self._max_size = max_size
+
+    def add(
+        self,
+        signal: Signal,
+        reason: str,
+        agent: str = "",
+        error: Exception | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "signal_id": signal.id,
+            "signal_type": type(signal).__name__,
+            "trace_id": signal.trace_id,
+            "agent": agent,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        if error is not None:
+            entry["error"] = f"{type(error).__name__}: {error}"
+        self._entries.append(entry)
+        if len(self._entries) > self._max_size:
+            self._entries = self._entries[-self._max_size :]
+
+    @property
+    def entries(self) -> list[dict[str, Any]]:
+        return list(self._entries)
+
+    @property
+    def count(self) -> int:
+        return len(self._entries)
+
+    def clear(self) -> None:
+        self._entries.clear()
 
 
 class Agent:
@@ -24,8 +71,12 @@ class Agent:
     Agents are the primary actors in the Signal Gating Protocol. They:
     - Receive signals through an inbox channel
     - Apply gates to filter/transform incoming signals
+    - Run middleware pipeline on each signal
     - Dispatch signals to registered handlers
     - Emit new signals to connected agents
+    - Track state across processing cycles
+    - Auto-restart on failure (supervision)
+    - Route failed signals to dead letter queue
 
     Usage:
         agent = Agent("worker")
@@ -44,16 +95,34 @@ class Agent:
         name: str,
         gates: list[Gate] | None = None,
         buffer_size: int = 1000,
+        max_restarts: int = 3,
+        restart_delay: float = 1.0,
     ):
         self.name = name
         self.gates = gates or []
         self.inbox: Channel[Signal] = Channel(Signal, buffer_size=buffer_size)
         self._handlers: dict[type[Signal], list[Handler]] = {}
+        self._middleware: list[Middleware] = []
         self._outbox: list[Callable[[Signal], Coroutine[Any, Any, None]]] = []
         self._task: asyncio.Task[None] | None = None
         self._running = False
         self._processed_count = 0
         self._rejected_count = 0
+        self._error_count = 0
+        self._restart_count = 0
+
+        # Agent state — persistent memory across signal processing cycles
+        self.state: dict[str, Any] = {}
+
+        # Supervision
+        self._max_restarts = max_restarts
+        self._restart_delay = restart_delay
+
+        # Dead letter queue
+        self.dead_letters = DeadLetterQueue()
+
+        # Tracer (set by mesh or manually)
+        self._tracer: Any = None
 
     @property
     def running(self) -> bool:
@@ -66,7 +135,10 @@ class Agent:
             "running": self._running,
             "processed": self._processed_count,
             "rejected": self._rejected_count,
+            "errors": self._error_count,
+            "restarts": self._restart_count,
             "pending": self.inbox.pending,
+            "dead_letters": self.dead_letters.count,
             "handlers": {t.__name__: len(h) for t, h in self._handlers.items()},
         }
 
@@ -89,6 +161,21 @@ class Agent:
         self._handlers.setdefault(Signal, []).append(fn)
         return fn
 
+    def use(self, middleware: Middleware) -> None:
+        """Add middleware to the processing pipeline.
+
+        Middleware wraps signal dispatch, enabling cross-cutting concerns:
+
+            async def logging_middleware(signal, next_fn):
+                print(f"Processing: {signal}")
+                result = await next_fn(signal)
+                print(f"Done: {signal}")
+                return result
+
+            agent.use(logging_middleware)
+        """
+        self._middleware.append(middleware)
+
     async def emit(self, signal: Signal) -> None:
         """Emit a signal to all connected downstream agents."""
         tagged = signal.with_source(self.name) if not signal.source else signal
@@ -101,47 +188,127 @@ class Agent:
         for gate in self.gates:
             if current is None:
                 return None
+            start = time.monotonic()
             current = await gate.process(current)
+            elapsed_ms = (time.monotonic() - start) * 1000
+
+            if self._tracer is not None:
+                action = "passed" if current is not None else "rejected"
+                self._tracer.record(
+                    trace_id=signal.trace_id,
+                    signal_id=signal.id,
+                    agent=self.name,
+                    gate=gate.name,
+                    action=action,
+                    duration_ms=elapsed_ms,
+                )
         return current
 
     async def _dispatch(self, signal: Signal) -> None:
-        """Dispatch a signal to matching handlers."""
+        """Dispatch a signal to matching handlers, with middleware."""
         dispatched = False
         for signal_type, handlers in self._handlers.items():
             if isinstance(signal, signal_type):
                 for handler in handlers:
-                    try:
-                        await handler(signal)
-                    except Exception as e:
-                        logger.error(f"Handler error in agent '{self.name}': {e}", exc_info=True)
-                        raise AgentError(self.name, str(e)) from e
+                    await self._run_handler_with_middleware(handler, signal)
                 dispatched = True
 
         if not dispatched:
-            logger.debug(f"Agent '{self.name}': no handler for {type(signal).__name__}")
+            logger.debug(
+                "Agent '%s': no handler for %s", self.name, type(signal).__name__
+            )
+
+    async def _run_handler_with_middleware(
+        self, handler: Handler, signal: Signal
+    ) -> None:
+        """Execute a single handler wrapped in the middleware chain."""
+
+        async def call_handler(sig: Signal) -> Signal | None:
+            await handler(sig)
+            return sig
+
+        chain: NextFn = call_handler
+        for mw in reversed(self._middleware):
+            outer_chain = chain
+
+            async def make_chain(
+                s: Signal, _mw: Middleware = mw, _next: NextFn = outer_chain
+            ) -> Signal | None:
+                return await _mw(s, _next)
+
+            chain = make_chain
+
+        try:
+            await chain(signal)
+        except Exception as e:
+            self._error_count += 1
+            self.dead_letters.add(signal, "handler_error", self.name, e)
+            logger.error(
+                "Handler error in agent '%s': %s", self.name, e, exc_info=True
+            )
+            raise AgentError(self.name, str(e)) from e
 
     async def _run_loop(self) -> None:
         """Main processing loop."""
         self._running = True
         try:
             async for signal in self.inbox:
+                start = time.monotonic()
                 gated = await self._apply_gates(signal)
                 if gated is None:
                     self._rejected_count += 1
+                    self.dead_letters.add(signal, "gate_rejected", self.name)
                     continue
                 self._processed_count += 1
                 await self._dispatch(gated)
+
+                if self._tracer is not None:
+                    elapsed_ms = (time.monotonic() - start) * 1000
+                    self._tracer.record(
+                        trace_id=signal.trace_id,
+                        signal_id=signal.id,
+                        agent=self.name,
+                        gate="dispatch",
+                        action="processed",
+                        duration_ms=elapsed_ms,
+                    )
         except Exception as e:
             if self._running:
-                logger.error(f"Agent '{self.name}' loop error: {e}", exc_info=True)
+                logger.error("Agent '%s' loop error: %s", self.name, e, exc_info=True)
         finally:
             self._running = False
 
     async def start(self) -> None:
-        """Start the agent's processing loop."""
+        """Start the agent's processing loop with supervision."""
         if self._task is not None:
             return
-        self._task = asyncio.create_task(self._run_loop(), name=f"agent:{self.name}")
+        self._task = asyncio.create_task(
+            self._supervised_loop(), name=f"agent:{self.name}"
+        )
+
+    async def _supervised_loop(self) -> None:
+        """Run the processing loop with automatic restart on failure."""
+        while self._restart_count <= self._max_restarts:
+            try:
+                await self._run_loop()
+                return  # Clean exit (channel closed)
+            except Exception as e:
+                self._restart_count += 1
+                if self._restart_count > self._max_restarts:
+                    logger.error(
+                        "Agent '%s' exceeded max restarts (%d). Shutting down.",
+                        self.name,
+                        self._max_restarts,
+                    )
+                    return
+                logger.warning(
+                    "Agent '%s' crashed (%s), restarting (%d/%d)...",
+                    self.name,
+                    e,
+                    self._restart_count,
+                    self._max_restarts,
+                )
+                await asyncio.sleep(self._restart_delay)
 
     async def stop(self) -> None:
         """Stop the agent gracefully."""
@@ -159,4 +326,7 @@ class Agent:
         self._outbox.append(send_fn)
 
     def __repr__(self) -> str:
-        return f"Agent({self.name!r}, gates={len(self.gates)}, handlers={sum(len(h) for h in self._handlers.values())})"
+        n_handlers = sum(len(h) for h in self._handlers.values())
+        return (
+            f"Agent({self.name!r}, gates={len(self.gates)}, handlers={n_handlers})"
+        )
