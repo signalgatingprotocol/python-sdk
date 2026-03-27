@@ -29,6 +29,7 @@ class Signal(BaseModel):
     priority: int = 0
     trace_id: str = Field(default_factory=lambda: uuid4().hex)
     correlation_id: str = ""
+    parent_id: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"frozen": True}
@@ -50,9 +51,26 @@ class Signal(BaseModel):
         merged = {**self.metadata, **kwargs}
         return self.evolve(metadata=merged)
 
+    def child(self: T, **kwargs: Any) -> T:
+        """Create a child signal that inherits this signal's trace lineage.
+
+        The child preserves the trace_id for correlation and records this
+        signal's id as parent_id, enabling full signal lineage trees.
+
+        This is the agent-native way to create derived signals:
+            task = TaskSignal(task="analyze")
+            subtask = task.child(task="analyze_section_1", priority=8)
+            # subtask.parent_id == task.id
+            # subtask.trace_id == task.trace_id
+        """
+        return self.evolve(parent_id=self.id, **kwargs)
+
     def __repr__(self) -> str:
         always_hide = {"id", "timestamp", "trace_id"}
-        hide_if_default = {"source": "", "priority": 0, "correlation_id": "", "metadata": {}}
+        hide_if_default = {
+            "source": "", "priority": 0, "correlation_id": "",
+            "parent_id": "", "metadata": {},
+        }
         fields: dict[str, Any] = {}
         for k, v in self.model_dump().items():
             if k in always_hide:

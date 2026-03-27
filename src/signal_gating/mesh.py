@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from collections.abc import Awaitable, Callable
 from inspect import isawaitable
@@ -74,7 +75,7 @@ class Mesh:
         """Add an agent to the mesh."""
         if agent.name in self._agents:
             raise MeshError(f"Agent '{agent.name}' already exists in mesh")
-        agent._tracer = self.tracer  # noqa: SLF001
+        agent.set_tracer(self.tracer)
         self._agents[agent.name] = agent
 
     def get(self, name: str) -> Agent:
@@ -82,6 +83,39 @@ class Mesh:
         if name not in self._agents:
             raise MeshError(f"Agent '{name}' not found in mesh")
         return self._agents[name]
+
+    async def remove(self, agent: Agent | str) -> None:
+        """Remove an agent from the mesh, stopping it and cleaning up edges.
+
+        Dynamic topology is essential for agent systems — agents join and leave
+        at runtime based on demand, failures, or scaling decisions.
+        """
+        resolved = self._resolve(agent)
+        if resolved.running:
+            await resolved.stop()
+        # Remove all edges involving this agent
+        self._edges = [
+            e for e in self._edges
+            if e.source.name != resolved.name and e.target.name != resolved.name
+        ]
+        # Remove capabilities
+        self._capabilities.pop(resolved.name, None)
+        del self._agents[resolved.name]
+
+    def disconnect(self, source: Agent | str, target: Agent | str) -> int:
+        """Remove all edges between source and target. Returns count removed.
+
+        Enables runtime topology rewiring — agents can be reconnected
+        to different targets without restarting the mesh.
+        """
+        src_name = source if isinstance(source, str) else source.name
+        tgt_name = target if isinstance(target, str) else target.name
+        before = len(self._edges)
+        self._edges = [
+            e for e in self._edges
+            if not (e.source.name == src_name and e.target.name == tgt_name)
+        ]
+        return before - len(self._edges)
 
     def connect(
         self,
@@ -229,7 +263,7 @@ class Mesh:
         resolved = [self._resolve(t) for t in targets]
         if not resolved:
             raise MeshError("load_balance requires at least one target")
-        counter = [0]
+        index = itertools.count()
         tracer = self.tracer
 
         async def balanced_route(signal: Signal) -> None:
@@ -238,8 +272,7 @@ class Mesh:
                 if result is None:
                     return
                 signal = result
-            target = resolved[counter[0] % len(resolved)]
-            counter[0] += 1
+            target = resolved[next(index) % len(resolved)]
             tracer.record(
                 trace_id=signal.trace_id,
                 signal_id=signal.id,
@@ -390,43 +423,55 @@ class Mesh:
         Returns responses in the same order as targets.
         """
         cid = uuid4().hex
-        tagged = signal.evolve(correlation_id=cid)
         resolved = [self._resolve(t) for t in targets]
 
         loop = asyncio.get_running_loop()
         futures: list[asyncio.Future[Signal]] = []
+        capture_fns: list[tuple[Agent, Any]] = []
 
-        # Create a temporary collector agent to gather responses
         for target in resolved:
+            target_cid = f"{cid}:{target.name}"
             future: asyncio.Future[Signal] = loop.create_future()
             futures.append(future)
-            target_cid = f"{cid}:{target.name}"
-            response_signal = tagged.evolve(correlation_id=target_cid)
-            await target.inbox.send(response_signal)
 
-        # Wait for all responses or timeout — agents reply via correlation_id
-        # We register pending requests on each target
-        per_target_futures: list[asyncio.Future[Signal]] = []
+            # Capture replies from this target's outbox by correlation_id.
+            # This avoids the previous bug where registering on _pending_requests
+            # caused the signal to be intercepted before reaching handlers.
+            def _make_capture(
+                f: asyncio.Future[Signal], tcid: str
+            ) -> Any:
+                async def capture(sig: Signal) -> None:
+                    if sig.correlation_id == tcid and not f.done():
+                        f.set_result(sig)
+
+                return capture
+
+            capture = _make_capture(future, target_cid)
+            target._outbox.append(capture)  # noqa: SLF001
+            capture_fns.append((target, capture))
+
+        # Send signals to all targets
         for target in resolved:
-            target_future: asyncio.Future[Signal] = loop.create_future()
             target_cid = f"{cid}:{target.name}"
-            target._pending_requests[target_cid] = target_future  # noqa: SLF001
-            per_target_futures.append(target_future)
-            await target.inbox.send(tagged.evolve(correlation_id=target_cid))
+            await target.inbox.send(
+                signal.evolve(correlation_id=target_cid)
+            )
 
         try:
-            done, _ = await asyncio.wait(per_target_futures, timeout=timeout)
+            done, _ = await asyncio.wait(futures, timeout=timeout)
             results: list[Signal] = []
-            for f in per_target_futures:
+            for f in futures:
                 if f.done() and not f.cancelled() and f.exception() is None:
                     results.append(f.result())
                 else:
-                    results.append(tagged)  # Placeholder for timed-out targets
+                    results.append(signal)  # Placeholder for timed-out targets
             return results
         finally:
-            for target in resolved:
-                target_cid = f"{cid}:{target.name}"
-                target._pending_requests.pop(target_cid, None)  # noqa: SLF001
+            for target, capture in capture_fns:
+                try:
+                    target._outbox.remove(capture)  # noqa: SLF001
+                except ValueError:
+                    pass
 
     # --- Graceful Shutdown ---
 

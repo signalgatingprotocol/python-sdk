@@ -257,3 +257,48 @@ class Gate:
     def block(cls) -> Gate:
         """A gate that blocks everything."""
         return cls(lambda s: None, name="block")
+
+    @classmethod
+    def when(
+        cls,
+        condition: Callable[[Signal], bool],
+        then: Gate,
+        otherwise: Gate | None = None,
+        name: str = "when",
+    ) -> Gate:
+        """Conditional branching gate — the agent-native if/else for signal flow.
+
+        Routes signals through different gate paths based on a condition.
+        If no `otherwise` gate is provided, non-matching signals pass through unchanged.
+
+            gate = Gate.when(
+                lambda s: s.priority >= 8,
+                then=Gate.transform(enrich_urgent),
+                otherwise=Gate.transform(enrich_normal),
+            )
+        """
+
+        async def fn(signal: Signal) -> Signal | None:
+            if condition(signal):
+                return await then.process(signal)
+            if otherwise is not None:
+                return await otherwise.process(signal)
+            return signal
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def sample(cls, rate: float, name: str = "sample") -> Gate:
+        """Probabilistic sampling gate — passes signals at the given rate (0.0-1.0).
+
+        Essential for high-throughput systems where you want to observe
+        or process only a fraction of signals:
+
+            gate = Gate.sample(0.1)  # Process ~10% of signals
+        """
+        import random
+
+        def fn(signal: Signal) -> Signal | None:
+            return signal if random.random() < rate else None  # noqa: S311
+
+        return cls(fn, name=name)

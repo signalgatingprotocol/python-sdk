@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Callable, Coroutine
 from inspect import isawaitable
-from typing import Any, TypeVar
+from typing import Any, TypeVar, get_type_hints
 from uuid import uuid4
 
 from signal_gating.channel import Channel, PriorityChannel
@@ -123,6 +124,19 @@ class DeadLetterQueue:
         self._signals.clear()
         return signals
 
+    async def replay(self, channel: Channel[Signal] | PriorityChannel[Signal]) -> int:
+        """Replay all dead-lettered signals back into a channel.
+
+        This is the agent-native recovery pattern: when signals fail,
+        fix the issue, then replay them without losing any work.
+
+        Returns the number of signals replayed.
+        """
+        signals = self.drain()
+        for signal in signals:
+            await channel.send(signal)
+        return len(signals)
+
     def clear(self) -> None:
         self._entries.clear()
         self._signals.clear()
@@ -198,6 +212,10 @@ class Agent:
 
         # Request/response pending futures
         self._pending_requests: dict[str, asyncio.Future[Signal]] = {}
+
+    def set_tracer(self, tracer: Any) -> None:
+        """Attach a tracer for observability. Called by Mesh or manually."""
+        self._tracer = tracer
 
     @property
     def running(self) -> bool:
@@ -366,6 +384,15 @@ class Agent:
         for send_fn in self._outbox:
             await send_fn(tagged)
 
+    async def emit_many(self, signals: list[Signal]) -> None:
+        """Emit multiple signals in batch. More efficient than individual emit() calls.
+
+        Essential for high-throughput agent patterns like fan-out, map operations,
+        or agents that produce multiple outputs per input signal.
+        """
+        for signal in signals:
+            await self.emit(signal)
+
     async def _apply_gates(self, signal: Signal) -> Signal | None:
         """Apply all gates sequentially. Returns None if any gate rejects."""
         current: Signal | None = signal
@@ -403,15 +430,27 @@ class Agent:
             )
 
     def _handler_wants_context(self, handler: Handler) -> bool:
-        """Check if a handler's signature explicitly annotates a param as AgentContext."""
+        """Check if a handler's signature includes an AgentContext parameter.
+
+        Uses inspect.signature() for robust detection that works with
+        decorated functions, closures, and deferred annotations.
+        """
         try:
-            hints = getattr(handler, "__annotations__", None)
-            if hints is None:
-                # Try to get from the underlying function
-                fn = getattr(handler, "__wrapped__", handler)
+            fn = getattr(handler, "__wrapped__", handler)
+            sig = inspect.signature(fn)
+            params = list(sig.parameters.values())
+            if len(params) < 2:
+                return False
+            # Check type hints robustly
+            try:
+                hints = get_type_hints(fn)
+            except Exception:
                 hints = getattr(fn, "__annotations__", {})
-            for ann in hints.values():
-                if ann is AgentContext or (isinstance(ann, str) and ann == "AgentContext"):
+            for param in params[1:]:  # Skip the first param (signal)
+                ann = hints.get(param.name)
+                if ann is AgentContext:
+                    return True
+                if isinstance(ann, str) and ann == "AgentContext":
                     return True
             return False
         except (ValueError, TypeError):

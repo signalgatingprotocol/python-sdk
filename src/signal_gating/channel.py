@@ -133,6 +133,8 @@ class PriorityChannel(Generic[T]):
         self._max_size = buffer_size
         self._closed = False
         self._has_items = asyncio.Event()
+        self._has_space = asyncio.Event()
+        self._has_space.set()  # Initially has space
         self._lock = asyncio.Lock()
 
     @property
@@ -154,6 +156,8 @@ class PriorityChannel(Generic[T]):
             heapq.heappush(self._heap, (-signal.priority, self._counter, signal))
             self._counter += 1
             self._has_items.set()
+            if self._max_size and len(self._heap) >= self._max_size:
+                self._has_space.clear()
 
     async def receive(self) -> T:
         """Receive the highest-priority signal. Blocks until one is available."""
@@ -163,6 +167,7 @@ class PriorityChannel(Generic[T]):
                     _, _, signal = heapq.heappop(self._heap)
                     if not self._heap:
                         self._has_items.clear()
+                    self._has_space.set()
                     return signal
                 if self._closed:
                     raise ChannelClosed()
@@ -174,12 +179,14 @@ class PriorityChannel(Generic[T]):
 
         Unlike `send()`, this method applies backpressure by blocking until
         buffer space is available instead of raising ChannelFull.
+        Uses event-driven notification — no polling.
         """
         if self._closed:
             raise ChannelClosed()
 
         async def _wait_and_send() -> None:
             while True:
+                await self._has_space.wait()
                 async with self._lock:
                     if not self._max_size or len(self._heap) < self._max_size:
                         heapq.heappush(
@@ -187,8 +194,9 @@ class PriorityChannel(Generic[T]):
                         )
                         self._counter += 1
                         self._has_items.set()
+                        if self._max_size and len(self._heap) >= self._max_size:
+                            self._has_space.clear()
                         return
-                await asyncio.sleep(0.01)
 
         if timeout is not None:
             await asyncio.wait_for(_wait_and_send(), timeout=timeout)
@@ -205,6 +213,7 @@ class PriorityChannel(Generic[T]):
             _, _, signal = heapq.heappop(self._heap)
             if not self._heap:
                 self._has_items.clear()
+            self._has_space.set()
             return signal
         return None
 
@@ -230,4 +239,5 @@ class PriorityChannel(Generic[T]):
                 _, _, signal = heapq.heappop(self._heap)
                 signals.append(signal)
             self._has_items.clear()
+            self._has_space.set()
             return signals
