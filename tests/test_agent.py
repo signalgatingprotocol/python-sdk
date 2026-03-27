@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from signal_gating import Agent, Gate, Signal
 
 
@@ -258,3 +260,153 @@ async def test_agent_stats_extended():
     assert "dead_letters" in stats
     assert stats["dead_letters"] == 1  # one gate rejection
     assert stats["restarts"] == 0
+
+
+# --- Lifecycle Hooks ---
+
+
+async def test_agent_on_start_hook():
+    agent = Agent("lifecycle")
+    events: list[str] = []
+
+    @agent.on_start
+    async def setup():
+        events.append("started")
+
+    @agent.on(Signal)
+    async def handle(s: Signal):
+        pass
+
+    await agent.start()
+    await asyncio.sleep(0.01)
+    await agent.stop()
+
+    assert "started" in events
+
+
+async def test_agent_on_stop_hook():
+    agent = Agent("lifecycle")
+    events: list[str] = []
+
+    @agent.on_stop
+    async def cleanup():
+        events.append("stopped")
+
+    @agent.on(Signal)
+    async def handle(s: Signal):
+        pass
+
+    await agent.start()
+    await asyncio.sleep(0.01)
+    await agent.stop()
+
+    assert "stopped" in events
+
+
+async def test_agent_lifecycle_order():
+    agent = Agent("lifecycle")
+    events: list[str] = []
+
+    @agent.on_start
+    async def setup():
+        events.append("start")
+
+    @agent.on_stop
+    async def cleanup():
+        events.append("stop")
+
+    @agent.on(Signal)
+    async def handle(s: Signal):
+        events.append("process")
+
+    await agent.start()
+    await agent.inbox.send(Signal())
+    await asyncio.sleep(0.05)
+    await agent.stop()
+
+    assert events == ["start", "process", "stop"]
+
+
+async def test_agent_sync_lifecycle_hooks():
+    agent = Agent("sync_hooks")
+    events: list[str] = []
+
+    @agent.on_start
+    def setup():
+        events.append("sync_start")
+
+    @agent.on_stop
+    def cleanup():
+        events.append("sync_stop")
+
+    await agent.start()
+    await asyncio.sleep(0.01)
+    await agent.stop()
+
+    assert events == ["sync_start", "sync_stop"]
+
+
+# --- Request/Response ---
+
+
+async def test_agent_request_response():
+    from signal_gating import Mesh
+
+    requester = Agent("requester")
+    responder = Agent("responder")
+
+    @responder.on(TaskSignal)
+    async def handle(signal: TaskSignal):
+        await responder.reply(signal, ResultSignal(result=f"done:{signal.task}"))
+
+    mesh = Mesh([requester, responder])
+    mesh.connect(requester, responder)
+    mesh.connect(responder, requester)  # Return path
+
+    async with mesh:
+        response = await requester.request(TaskSignal(task="analyze"), timeout=2.0)
+        assert isinstance(response, ResultSignal)
+        assert response.result == "done:analyze"
+
+
+async def test_agent_request_timeout():
+    agent = Agent("lonely")
+    # No connections, so request will timeout
+    await agent.start()
+    with pytest.raises(asyncio.TimeoutError):
+        await agent.request(Signal(), timeout=0.05)
+    await agent.stop()
+
+
+async def test_agent_reply_without_correlation():
+    agent = Agent("replier")
+    emitted: list[Signal] = []
+    agent._add_output(lambda s: emitted.append(s) or asyncio.sleep(0))  # type: ignore
+
+    # Reply to a signal without correlation_id just emits normally
+    original = Signal()
+    await agent.reply(original, ResultSignal(result="ok"))
+    assert len(emitted) == 1
+
+
+# --- Priority Inbox ---
+
+
+async def test_agent_priority_inbox():
+    agent = Agent("priority_worker", priority_inbox=True)
+    received_order: list[int] = []
+
+    @agent.on(Signal)
+    async def handle(signal: Signal):
+        received_order.append(signal.priority)
+
+    # Queue up signals before starting so they're all available
+    await agent.inbox.send(Signal(priority=1))
+    await agent.inbox.send(Signal(priority=10))
+    await agent.inbox.send(Signal(priority=5))
+
+    await agent.start()
+    await asyncio.sleep(0.05)
+    await agent.stop()
+
+    assert received_order == [10, 5, 1]

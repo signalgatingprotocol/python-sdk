@@ -32,7 +32,7 @@ Quick start:
 """
 
 from signal_gating.agent import Agent, DeadLetterQueue
-from signal_gating.channel import Channel
+from signal_gating.channel import Channel, PriorityChannel
 from signal_gating.errors import (
     AgentError,
     ChannelClosed,
@@ -62,6 +62,7 @@ __all__ = [
     "Mesh",
     "MeshError",
     "Pipeline",
+    "PriorityChannel",
     "Signal",
     "SignalGatingError",
     "SignalValidationError",

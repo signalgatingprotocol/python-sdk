@@ -76,24 +76,38 @@ both = high_priority & Gate.filter(lambda s: s.source == "sensor")  # and
 not_low = ~Gate.by_priority(1)  # invert
 ```
 
-Built-in gates: `filter`, `transform`, `by_type`, `by_priority`, `rate_limit`, `deduplicate`, `passthrough`, `block`.
+Built-in gates: `filter`, `transform`, `by_type`, `by_priority`, `rate_limit`, `deduplicate`, `retry`, `circuit_breaker`, `timeout`, `passthrough`, `block`.
 
 ### Agent
 
-Autonomous signal processors with lifecycle management:
+Autonomous signal processors with lifecycle management, request/response, and priority inboxes:
 
 ```python
-worker = Agent("worker", gates=[Gate.by_priority(3)])
+worker = Agent("worker", gates=[Gate.by_priority(3)], priority_inbox=True)
+
+@worker.on_start
+async def setup():
+    worker.state["db"] = await connect_db()
+
+@worker.on_stop
+async def cleanup():
+    await worker.state["db"].close()
 
 @worker.on(TaskSignal)
 async def handle(signal: TaskSignal):
     result = await process(signal.task)
-    await worker.emit(ResultSignal(result=result))
+    await worker.reply(signal, ResultSignal(result=result))
+```
+
+Request/response — agents can ask questions and wait for answers:
+
+```python
+response = await planner.request(TaskSignal(task="analyze data"), timeout=5.0)
 ```
 
 ### Mesh
 
-Agent network topology with gated connections:
+Agent network topology with gated connections and content-based routing:
 
 ```python
 mesh = Mesh([coordinator, analyst, reporter])
@@ -103,6 +117,12 @@ mesh.connect(analyst, reporter)
 # Fan-out and fan-in
 mesh.broadcast_connect(source, [a, b, c])
 mesh.converge_connect([a, b, c], target)
+
+# Content-based routing — signals go where they need to based on content
+mesh.route(coordinator, [
+    (lambda s: s.priority >= 8, critical_handler),
+    (lambda s: isinstance(s, AnalysisTask), analyst),
+], default=general_worker)
 
 # Lifecycle
 async with mesh:
@@ -120,6 +140,21 @@ pipeline = Pipeline([
     Gate.transform(enrich),
 ])
 result = await pipeline.process(signal)
+```
+
+### Channel
+
+Async typed conduits with backpressure and priority ordering:
+
+```python
+# Standard FIFO channel with backpressure
+channel = Channel(Signal, buffer_size=100)
+await channel.send(signal)        # Raises ChannelFull if full
+await channel.send_wait(signal)   # Blocks until space is available
+
+# Priority channel — highest priority dequeued first
+from signal_gating import PriorityChannel
+channel = PriorityChannel(Signal, buffer_size=1000)
 ```
 
 ### Tracing

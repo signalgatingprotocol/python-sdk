@@ -61,3 +61,39 @@ def test_signal_repr():
     r = repr(s)
     assert "TaskSignal" in r
     assert "test" in r
+
+
+def test_signal_repr_hides_defaults():
+    s = Signal()
+    r = repr(s)
+    # Should hide id, timestamp, trace_id, and default-valued fields
+    assert "id=" not in r
+    assert "timestamp=" not in r
+    assert "trace_id=" not in r
+    assert "source=" not in r
+    assert "priority=" not in r
+    assert "metadata=" not in r
+    assert "correlation_id=" not in r
+    assert r == "Signal()"
+
+
+def test_signal_repr_shows_non_defaults():
+    s = Signal(priority=5, source="agent-a")
+    r = repr(s)
+    assert "priority=5" in r
+    assert "source='agent-a'" in r
+
+
+def test_signal_correlation_id():
+    s = Signal()
+    assert s.correlation_id == ""
+    s2 = s.evolve(correlation_id="req-123")
+    assert s2.correlation_id == "req-123"
+    assert s.correlation_id == ""  # Original unchanged
+
+
+def test_signal_correlation_id_preserved_in_evolve():
+    s = Signal(correlation_id="req-abc")
+    s2 = s.evolve(priority=10)
+    assert s2.correlation_id == "req-abc"
+    assert s2.priority == 10

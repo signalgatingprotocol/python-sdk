@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from signal_gating.agent import Agent
@@ -138,6 +139,58 @@ class Mesh:
         """Connect multiple sources to one target (fan-in)."""
         for source in sources:
             self.connect(source, target, gate)
+
+    def route(
+        self,
+        source: Agent | str,
+        routes: list[tuple[Callable[[Signal], bool], Agent | str]],
+        default: Agent | str | None = None,
+    ) -> None:
+        """Content-based routing: route signals to different targets based on predicates.
+
+        First matching predicate wins. If no predicate matches and a default is
+        specified, the signal goes there. Otherwise it is dropped.
+
+        This is the agent-native way to build intelligent signal routing —
+        signals go where they need to based on their content, not just topology.
+
+            mesh.route(coordinator, [
+                (lambda s: s.priority >= 8, critical_handler),
+                (lambda s: isinstance(s, AnalysisTask), analyst),
+            ], default=general_worker)
+        """
+        src = self._resolve(source)
+        resolved: list[tuple[Callable[[Signal], bool], Agent]] = [
+            (pred, self._resolve(tgt)) for pred, tgt in routes
+        ]
+        resolved_default = self._resolve(default) if default else None
+        tracer = self.tracer
+
+        async def content_route(signal: Signal) -> None:
+            for predicate, target in resolved:
+                if predicate(signal):
+                    tracer.record(
+                        trace_id=signal.trace_id,
+                        signal_id=signal.id,
+                        agent=src.name,
+                        gate="content_route",
+                        action="routed",
+                        target=target.name,
+                    )
+                    await target.inbox.send(signal)
+                    return
+            if resolved_default:
+                tracer.record(
+                    trace_id=signal.trace_id,
+                    signal_id=signal.id,
+                    agent=src.name,
+                    gate="content_route",
+                    action="default_routed",
+                    target=resolved_default.name,
+                )
+                await resolved_default.inbox.send(signal)
+
+        src._add_output(content_route)
 
     async def start(self) -> None:
         """Start all agents in the mesh."""
