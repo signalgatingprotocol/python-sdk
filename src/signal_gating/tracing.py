@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass
+@dataclass(slots=True)
 class Span:
     """A single span in a signal's trace through the system."""
 
@@ -24,6 +24,8 @@ class Span:
 class Tracer:
     """Collects trace spans for signal flow observability.
 
+    Uses indexed lookups for O(1) trace and agent queries instead of O(n) scans.
+
     Usage:
         tracer = Tracer()
 
@@ -39,6 +41,9 @@ class Tracer:
     def __init__(self, max_spans: int = 10000):
         self._spans: list[Span] = []
         self._max_spans = max_spans
+        # Indexed lookups for O(1) access
+        self._by_trace: dict[str, list[Span]] = {}
+        self._by_agent: dict[str, list[Span]] = {}
 
     def record(
         self,
@@ -61,21 +66,34 @@ class Tracer:
             metadata=metadata,
         )
         self._spans.append(span)
+        self._by_trace.setdefault(trace_id, []).append(span)
+        self._by_agent.setdefault(agent, []).append(span)
         if len(self._spans) > self._max_spans:
-            self._spans = self._spans[-self._max_spans:]
+            self._evict()
         return span
 
+    def _evict(self) -> None:
+        """Evict oldest spans to stay within max_spans, rebuilding indexes."""
+        self._spans = self._spans[-self._max_spans :]
+        self._by_trace.clear()
+        self._by_agent.clear()
+        for span in self._spans:
+            self._by_trace.setdefault(span.trace_id, []).append(span)
+            self._by_agent.setdefault(span.agent, []).append(span)
+
     def get_trace(self, trace_id: str) -> list[Span]:
-        """Get all spans for a given trace ID."""
-        return [s for s in self._spans if s.trace_id == trace_id]
+        """Get all spans for a given trace ID. O(1) lookup."""
+        return list(self._by_trace.get(trace_id, []))
 
     def get_agent_spans(self, agent: str) -> list[Span]:
-        """Get all spans for a given agent."""
-        return [s for s in self._spans if s.agent == agent]
+        """Get all spans for a given agent. O(1) lookup."""
+        return list(self._by_agent.get(agent, []))
 
     def clear(self) -> None:
         """Clear all recorded spans."""
         self._spans.clear()
+        self._by_trace.clear()
+        self._by_agent.clear()
 
     @property
     def span_count(self) -> int:
@@ -86,19 +104,15 @@ class Tracer:
         if not self._spans:
             return {"total_spans": 0}
         actions: dict[str, int] = {}
-        agents: set[str] = set()
-        traces: set[str] = set()
         durations: list[float] = []
         for s in self._spans:
             actions[s.action] = actions.get(s.action, 0) + 1
-            agents.add(s.agent)
-            traces.add(s.trace_id)
             if s.duration_ms > 0:
                 durations.append(s.duration_ms)
         result: dict[str, Any] = {
             "total_spans": len(self._spans),
-            "unique_traces": len(traces),
-            "unique_agents": len(agents),
+            "unique_traces": len(self._by_trace),
+            "unique_agents": len(self._by_agent),
             "actions": actions,
         }
         if durations:
