@@ -82,19 +82,34 @@ class Tracer:
         return len(self._spans)
 
     def summary(self) -> dict[str, Any]:
-        """Summary statistics across all recorded spans."""
+        """Summary statistics across all recorded spans, including latency percentiles."""
         if not self._spans:
             return {"total_spans": 0}
         actions: dict[str, int] = {}
         agents: set[str] = set()
         traces: set[str] = set()
+        durations: list[float] = []
         for s in self._spans:
             actions[s.action] = actions.get(s.action, 0) + 1
             agents.add(s.agent)
             traces.add(s.trace_id)
-        return {
+            if s.duration_ms > 0:
+                durations.append(s.duration_ms)
+        result: dict[str, Any] = {
             "total_spans": len(self._spans),
             "unique_traces": len(traces),
             "unique_agents": len(agents),
             "actions": actions,
         }
+        if durations:
+            durations.sort()
+            n = len(durations)
+            result["latency_ms"] = {
+                "min": durations[0],
+                "max": durations[-1],
+                "mean": sum(durations) / n,
+                "p50": durations[n // 2],
+                "p95": durations[int(n * 0.95)],
+                "p99": durations[min(int(n * 0.99), n - 1)],
+            }
+        return result

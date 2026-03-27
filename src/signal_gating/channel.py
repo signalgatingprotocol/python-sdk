@@ -133,6 +133,7 @@ class PriorityChannel(Generic[T]):
         self._max_size = buffer_size
         self._closed = False
         self._has_items = asyncio.Event()
+        self._lock = asyncio.Lock()
 
     @property
     def closed(self) -> bool:
@@ -146,24 +147,26 @@ class PriorityChannel(Generic[T]):
         """Send a signal into the priority channel."""
         if self._closed:
             raise ChannelClosed()
-        if self._max_size and len(self._heap) >= self._max_size:
-            raise ChannelFull()
-        # Negate priority for max-heap behavior (heapq is a min-heap)
-        heapq.heappush(self._heap, (-signal.priority, self._counter, signal))
-        self._counter += 1
-        self._has_items.set()
+        async with self._lock:
+            if self._max_size and len(self._heap) >= self._max_size:
+                raise ChannelFull()
+            # Negate priority for max-heap behavior (heapq is a min-heap)
+            heapq.heappush(self._heap, (-signal.priority, self._counter, signal))
+            self._counter += 1
+            self._has_items.set()
 
     async def receive(self) -> T:
         """Receive the highest-priority signal. Blocks until one is available."""
         while True:
-            if self._heap:
-                _, _, signal = heapq.heappop(self._heap)
-                if not self._heap:
-                    self._has_items.clear()
-                return signal
-            if self._closed:
-                raise ChannelClosed()
-            self._has_items.clear()
+            async with self._lock:
+                if self._heap:
+                    _, _, signal = heapq.heappop(self._heap)
+                    if not self._heap:
+                        self._has_items.clear()
+                    return signal
+                if self._closed:
+                    raise ChannelClosed()
+                self._has_items.clear()
             await self._has_items.wait()
 
     def try_receive(self) -> T | None:
@@ -191,9 +194,10 @@ class PriorityChannel(Generic[T]):
 
     async def drain(self) -> list[T]:
         """Drain all pending signals in priority order (highest first)."""
-        signals: list[T] = []
-        while self._heap:
-            _, _, signal = heapq.heappop(self._heap)
-            signals.append(signal)
-        self._has_items.clear()
-        return signals
+        async with self._lock:
+            signals: list[T] = []
+            while self._heap:
+                _, _, signal = heapq.heappop(self._heap)
+                signals.append(signal)
+            self._has_items.clear()
+            return signals

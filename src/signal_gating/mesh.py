@@ -192,6 +192,46 @@ class Mesh:
 
         src._add_output(content_route)
 
+    def load_balance(
+        self,
+        source: Agent | str,
+        targets: list[Agent | str],
+        gate: Gate | None = None,
+    ) -> None:
+        """Round-robin load balancing across multiple target agents.
+
+        Distributes signals evenly across targets. Essential for scaling
+        agent workloads horizontally:
+
+            mesh.load_balance(dispatcher, [worker1, worker2, worker3])
+        """
+        src = self._resolve(source)
+        resolved = [self._resolve(t) for t in targets]
+        if not resolved:
+            raise MeshError("load_balance requires at least one target")
+        counter = [0]
+        tracer = self.tracer
+
+        async def balanced_route(signal: Signal) -> None:
+            if gate is not None:
+                result = await gate.process(signal)
+                if result is None:
+                    return
+                signal = result
+            target = resolved[counter[0] % len(resolved)]
+            counter[0] += 1
+            tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=signal.id,
+                agent=src.name,
+                gate="load_balance",
+                action="routed",
+                target=target.name,
+            )
+            await target.inbox.send(signal)
+
+        src._add_output(balanced_route)
+
     async def start(self) -> None:
         """Start all agents in the mesh."""
         self._running = True
@@ -215,6 +255,18 @@ class Mesh:
         """Inject a signal directly into an agent's inbox."""
         agent = self._resolve(target)
         await agent.inbox.send(signal)
+
+    def health(self) -> dict[str, Any]:
+        """Aggregate health status of all agents in the mesh."""
+        agent_health = {a.name: a.health() for a in self._agents.values()}
+        all_healthy = all(h["healthy"] for h in agent_health.values())
+        return {
+            "healthy": all_healthy,
+            "running": self._running,
+            "agents": agent_health,
+            "total_agents": len(self._agents),
+            "total_edges": len(self._edges),
+        }
 
     def topology(self) -> dict[str, Any]:
         """Return the mesh topology as a dict for inspection."""
