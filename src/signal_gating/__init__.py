@@ -31,12 +31,13 @@ Quick start:
         await planner.emit(TaskSignal(task="build", priority=5))
 """
 
-from signal_gating.agent import Agent
+from signal_gating.agent import Agent, DeadLetterQueue
 from signal_gating.channel import Channel
 from signal_gating.errors import (
     AgentError,
     ChannelClosed,
     ChannelFull,
+    CircuitOpenError,
     GateRejected,
     MeshError,
     SignalGatingError,
@@ -54,6 +55,8 @@ __all__ = [
     "Channel",
     "ChannelClosed",
     "ChannelFull",
+    "CircuitOpenError",
+    "DeadLetterQueue",
     "Gate",
     "GateRejected",
     "Mesh",

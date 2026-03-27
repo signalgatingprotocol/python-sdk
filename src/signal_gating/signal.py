@@ -50,5 +50,6 @@ class Signal(BaseModel):
         return self.evolve(metadata=merged)
 
     def __repr__(self) -> str:
-        fields = {k: v for k, v in self.model_dump().items() if k not in ("id", "timestamp", "trace_id", "metadata") or v}
+        skip = ("id", "timestamp", "trace_id", "metadata")
+        fields = {k: v for k, v in self.model_dump().items() if k not in skip or v}
         return f"{type(self).__name__}({', '.join(f'{k}={v!r}' for k, v in fields.items())})"

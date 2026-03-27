@@ -2,7 +2,7 @@
 
 import asyncio
 
-from signal_gating import Agent, Gate, Mesh, Signal
+from signal_gating import Agent, Mesh, Signal
 
 
 class DataSignal(Signal):

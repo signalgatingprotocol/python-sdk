@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from signal_gating import Agent, Gate, Mesh, MeshError, Signal
+from signal_gating import Agent, Gate, Mesh, MeshError, Signal, Tracer
 
 
 class TaskSignal(Signal):
@@ -159,3 +159,69 @@ async def test_mesh_connect_by_name():
     mesh = Mesh([a, b])
     mesh.connect("a", "b")
     assert len(mesh.edges) == 1
+
+
+# --- New: Integrated Tracing ---
+
+
+async def test_mesh_auto_traces_signal_flow():
+    producer = Agent("producer")
+    consumer = Agent("consumer")
+    received = []
+
+    @consumer.on(TaskSignal)
+    async def handle(signal: TaskSignal):
+        received.append(signal.task)
+
+    mesh = Mesh([producer, consumer])
+    mesh.connect(producer, consumer)
+
+    async with mesh:
+        await producer.emit(TaskSignal(task="traced"))
+        await asyncio.sleep(0.05)
+
+    # Mesh should have auto-traced the signal flow
+    assert mesh.tracer.span_count > 0
+    summary = mesh.tracer.summary()
+    assert summary["total_spans"] > 0
+    assert "routed" in summary["actions"]
+
+
+async def test_mesh_traces_edge_rejection():
+    producer = Agent("producer")
+    consumer = Agent("consumer")
+
+    @consumer.on(Signal)
+    async def handle(s: Signal):
+        pass
+
+    mesh = Mesh([producer, consumer])
+    mesh.connect(producer, consumer, gate=Gate.by_priority(100))
+
+    async with mesh:
+        await producer.emit(Signal(priority=1))
+        await asyncio.sleep(0.05)
+
+    actions = mesh.tracer.summary().get("actions", {})
+    assert "edge_rejected" in actions
+
+
+async def test_mesh_custom_tracer():
+    tracer = Tracer(max_spans=50)
+    a = Agent("a")
+    b = Agent("b")
+
+    @b.on(Signal)
+    async def handle(s: Signal):
+        pass
+
+    mesh = Mesh([a, b], tracer=tracer)
+    mesh.connect(a, b)
+
+    async with mesh:
+        await a.emit(Signal())
+        await asyncio.sleep(0.05)
+
+    # The custom tracer should have been used
+    assert tracer.span_count > 0
+    assert mesh.tracer is tracer

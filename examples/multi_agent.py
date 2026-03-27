@@ -25,9 +25,12 @@ async def main():
     @analyst.on(TaskSignal)
     async def analyze(signal: TaskSignal):
         print(f"  [analyst] Analyzing: {signal.task}")
-        await analyst.emit(
-            ResultSignal(task=signal.task, output=f"Analysis of '{signal.task}' complete", priority=signal.priority)
+        result = ResultSignal(
+            task=signal.task,
+            output=f"Analysis of '{signal.task}' complete",
+            priority=signal.priority,
         )
+        await analyst.emit(result)
 
     # Reporter receives results
     @reporter.on(ResultSignal)

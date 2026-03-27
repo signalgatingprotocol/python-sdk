@@ -114,3 +114,147 @@ async def test_agent_source_tagging():
 
     await agent.emit(TaskSignal(task="tagged"))
     assert emitted[0].source == "tagger"
+
+
+# --- New: Middleware ---
+
+
+async def test_agent_middleware():
+    agent = Agent("mw_agent")
+    log = []
+
+    async def logging_mw(signal, next_fn):
+        log.append(f"before:{signal.priority}")
+        result = await next_fn(signal)
+        log.append(f"after:{signal.priority}")
+        return result
+
+    agent.use(logging_mw)
+
+    @agent.on(Signal)
+    async def handle(signal: Signal):
+        log.append(f"handler:{signal.priority}")
+
+    await agent.start()
+    await agent.inbox.send(Signal(priority=42))
+    await asyncio.sleep(0.05)
+    await agent.stop()
+
+    assert "before:42" in log
+    assert "handler:42" in log
+    assert "after:42" in log
+
+
+async def test_agent_middleware_chain():
+    agent = Agent("chain_agent")
+    order = []
+
+    async def mw_a(signal, next_fn):
+        order.append("a_before")
+        result = await next_fn(signal)
+        order.append("a_after")
+        return result
+
+    async def mw_b(signal, next_fn):
+        order.append("b_before")
+        result = await next_fn(signal)
+        order.append("b_after")
+        return result
+
+    agent.use(mw_a)
+    agent.use(mw_b)
+
+    @agent.on(Signal)
+    async def handle(signal: Signal):
+        order.append("handler")
+
+    await agent.start()
+    await agent.inbox.send(Signal())
+    await asyncio.sleep(0.05)
+    await agent.stop()
+
+    # Middleware should wrap in order: a wraps b wraps handler
+    assert order == ["a_before", "b_before", "handler", "b_after", "a_after"]
+
+
+# --- New: Agent State ---
+
+
+async def test_agent_state():
+    agent = Agent("stateful")
+    agent.state["counter"] = 0
+
+    @agent.on(Signal)
+    async def handle(signal: Signal):
+        agent.state["counter"] += 1
+
+    await agent.start()
+    await agent.inbox.send(Signal())
+    await agent.inbox.send(Signal())
+    await agent.inbox.send(Signal())
+    await asyncio.sleep(0.05)
+    await agent.stop()
+
+    assert agent.state["counter"] == 3
+
+
+# --- New: Dead Letter Queue ---
+
+
+async def test_dead_letter_queue_on_gate_rejection():
+    agent = Agent("dlq_agent", gates=[Gate.by_priority(100)])
+
+    @agent.on(Signal)
+    async def handle(signal: Signal):
+        pass
+
+    await agent.start()
+    await agent.inbox.send(Signal(priority=1))
+    await asyncio.sleep(0.05)
+    await agent.stop()
+
+    assert agent.dead_letters.count == 1
+    entry = agent.dead_letters.entries[0]
+    assert entry["reason"] == "gate_rejected"
+    assert entry["agent"] == "dlq_agent"
+
+
+async def test_dead_letter_queue_on_handler_error():
+    agent = Agent("error_agent")
+
+    @agent.on(Signal)
+    async def handle(signal: Signal):
+        raise ValueError("boom")
+
+    await agent.start()
+    await agent.inbox.send(Signal())
+    await asyncio.sleep(0.1)
+    await agent.stop()
+
+    assert agent.dead_letters.count == 1
+    entry = agent.dead_letters.entries[0]
+    assert entry["reason"] == "handler_error"
+    assert "ValueError: boom" in entry["error"]
+
+
+# --- New: Stats include errors and dead letters ---
+
+
+async def test_agent_stats_extended():
+    agent = Agent("stats_agent", gates=[Gate.by_priority(5)])
+
+    @agent.on(Signal)
+    async def handle(signal: Signal):
+        pass
+
+    await agent.start()
+    await agent.inbox.send(Signal(priority=1))
+    await agent.inbox.send(Signal(priority=10))
+    await asyncio.sleep(0.05)
+    await agent.stop()
+
+    stats = agent.stats
+    assert "errors" in stats
+    assert "dead_letters" in stats
+    assert stats["dead_letters"] == 1  # one gate rejection
+    assert stats["restarts"] == 0

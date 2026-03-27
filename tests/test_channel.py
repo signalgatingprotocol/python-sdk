@@ -1,7 +1,5 @@
 """Tests for Channel async transport."""
 
-import asyncio
-
 import pytest
 
 from signal_gating import Channel, ChannelClosed, ChannelFull, Signal
