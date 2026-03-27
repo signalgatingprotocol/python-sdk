@@ -7,7 +7,7 @@ import itertools
 import logging
 from collections.abc import Awaitable, Callable
 from inspect import isawaitable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from signal_gating.agent import Agent
@@ -15,6 +15,9 @@ from signal_gating.errors import MeshError
 from signal_gating.gate import Gate
 from signal_gating.signal import Signal
 from signal_gating.tracing import Tracer
+
+if TYPE_CHECKING:
+    from signal_gating.pool import AgentPool
 
 logger = logging.getLogger("signal_gating.mesh")
 
@@ -59,6 +62,8 @@ class Mesh:
         self._running = False
         self._interceptors: list[Interceptor] = []
         self._capabilities: dict[str, set[str]] = {}
+        self._pools: dict[str, AgentPool] = {}
+        self._topics: dict[str, list[Agent]] = {}
         self.tracer = tracer or Tracer()
         for agent in agents or []:
             self.add(agent)
@@ -130,67 +135,6 @@ class Mesh:
         # Remove the actual routing functions from the source agent's outbox
         src._remove_outputs(target=tgt_name)
         return before - len(self._edges)
-
-    def connect(
-        self,
-        source: Agent | str,
-        target: Agent | str,
-        gate: Gate | None = None,
-    ) -> None:
-        """Connect two agents with an optional gate on the edge.
-
-        Signals emitted by `source` will be delivered to `target`'s inbox,
-        after passing through the optional gate.
-        """
-        src = self._resolve(source)
-        tgt = self._resolve(target)
-
-        edge = Edge(src, tgt, gate)
-        self._edges.append(edge)
-        tracer = self.tracer
-        mesh = self
-
-        async def route(signal: Signal) -> None:
-            # Apply mesh-level interceptors
-            intercepted = await mesh._apply_interceptors(signal, src.name, tgt.name)
-            if intercepted is None:
-                tracer.record(
-                    trace_id=signal.trace_id,
-                    signal_id=signal.id,
-                    agent=f"{src.name}->{tgt.name}",
-                    gate="interceptor",
-                    action="intercepted",
-                )
-                return
-            signal = intercepted
-
-            if gate is not None:
-                result = await gate.process(signal)
-                if result is None:
-                    tracer.record(
-                        trace_id=signal.trace_id,
-                        signal_id=signal.id,
-                        agent=f"{src.name}->{tgt.name}",
-                        gate=gate.name,
-                        action="edge_rejected",
-                    )
-                    return
-                signal = result
-            tracer.record(
-                trace_id=signal.trace_id,
-                signal_id=signal.id,
-                agent=src.name,
-                gate="route",
-                action="routed",
-                target=tgt.name,
-            )
-            await tgt.inbox.send(signal)
-
-        # Tag route function so disconnect/remove can find and remove it
-        route._mesh_target = tgt.name  # type: ignore[attr-defined]
-        route._mesh_source = src.name  # type: ignore[attr-defined]
-        route._mesh_tag = "connect"  # type: ignore[attr-defined]
-        src._add_output(route)
 
     def broadcast_connect(
         self,
@@ -422,6 +366,214 @@ class Mesh:
         name = agent if isinstance(agent, str) else agent.name
         return set(self._capabilities.get(name, set()))
 
+    # --- Agent Pools ---
+
+    def add_pool(self, pool: AgentPool) -> None:
+        """Add an agent pool to the mesh.
+
+        All pool workers are added as mesh agents. The pool object is tracked
+        so that ``connect(source, pool)`` and ``connect(pool, target)`` work
+        with automatic load balancing.
+
+            pool = AgentPool("workers", size=3)
+            mesh.add_pool(pool)
+            mesh.connect(coordinator, pool)  # load-balanced to workers
+            mesh.connect(pool, collector)    # all workers emit to collector
+        """
+        if pool.name in self._pools:
+            raise MeshError(f"Pool '{pool.name}' already exists in mesh")
+        self._pools[pool.name] = pool
+        for worker in pool.workers:
+            self.add(worker)
+
+    def get_pool(self, name: str) -> AgentPool:
+        """Get a pool by name."""
+        if name not in self._pools:
+            raise MeshError(f"Pool '{name}' not found in mesh")
+        return self._pools[name]
+
+    def _resolve_pool_or_agent(
+        self, ref: Agent | str | AgentPool,
+    ) -> Agent | AgentPool:
+        """Resolve a reference that could be an Agent, pool name, or AgentPool."""
+        from signal_gating.pool import AgentPool
+
+        if isinstance(ref, AgentPool):
+            return ref
+        if isinstance(ref, str):
+            if ref in self._pools:
+                return self._pools[ref]
+            return self.get(ref)
+        return ref
+
+    def connect(
+        self,
+        source: Agent | str | AgentPool,
+        target: Agent | str | AgentPool,
+        gate: Gate | None = None,
+    ) -> None:
+        """Connect two agents with an optional gate on the edge.
+
+        Supports AgentPool as source or target:
+        - Pool as target: load-balanced across pool workers
+        - Pool as source: all workers connect to target
+        """
+        from signal_gating.pool import AgentPool
+
+        resolved_src = self._resolve_pool_or_agent(source)
+        resolved_tgt = self._resolve_pool_or_agent(target)
+
+        if isinstance(resolved_src, AgentPool) and isinstance(resolved_tgt, AgentPool):
+            # Pool-to-pool: all source workers load-balance to target workers
+            for worker in resolved_src.workers:
+                self.load_balance(worker, resolved_tgt.workers, gate)
+            return
+
+        if isinstance(resolved_tgt, AgentPool):
+            # Load-balance across pool workers
+            src_agent = resolved_src if isinstance(resolved_src, Agent) else self.get(str(source))
+            self.load_balance(src_agent, resolved_tgt.workers, gate)
+            return
+
+        if isinstance(resolved_src, AgentPool):
+            # All pool workers connect to target
+            tgt_agent = resolved_tgt if isinstance(resolved_tgt, Agent) else self.get(str(target))
+            for worker in resolved_src.workers:
+                self._connect_agents(worker, tgt_agent, gate)
+            return
+
+        # Standard agent-to-agent
+        src_agent = resolved_src if isinstance(resolved_src, Agent) else self._resolve(source)
+        tgt_agent = resolved_tgt if isinstance(resolved_tgt, Agent) else self._resolve(target)
+        self._connect_agents(src_agent, tgt_agent, gate)
+
+    def _connect_agents(
+        self,
+        src: Agent,
+        tgt: Agent,
+        gate: Gate | None = None,
+    ) -> None:
+        """Internal: wire two agents together."""
+        edge = Edge(src, tgt, gate)
+        self._edges.append(edge)
+        tracer = self.tracer
+        mesh = self
+
+        async def route(signal: Signal) -> None:
+            # Apply mesh-level interceptors
+            intercepted = await mesh._apply_interceptors(signal, src.name, tgt.name)
+            if intercepted is None:
+                tracer.record(
+                    trace_id=signal.trace_id,
+                    signal_id=signal.id,
+                    agent=f"{src.name}->{tgt.name}",
+                    gate="interceptor",
+                    action="intercepted",
+                )
+                return
+            signal = intercepted
+
+            if gate is not None:
+                result = await gate.process(signal)
+                if result is None:
+                    tracer.record(
+                        trace_id=signal.trace_id,
+                        signal_id=signal.id,
+                        agent=f"{src.name}->{tgt.name}",
+                        gate=gate.name,
+                        action="edge_rejected",
+                    )
+                    return
+                signal = result
+            tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=signal.id,
+                agent=src.name,
+                gate="route",
+                action="routed",
+                target=tgt.name,
+            )
+            await tgt.inbox.send(signal)
+
+        # Tag route function so disconnect/remove can find and remove it
+        route._mesh_target = tgt.name  # type: ignore[attr-defined]
+        route._mesh_source = src.name  # type: ignore[attr-defined]
+        route._mesh_tag = "connect"  # type: ignore[attr-defined]
+        src._add_output(route)
+
+    # --- Pub/Sub Topics ---
+
+    def create_topic(self, name: str) -> None:
+        """Create a named topic for publish/subscribe communication.
+
+        Topics decouple producers from consumers. Any agent can publish to a
+        topic, and all subscribers receive the signal. This is the agent-native
+        broadcast pattern — essential when the number and identity of consumers
+        is dynamic.
+
+            mesh.create_topic("events")
+            mesh.subscribe(logger_agent, "events")
+            mesh.subscribe(metrics_agent, "events")
+
+            # Any agent can publish
+            await mesh.publish("events", AlertSignal(message="CPU spike"))
+        """
+        if name in self._topics:
+            raise MeshError(f"Topic '{name}' already exists")
+        self._topics[name] = []
+
+    def subscribe(self, agent: Agent | str, topic: str) -> None:
+        """Subscribe an agent to a topic. It will receive all published signals."""
+        if topic not in self._topics:
+            raise MeshError(f"Topic '{topic}' does not exist — create it first")
+        resolved = self._resolve(agent)
+        if resolved not in self._topics[topic]:
+            self._topics[topic].append(resolved)
+
+    def unsubscribe(self, agent: Agent | str, topic: str) -> None:
+        """Unsubscribe an agent from a topic."""
+        if topic not in self._topics:
+            return
+        resolved = self._resolve(agent)
+        self._topics[topic] = [a for a in self._topics[topic] if a.name != resolved.name]
+
+    async def publish(self, topic: str, signal: Signal) -> int:
+        """Publish a signal to all subscribers of a topic.
+
+        Returns the number of subscribers that received the signal.
+        This is fire-and-forget — the signal is sent to each subscriber's
+        inbox without waiting for processing.
+
+            count = await mesh.publish("events", AlertSignal(message="alert"))
+        """
+        if topic not in self._topics:
+            raise MeshError(f"Topic '{topic}' does not exist")
+        subscribers = self._topics[topic]
+        for subscriber in subscribers:
+            self.tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=signal.id,
+                agent="mesh",
+                gate=f"topic:{topic}",
+                action="published",
+                target=subscriber.name,
+            )
+            await subscriber.inbox.send(signal)
+        return len(subscribers)
+
+    def list_topics(self) -> dict[str, list[str]]:
+        """List all topics and their subscriber names."""
+        return {
+            topic: [a.name for a in subscribers]
+            for topic, subscribers in self._topics.items()
+        }
+
+    def delete_topic(self, name: str) -> None:
+        """Delete a topic and remove all subscriptions."""
+        if name not in self._topics:
+            raise MeshError(f"Topic '{name}' does not exist")
+        del self._topics[name]
+
     # --- Scatter / Gather ---
 
     async def scatter(
@@ -508,9 +660,9 @@ class Mesh:
         self._running = False
         if drain:
             # Wait for all inboxes to empty with adaptive polling
-            deadline = asyncio.get_event_loop().time() + drain_timeout
+            deadline = asyncio.get_running_loop().time() + drain_timeout
             interval = 0.01  # Start fast, back off
-            while asyncio.get_event_loop().time() < deadline:
+            while asyncio.get_running_loop().time() < deadline:
                 if all(a.inbox.pending == 0 for a in self._agents.values()):
                     break
                 await asyncio.sleep(interval)

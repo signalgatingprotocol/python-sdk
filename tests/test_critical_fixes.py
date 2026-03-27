@@ -3,10 +3,7 @@
 import asyncio
 import time
 
-import pytest
-
 from signal_gating import Agent, AgentContext, Gate, Mesh, Signal
-from signal_gating.channel import PriorityChannel
 
 
 class TaskSignal(Signal):
