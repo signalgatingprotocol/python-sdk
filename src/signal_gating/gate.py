@@ -16,6 +16,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from inspect import isawaitable
+from typing import Any
 
 from signal_gating.signal import Signal
 

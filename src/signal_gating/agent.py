@@ -302,6 +302,7 @@ class Agent:
                     handlers.remove(wrapper)
                 return result
 
+            wrapper.__wrapped__ = fn  # type: ignore[attr-defined]
             self._handlers.setdefault(signal_type, []).append(wrapper)
             return fn
 

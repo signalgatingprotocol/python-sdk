@@ -46,6 +46,7 @@ from signal_gating.errors import (
 from signal_gating.gate import Gate
 from signal_gating.mesh import Edge, Mesh
 from signal_gating.pipeline import Pipeline
+from signal_gating.pool import AgentPool
 from signal_gating.signal import Signal
 from signal_gating.tracing import Span, Tracer
 
@@ -53,6 +54,7 @@ __all__ = [
     "Agent",
     "AgentContext",
     "AgentError",
+    "AgentPool",
     "Channel",
     "ChannelClosed",
     "ChannelFull",
