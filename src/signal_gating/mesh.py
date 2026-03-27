@@ -89,10 +89,19 @@ class Mesh:
 
         Dynamic topology is essential for agent systems — agents join and leave
         at runtime based on demand, failures, or scaling decisions.
+
+        This removes all edges, routing functions, and capabilities — the agent
+        is fully severed from the mesh.
         """
         resolved = self._resolve(agent)
         if resolved.running:
             await resolved.stop()
+        # Remove all outbox functions that route TO this agent (from other agents)
+        for other in self._agents.values():
+            if other.name != resolved.name:
+                other._remove_outputs(target=resolved.name)
+        # Clear the removed agent's own outbox
+        resolved._outbox.clear()
         # Remove all edges involving this agent
         self._edges = [
             e for e in self._edges
@@ -107,14 +116,19 @@ class Mesh:
 
         Enables runtime topology rewiring — agents can be reconnected
         to different targets without restarting the mesh.
+
+        This removes both the edge records AND the actual routing functions,
+        so signals genuinely stop flowing between the disconnected agents.
         """
-        src_name = source if isinstance(source, str) else source.name
+        src = self._resolve(source)
         tgt_name = target if isinstance(target, str) else target.name
         before = len(self._edges)
         self._edges = [
             e for e in self._edges
-            if not (e.source.name == src_name and e.target.name == tgt_name)
+            if not (e.source.name == src.name and e.target.name == tgt_name)
         ]
+        # Remove the actual routing functions from the source agent's outbox
+        src._remove_outputs(target=tgt_name)
         return before - len(self._edges)
 
     def connect(
@@ -172,6 +186,10 @@ class Mesh:
             )
             await tgt.inbox.send(signal)
 
+        # Tag route function so disconnect/remove can find and remove it
+        route._mesh_target = tgt.name  # type: ignore[attr-defined]
+        route._mesh_source = src.name  # type: ignore[attr-defined]
+        route._mesh_tag = "connect"  # type: ignore[attr-defined]
         src._add_output(route)
 
     def broadcast_connect(
@@ -244,6 +262,8 @@ class Mesh:
                 )
                 await resolved_default.inbox.send(signal)
 
+        content_route._mesh_tag = "content_route"  # type: ignore[attr-defined]
+        content_route._mesh_source = src.name  # type: ignore[attr-defined]
         src._add_output(content_route)
 
     def load_balance(
@@ -283,6 +303,8 @@ class Mesh:
             )
             await target.inbox.send(signal)
 
+        balanced_route._mesh_tag = "load_balance"  # type: ignore[attr-defined]
+        balanced_route._mesh_source = src.name  # type: ignore[attr-defined]
         src._add_output(balanced_route)
 
     async def start(self) -> None:
@@ -475,21 +497,24 @@ class Mesh:
 
     # --- Graceful Shutdown ---
 
-    async def stop(self, drain: bool = False) -> None:
+    async def stop(self, drain: bool = False, drain_timeout: float = 10.0) -> None:
         """Stop all agents gracefully.
 
         Args:
             drain: If True, wait for agents to process all pending signals
                    before shutting down. If False, stop immediately.
+            drain_timeout: Maximum seconds to wait for drain (default 10s).
         """
         self._running = False
         if drain:
-            # Wait for all inboxes to empty
-            for _ in range(100):  # Max 10 seconds
-                all_empty = all(a.inbox.pending == 0 for a in self._agents.values())
-                if all_empty:
+            # Wait for all inboxes to empty with adaptive polling
+            deadline = asyncio.get_event_loop().time() + drain_timeout
+            interval = 0.01  # Start fast, back off
+            while asyncio.get_event_loop().time() < deadline:
+                if all(a.inbox.pending == 0 for a in self._agents.values()):
                     break
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(interval)
+                interval = min(interval * 1.5, 0.2)  # Adaptive: 10ms -> 200ms
         await asyncio.gather(*(agent.stop() for agent in self._agents.values()))
         logger.info("Mesh stopped")
 

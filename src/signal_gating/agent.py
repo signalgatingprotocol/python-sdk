@@ -178,12 +178,11 @@ class Agent:
     ):
         self.name = name
         self.gates = gates or []
-        self.inbox: Channel[Signal] | PriorityChannel[Signal] = (
-            PriorityChannel(Signal, buffer_size=buffer_size)
-            if priority_inbox
-            else Channel(Signal, buffer_size=buffer_size)
-        )
+        self._buffer_size = buffer_size
+        self._priority_inbox = priority_inbox
+        self.inbox: Channel[Signal] | PriorityChannel[Signal] = self._make_inbox()
         self._handlers: dict[type[Signal], list[Handler]] = {}
+        self._handler_context_cache: dict[int, bool] = {}
         self._middleware: list[Middleware] = []
         self._outbox: list[Callable[[Signal], Coroutine[Any, Any, None]]] = []
         self._task: asyncio.Task[None] | None = None
@@ -212,6 +211,12 @@ class Agent:
 
         # Request/response pending futures
         self._pending_requests: dict[str, asyncio.Future[Signal]] = {}
+
+    def _make_inbox(self) -> Channel[Signal] | PriorityChannel[Signal]:
+        """Create a fresh inbox channel."""
+        if self._priority_inbox:
+            return PriorityChannel(Signal, buffer_size=self._buffer_size)
+        return Channel(Signal, buffer_size=self._buffer_size)
 
     def set_tracer(self, tracer: Any) -> None:
         """Attach a tracer for observability. Called by Mesh or manually."""
@@ -385,13 +390,14 @@ class Agent:
             await send_fn(tagged)
 
     async def emit_many(self, signals: list[Signal]) -> None:
-        """Emit multiple signals in batch. More efficient than individual emit() calls.
+        """Emit multiple signals concurrently.
 
-        Essential for high-throughput agent patterns like fan-out, map operations,
-        or agents that produce multiple outputs per input signal.
+        Uses asyncio.gather for true parallel emission — all signals are sent
+        to all downstream agents simultaneously instead of sequentially.
+        Essential for high-throughput agent patterns like fan-out and map operations.
         """
-        for signal in signals:
-            await self.emit(signal)
+        if signals:
+            await asyncio.gather(*(self.emit(signal) for signal in signals))
 
     async def _apply_gates(self, signal: Signal) -> Signal | None:
         """Apply all gates sequentially. Returns None if any gate rejects."""
@@ -432,21 +438,32 @@ class Agent:
     def _handler_wants_context(self, handler: Handler) -> bool:
         """Check if a handler's signature includes an AgentContext parameter.
 
-        Uses inspect.signature() for robust detection that works with
-        decorated functions, closures, and deferred annotations.
+        Results are cached per handler identity for performance — this avoids
+        expensive introspection on every signal dispatch.
         """
+        handler_id = id(handler)
+        cached = self._handler_context_cache.get(handler_id)
+        if cached is not None:
+            return cached
+
+        result = self._inspect_handler_context(handler)
+        self._handler_context_cache[handler_id] = result
+        return result
+
+    @staticmethod
+    def _inspect_handler_context(handler: Handler) -> bool:
+        """Introspect a handler's signature for AgentContext parameter."""
         try:
             fn = getattr(handler, "__wrapped__", handler)
             sig = inspect.signature(fn)
             params = list(sig.parameters.values())
             if len(params) < 2:
                 return False
-            # Check type hints robustly
             try:
                 hints = get_type_hints(fn)
             except Exception:
                 hints = getattr(fn, "__annotations__", {})
-            for param in params[1:]:  # Skip the first param (signal)
+            for param in params[1:]:
                 ann = hints.get(param.name)
                 if ann is AgentContext:
                     return True
@@ -530,9 +547,16 @@ class Agent:
             self._running = False
 
     async def start(self) -> None:
-        """Start the agent's processing loop with supervision."""
+        """Start the agent's processing loop with supervision.
+
+        Can be called after stop() — a fresh inbox is created automatically
+        if the previous one was closed, enabling agent restart patterns.
+        """
         if self._task is not None:
             return
+        # Recreate inbox if it was closed (enables restart after stop)
+        if self.inbox.closed:
+            self.inbox = self._make_inbox()
         for hook in self._on_start_hooks:
             try:
                 result = hook()
@@ -548,7 +572,12 @@ class Agent:
         )
 
     async def _supervised_loop(self) -> None:
-        """Run the processing loop with automatic restart on failure."""
+        """Run the processing loop with automatic restart on failure.
+
+        Uses exponential backoff: each restart waits longer than the last,
+        preventing thundering-herd restarts in production systems.
+        """
+        current_delay = self._restart_delay
         while self._restart_count <= self._max_restarts:
             try:
                 await self._run_loop()
@@ -563,13 +592,15 @@ class Agent:
                     )
                     return
                 logger.warning(
-                    "Agent '%s' crashed (%s), restarting (%d/%d)...",
+                    "Agent '%s' crashed (%s), restarting (%d/%d) in %.1fs...",
                     self.name,
                     e,
                     self._restart_count,
                     self._max_restarts,
+                    current_delay,
                 )
-                await asyncio.sleep(self._restart_delay)
+                await asyncio.sleep(current_delay)
+                current_delay *= 2  # Exponential backoff
 
     async def stop(self) -> None:
         """Stop the agent gracefully."""
@@ -594,6 +625,23 @@ class Agent:
     def _add_output(self, send_fn: Callable[[Signal], Coroutine[Any, Any, None]]) -> None:
         """Internal: register an output destination."""
         self._outbox.append(send_fn)
+
+    def _remove_outputs(
+        self, *, target: str | None = None, tag: str | None = None
+    ) -> int:
+        """Internal: remove output destinations by target name or tag.
+
+        Returns the number of removed entries.
+        """
+        before = len(self._outbox)
+        self._outbox = [
+            fn for fn in self._outbox
+            if not (
+                (target is not None and getattr(fn, "_mesh_target", None) == target)
+                or (tag is not None and getattr(fn, "_mesh_tag", None) == tag)
+            )
+        ]
+        return before - len(self._outbox)
 
     def __repr__(self) -> str:
         n_handlers = sum(len(h) for h in self._handlers.values())
