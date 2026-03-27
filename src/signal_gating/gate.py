@@ -32,7 +32,7 @@ class Gate:
 
     def __init__(self, fn: GateFn, name: str = ""):
         self._fn = fn
-        self.name = name or fn.__name__ if hasattr(fn, "__name__") else "gate"
+        self.name = name or (fn.__name__ if hasattr(fn, "__name__") else "gate")
 
     async def process(self, signal: Signal) -> Signal | None:
         """Process a signal through this gate. Returns None if rejected."""
@@ -300,5 +300,74 @@ class Gate:
 
         def fn(signal: Signal) -> Signal | None:
             return signal if random.random() < rate else None  # noqa: S311
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def throttle(cls, max_per_second: float, name: str = "throttle") -> Gate:
+        """Throttle gate — drops signals that exceed the rate instead of sleeping.
+
+        Unlike `rate_limit` which applies backpressure (sleeps), throttle
+        silently drops excess signals. Use when dropping is preferable to
+        queuing — essential for real-time agent systems where stale signals
+        have no value.
+
+            gate = Gate.throttle(100)  # Allow max 100 signals/sec, drop rest
+        """
+        min_interval = 1.0 / max_per_second
+        state: dict[str, float] = {"last": 0.0}
+
+        def fn(signal: Signal) -> Signal | None:
+            now = time.monotonic()
+            if now - state["last"] < min_interval:
+                return None
+            state["last"] = now
+            return signal
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def ttl(cls, seconds: float, name: str = "ttl") -> Gate:
+        """Time-to-live gate — drops signals older than the specified age.
+
+        Prevents stale signals from consuming agent resources. Critical for
+        systems where signal freshness determines value:
+
+            gate = Gate.ttl(30)  # Drop signals older than 30 seconds
+        """
+
+        def fn(signal: Signal) -> Signal | None:
+            age = time.time() - signal.timestamp
+            return signal if age <= seconds else None
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def debounce(cls, seconds: float, name: str = "debounce") -> Gate:
+        """Debounce gate — only passes a signal after a quiet period.
+
+        Waits `seconds` after receiving a signal. If another signal arrives
+        during the wait, the timer resets. Only the last signal in a burst
+        passes through. Essential for noisy signal sources.
+
+            gate = Gate.debounce(0.5)  # Wait 500ms of silence before passing
+        """
+        state: dict[str, Any] = {"last_signal": None, "last_time": 0.0}
+        lock = asyncio.Lock()
+
+        async def fn(signal: Signal) -> Signal | None:
+            async with lock:
+                now = time.monotonic()
+                state["last_signal"] = signal
+                state["last_time"] = now
+
+            # Wait for quiet period
+            await asyncio.sleep(seconds)
+
+            async with lock:
+                # Only pass if no newer signal arrived
+                if state["last_time"] <= now:
+                    return state["last_signal"]
+                return None
 
         return cls(fn, name=name)

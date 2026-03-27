@@ -76,7 +76,27 @@ both = high_priority & Gate.filter(lambda s: s.source == "sensor")  # and
 not_low = ~Gate.by_priority(1)  # invert
 ```
 
-Built-in gates: `filter`, `transform`, `by_type`, `by_priority`, `rate_limit`, `deduplicate`, `retry`, `circuit_breaker`, `timeout`, `passthrough`, `block`.
+Built-in gates: `filter`, `transform`, `by_type`, `by_priority`, `rate_limit`, `throttle`, `deduplicate`, `retry`, `circuit_breaker`, `timeout`, `ttl`, `debounce`, `sample`, `when`, `passthrough`, `block`.
+
+**Real-time signal control:**
+
+```python
+# Throttle: drop excess signals instead of queuing (unlike rate_limit which sleeps)
+fast_gate = Gate.throttle(100)  # Max 100/sec, drop the rest
+
+# TTL: drop stale signals — freshness matters in real-time systems
+fresh_only = Gate.ttl(30)  # Drop signals older than 30 seconds
+
+# Debounce: wait for silence before passing — tame noisy signal sources
+stable = Gate.debounce(0.5)  # Pass only after 500ms of quiet
+
+# Conditional branching — the agent-native if/else for signal flow
+gate = Gate.when(
+    lambda s: s.priority >= 8,
+    then=Gate.transform(enrich_urgent),
+    otherwise=Gate.transform(enrich_normal),
+)
+```
 
 ### Agent
 
@@ -125,6 +145,21 @@ Request/response — agents can ask questions and wait for answers:
 response = await planner.request(TaskSignal(task="analyze data"), timeout=5.0)
 ```
 
+**Restartable agents** — agents can be stopped and restarted with fresh inboxes:
+
+```python
+await worker.stop()
+# ... fix the issue, update config ...
+await worker.start()  # Fresh inbox, preserved state and handlers
+```
+
+**Supervision** — agents auto-restart on failure with exponential backoff:
+
+```python
+worker = Agent("worker", max_restarts=5, restart_delay=1.0)
+# Delays: 1s, 2s, 4s, 8s, 16s between restarts
+```
+
 ### Mesh
 
 Agent network topology with gated connections and content-based routing:
@@ -143,6 +178,10 @@ mesh.route(coordinator, [
     (lambda s: s.priority >= 8, critical_handler),
     (lambda s: isinstance(s, AnalysisTask), analyst),
 ], default=general_worker)
+
+# Dynamic topology — rewire at runtime
+mesh.disconnect(coordinator, analyst)  # Fully stops signal flow
+await mesh.remove(analyst)  # Remove agent, cleanup all connections
 
 # Lifecycle with graceful drain
 async with mesh:
