@@ -57,3 +57,26 @@ def test_clear():
     tracer.record("t1", "s1", "a", "g", "passed")
     tracer.clear()
     assert tracer.span_count == 0
+
+
+def test_summary_latency_percentiles():
+    tracer = Tracer()
+    for i in range(100):
+        tracer.record("t1", f"s{i}", "a", "g", "passed", duration_ms=float(i + 1))
+
+    s = tracer.summary()
+    assert "latency_ms" in s
+    lat = s["latency_ms"]
+    assert lat["min"] == 1.0
+    assert lat["max"] == 100.0
+    assert lat["mean"] == 50.5
+    assert lat["p50"] == 51.0
+    assert lat["p95"] == 96.0
+    assert lat["p99"] == 100.0
+
+
+def test_summary_no_latency_when_zero_durations():
+    tracer = Tracer()
+    tracer.record("t1", "s1", "a", "g", "passed")  # duration_ms=0
+    s = tracer.summary()
+    assert "latency_ms" not in s

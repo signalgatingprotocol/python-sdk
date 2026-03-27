@@ -350,3 +350,118 @@ async def test_mesh_content_routing_traces():
 
     actions = mesh.tracer.summary().get("actions", {})
     assert "routed" in actions
+
+
+# --- Load Balancing ---
+
+
+async def test_mesh_load_balance():
+    dispatcher = Agent("dispatcher")
+    w1 = Agent("w1")
+    w2 = Agent("w2")
+    w3 = Agent("w3")
+    w1_received: list[str] = []
+    w2_received: list[str] = []
+    w3_received: list[str] = []
+
+    @w1.on(TaskSignal)
+    async def h1(s: TaskSignal):
+        w1_received.append(s.task)
+
+    @w2.on(TaskSignal)
+    async def h2(s: TaskSignal):
+        w2_received.append(s.task)
+
+    @w3.on(TaskSignal)
+    async def h3(s: TaskSignal):
+        w3_received.append(s.task)
+
+    mesh = Mesh([dispatcher, w1, w2, w3])
+    mesh.load_balance(dispatcher, [w1, w2, w3])
+
+    async with mesh:
+        for i in range(6):
+            await dispatcher.emit(TaskSignal(task=f"job-{i}"))
+        await asyncio.sleep(0.1)
+
+    # Round-robin: each worker gets exactly 2 jobs
+    assert len(w1_received) == 2
+    assert len(w2_received) == 2
+    assert len(w3_received) == 2
+    assert w1_received == ["job-0", "job-3"]
+    assert w2_received == ["job-1", "job-4"]
+    assert w3_received == ["job-2", "job-5"]
+
+
+async def test_mesh_load_balance_with_gate():
+    dispatcher = Agent("dispatcher")
+    w1 = Agent("w1")
+    w2 = Agent("w2")
+    received: list[str] = []
+
+    @w1.on(TaskSignal)
+    async def h1(s: TaskSignal):
+        received.append(f"w1:{s.task}")
+
+    @w2.on(TaskSignal)
+    async def h2(s: TaskSignal):
+        received.append(f"w2:{s.task}")
+
+    mesh = Mesh([dispatcher, w1, w2])
+    mesh.load_balance(dispatcher, [w1, w2], gate=Gate.by_priority(5))
+
+    async with mesh:
+        await dispatcher.emit(TaskSignal(task="low", priority=1))
+        await dispatcher.emit(TaskSignal(task="high", priority=10))
+        await asyncio.sleep(0.05)
+
+    # Low priority is filtered out, only high gets through
+    assert len(received) == 1
+    assert "high" in received[0]
+
+
+async def test_mesh_load_balance_by_name():
+    dispatcher = Agent("dispatcher")
+    w1 = Agent("w1")
+    w2 = Agent("w2")
+
+    @w1.on(Signal)
+    async def h1(s: Signal):
+        pass
+
+    @w2.on(Signal)
+    async def h2(s: Signal):
+        pass
+
+    mesh = Mesh([dispatcher, w1, w2])
+    mesh.load_balance("dispatcher", ["w1", "w2"])
+    # Should not raise — just verifying the API accepts strings
+
+
+# --- Mesh Health ---
+
+
+async def test_mesh_health():
+    a = Agent("a")
+    b = Agent("b")
+
+    @a.on(Signal)
+    async def ha(s: Signal):
+        pass
+
+    @b.on(Signal)
+    async def hb(s: Signal):
+        pass
+
+    mesh = Mesh([a, b])
+    mesh.connect(a, b)
+
+    async with mesh:
+        health = mesh.health()
+        assert health["healthy"] is True
+        assert health["running"] is True
+        assert health["total_agents"] == 2
+        assert health["total_edges"] == 1
+        assert "a" in health["agents"]
+        assert "b" in health["agents"]
+        assert health["agents"]["a"]["healthy"] is True

@@ -33,6 +33,7 @@ class DeadLetterQueue:
 
     def __init__(self, max_size: int = 10000):
         self._entries: list[dict[str, Any]] = []
+        self._signals: list[Signal] = []
         self._max_size = max_size
 
     def add(
@@ -53,19 +54,34 @@ class DeadLetterQueue:
         if error is not None:
             entry["error"] = f"{type(error).__name__}: {error}"
         self._entries.append(entry)
+        self._signals.append(signal)
         if len(self._entries) > self._max_size:
             self._entries = self._entries[-self._max_size :]
+            self._signals = self._signals[-self._max_size :]
 
     @property
     def entries(self) -> list[dict[str, Any]]:
         return list(self._entries)
 
     @property
+    def signals(self) -> list[Signal]:
+        """Access the original signal objects for replay or inspection."""
+        return list(self._signals)
+
+    @property
     def count(self) -> int:
         return len(self._entries)
 
+    def drain(self) -> list[Signal]:
+        """Remove and return all signals for replay. Clears the DLQ."""
+        signals = list(self._signals)
+        self._entries.clear()
+        self._signals.clear()
+        return signals
+
     def clear(self) -> None:
         self._entries.clear()
+        self._signals.clear()
 
 
 class Agent:
@@ -142,6 +158,33 @@ class Agent:
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def healthy(self) -> bool:
+        """Quick health check: is the agent running and not over-erroring?"""
+        if not self._running:
+            return False
+        if self._restart_count > self._max_restarts:
+            return False
+        return True
+
+    def health(self) -> dict[str, Any]:
+        """Detailed health status for monitoring and readiness probes."""
+        return {
+            "name": self.name,
+            "healthy": self.healthy,
+            "running": self._running,
+            "restarts": self._restart_count,
+            "max_restarts": self._max_restarts,
+            "error_count": self._error_count,
+            "dead_letters": self.dead_letters.count,
+            "inbox_depth": self.inbox.pending,
+            "error_rate": (
+                self._error_count / self._processed_count
+                if self._processed_count > 0
+                else 0.0
+            ),
+        }
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -314,15 +357,7 @@ class Agent:
 
             chain = make_chain
 
-        try:
-            await chain(signal)
-        except Exception as e:
-            self._error_count += 1
-            self.dead_letters.add(signal, "handler_error", self.name, e)
-            logger.error(
-                "Handler error in agent '%s': %s", self.name, e, exc_info=True
-            )
-            raise AgentError(self.name, str(e)) from e
+        await chain(signal)
 
     async def _run_loop(self) -> None:
         """Main processing loop."""
@@ -337,18 +372,23 @@ class Agent:
                     continue
 
                 # Request/response: resolve pending futures for correlated responses
-                if (
-                    gated.correlation_id
-                    and gated.correlation_id in self._pending_requests
-                ):
-                    future = self._pending_requests[gated.correlation_id]
-                    if not future.done():
+                if gated.correlation_id:
+                    future = self._pending_requests.pop(gated.correlation_id, None)
+                    if future is not None and not future.done():
                         future.set_result(gated)
-                    self._processed_count += 1
-                    continue
+                        self._processed_count += 1
+                        continue
 
                 self._processed_count += 1
-                await self._dispatch(gated)
+                try:
+                    await self._dispatch(gated)
+                except Exception as e:
+                    self._error_count += 1
+                    self.dead_letters.add(gated, "handler_error", self.name, e)
+                    logger.error(
+                        "Handler error in agent '%s': %s", self.name, e, exc_info=True
+                    )
+                    continue
 
                 if self._tracer is not None:
                     elapsed_ms = (time.monotonic() - start) * 1000
@@ -371,9 +411,15 @@ class Agent:
         if self._task is not None:
             return
         for hook in self._on_start_hooks:
-            result = hook()
-            if isawaitable(result):
-                await result
+            try:
+                result = hook()
+                if isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.error(
+                    "Agent '%s' on_start hook failed: %s", self.name, e, exc_info=True
+                )
+                raise AgentError(self.name, f"on_start hook failed: {e}") from e
         self._task = asyncio.create_task(
             self._supervised_loop(), name=f"agent:{self.name}"
         )
@@ -413,9 +459,14 @@ class Agent:
                 self._task.cancel()
             self._task = None
         for hook in self._on_stop_hooks:
-            result = hook()
-            if isawaitable(result):
-                await result
+            try:
+                result = hook()
+                if isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.error(
+                    "Agent '%s' on_stop hook failed: %s", self.name, e, exc_info=True
+                )
 
     def _add_output(self, send_fn: Callable[[Signal], Coroutine[Any, Any, None]]) -> None:
         """Internal: register an output destination."""

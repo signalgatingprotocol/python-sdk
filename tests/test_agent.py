@@ -410,3 +410,135 @@ async def test_agent_priority_inbox():
     await agent.stop()
 
     assert received_order == [10, 5, 1]
+
+
+# --- Handler error resilience ---
+
+
+async def test_agent_continues_after_handler_error():
+    """Critical: handler errors must not crash the agent loop."""
+    agent = Agent("resilient")
+    results = []
+
+    @agent.on(TaskSignal)
+    async def handle(signal: TaskSignal):
+        if signal.task == "explode":
+            raise RuntimeError("boom")
+        results.append(signal.task)
+
+    await agent.start()
+    await agent.inbox.send(TaskSignal(task="explode"))
+    await agent.inbox.send(TaskSignal(task="after_error"))
+    await asyncio.sleep(0.1)
+    await agent.stop()
+
+    # Agent must continue processing after the error
+    assert results == ["after_error"]
+    assert agent.dead_letters.count == 1
+    assert agent._error_count == 1
+    assert agent.stats["errors"] == 1
+
+
+async def test_agent_multiple_errors_keep_processing():
+    agent = Agent("tank")
+    count = 0
+
+    @agent.on(Signal)
+    async def handle(signal: Signal):
+        nonlocal count
+        count += 1
+        if signal.priority < 5:
+            raise ValueError("too low")
+
+    await agent.start()
+    for i in range(10):
+        await agent.inbox.send(Signal(priority=i))
+    await asyncio.sleep(0.15)
+    await agent.stop()
+
+    assert count == 10
+    assert agent._error_count == 5  # priorities 0-4
+
+
+# --- Health Check ---
+
+
+async def test_agent_health_running():
+    agent = Agent("health_test")
+
+    @agent.on(Signal)
+    async def handle(s: Signal):
+        pass
+
+    assert not agent.healthy
+
+    await agent.start()
+    await asyncio.sleep(0.01)
+    assert agent.healthy
+
+    health = agent.health()
+    assert health["healthy"] is True
+    assert health["running"] is True
+    assert health["error_rate"] == 0.0
+
+    await agent.stop()
+    assert not agent.healthy
+
+
+# --- DLQ Replay ---
+
+
+async def test_dlq_drain_returns_signals():
+    agent = Agent("dlq_replay", gates=[Gate.by_priority(100)])
+
+    @agent.on(Signal)
+    async def handle(s: Signal):
+        pass
+
+    await agent.start()
+    s1 = Signal(priority=1)
+    s2 = Signal(priority=2)
+    await agent.inbox.send(s1)
+    await agent.inbox.send(s2)
+    await asyncio.sleep(0.05)
+    await agent.stop()
+
+    assert agent.dead_letters.count == 2
+    replayed = agent.dead_letters.drain()
+    assert len(replayed) == 2
+    assert agent.dead_letters.count == 0  # cleared after drain
+    assert replayed[0].id == s1.id
+    assert replayed[1].id == s2.id
+
+
+# --- Lifecycle hook error handling ---
+
+
+async def test_agent_on_start_hook_failure_raises():
+    agent = Agent("bad_start")
+
+    @agent.on_start
+    async def fail():
+        raise RuntimeError("setup crashed")
+
+    with pytest.raises(Exception, match="on_start hook failed"):
+        await agent.start()
+
+    assert agent._task is None  # should not have started
+
+
+async def test_agent_on_stop_hook_failure_doesnt_crash():
+    agent = Agent("bad_stop")
+
+    @agent.on_stop
+    async def fail():
+        raise RuntimeError("cleanup crashed")
+
+    @agent.on(Signal)
+    async def handle(s: Signal):
+        pass
+
+    await agent.start()
+    await asyncio.sleep(0.01)
+    # Should not raise even though on_stop hook fails
+    await agent.stop()

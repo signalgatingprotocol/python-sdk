@@ -114,14 +114,16 @@ class Gate:
         """Create a gate that enforces a rate limit."""
         min_interval = 1.0 / max_per_second
         state: dict[str, float] = {"last": 0.0}
+        lock = asyncio.Lock()
 
         async def fn(signal: Signal) -> Signal | None:
-            now = time.monotonic()
-            elapsed = now - state["last"]
-            if elapsed < min_interval:
-                await asyncio.sleep(min_interval - elapsed)
-            state["last"] = time.monotonic()
-            return signal
+            async with lock:
+                now = time.monotonic()
+                elapsed = now - state["last"]
+                if elapsed < min_interval:
+                    await asyncio.sleep(min_interval - elapsed)
+                state["last"] = time.monotonic()
+                return signal
 
         return cls(fn, name=name)
 
@@ -129,20 +131,22 @@ class Gate:
     def deduplicate(cls, window: float = 60.0, name: str = "dedup") -> Gate:
         """Create a gate that drops duplicate signals within a time window."""
         seen: dict[str, float] = {}
+        lock = asyncio.Lock()
 
-        def fn(signal: Signal) -> Signal | None:
-            now = time.monotonic()
-            # Evict expired entries
-            expired = [k for k, t in seen.items() if now - t > window]
-            for k in expired:
-                del seen[k]
-            # Check for duplicate
-            content = signal.model_dump_json(exclude={"id", "timestamp", "trace_id"})
-            key = f"{type(signal).__name__}:{content}"
-            if key in seen:
-                return None
-            seen[key] = now
-            return signal
+        async def fn(signal: Signal) -> Signal | None:
+            async with lock:
+                now = time.monotonic()
+                # Evict expired entries
+                expired = [k for k, t in seen.items() if now - t > window]
+                for k in expired:
+                    del seen[k]
+                # Check for duplicate
+                content = signal.model_dump_json(exclude={"id", "timestamp", "trace_id"})
+                key = f"{type(signal).__name__}:{content}"
+                if key in seen:
+                    return None
+                seen[key] = now
+                return signal
 
         return cls(fn, name=name)
 
@@ -204,29 +208,31 @@ class Gate:
             "opened_at": 0.0,
             "status": "closed",  # closed | open | half_open
         }
+        lock = asyncio.Lock()
 
         async def fn(signal: Signal) -> Signal | None:
-            now = time.monotonic()
-            status = state["status"]
+            async with lock:
+                now = time.monotonic()
+                status = state["status"]
 
-            if status == "open":
-                elapsed = now - float(state["opened_at"])
-                if elapsed < recovery_timeout:
-                    return None
-                state["status"] = "half_open"
+                if status == "open":
+                    elapsed = now - float(state["opened_at"])
+                    if elapsed < recovery_timeout:
+                        return None
+                    state["status"] = "half_open"
 
-            result = await gate.process(signal)
+                result = await gate.process(signal)
 
-            if result is not None:
-                state["failures"] = 0
-                state["status"] = "closed"
-                return result
+                if result is not None:
+                    state["failures"] = 0
+                    state["status"] = "closed"
+                    return result
 
-            state["failures"] = int(state["failures"]) + 1
-            if int(state["failures"]) >= failure_threshold:
-                state["status"] = "open"
-                state["opened_at"] = now
-            return None
+                state["failures"] = int(state["failures"]) + 1
+                if int(state["failures"]) >= failure_threshold:
+                    state["status"] = "open"
+                    state["opened_at"] = now
+                return None
 
         return cls(fn, name=name)
 
