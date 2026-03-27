@@ -28,6 +28,7 @@ class Signal(BaseModel):
     timestamp: float = Field(default_factory=time.time)
     priority: int = 0
     trace_id: str = Field(default_factory=lambda: uuid4().hex)
+    correlation_id: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"frozen": True}
@@ -50,6 +51,13 @@ class Signal(BaseModel):
         return self.evolve(metadata=merged)
 
     def __repr__(self) -> str:
-        skip = ("id", "timestamp", "trace_id", "metadata")
-        fields = {k: v for k, v in self.model_dump().items() if k not in skip or v}
+        always_hide = {"id", "timestamp", "trace_id"}
+        hide_if_default = {"source": "", "priority": 0, "correlation_id": "", "metadata": {}}
+        fields: dict[str, Any] = {}
+        for k, v in self.model_dump().items():
+            if k in always_hide:
+                continue
+            if k in hide_if_default and v == hide_if_default[k]:
+                continue
+            fields[k] = v
         return f"{type(self).__name__}({', '.join(f'{k}={v!r}' for k, v in fields.items())})"

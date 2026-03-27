@@ -6,9 +6,11 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Coroutine
+from inspect import isawaitable
 from typing import Any, TypeVar
+from uuid import uuid4
 
-from signal_gating.channel import Channel
+from signal_gating.channel import Channel, PriorityChannel
 from signal_gating.errors import AgentError
 from signal_gating.gate import Gate
 from signal_gating.signal import Signal
@@ -17,6 +19,7 @@ T = TypeVar("T", bound=Signal)
 Handler = Callable[..., Coroutine[Any, Any, Any]]
 NextFn = Callable[..., Coroutine[Any, Any, Signal | None]]
 Middleware = Callable[[Signal, NextFn], Coroutine[Any, Any, Signal | None]]
+LifecycleHook = Callable[[], Any]
 
 logger = logging.getLogger("signal_gating.agent")
 
@@ -97,10 +100,15 @@ class Agent:
         buffer_size: int = 1000,
         max_restarts: int = 3,
         restart_delay: float = 1.0,
+        priority_inbox: bool = False,
     ):
         self.name = name
         self.gates = gates or []
-        self.inbox: Channel[Signal] = Channel(Signal, buffer_size=buffer_size)
+        self.inbox: Channel[Signal] | PriorityChannel[Signal] = (
+            PriorityChannel(Signal, buffer_size=buffer_size)
+            if priority_inbox
+            else Channel(Signal, buffer_size=buffer_size)
+        )
         self._handlers: dict[type[Signal], list[Handler]] = {}
         self._middleware: list[Middleware] = []
         self._outbox: list[Callable[[Signal], Coroutine[Any, Any, None]]] = []
@@ -123,6 +131,13 @@ class Agent:
 
         # Tracer (set by mesh or manually)
         self._tracer: Any = None
+
+        # Lifecycle hooks
+        self._on_start_hooks: list[LifecycleHook] = []
+        self._on_stop_hooks: list[LifecycleHook] = []
+
+        # Request/response pending futures
+        self._pending_requests: dict[str, asyncio.Future[Signal]] = {}
 
     @property
     def running(self) -> bool:
@@ -160,6 +175,67 @@ class Agent:
         """Register a handler for all signal types."""
         self._handlers.setdefault(Signal, []).append(fn)
         return fn
+
+    def on_start(self, fn: LifecycleHook) -> LifecycleHook:
+        """Register a hook called when the agent starts.
+
+            @agent.on_start
+            async def setup():
+                agent.state["db"] = await connect_db()
+        """
+        self._on_start_hooks.append(fn)
+        return fn
+
+    def on_stop(self, fn: LifecycleHook) -> LifecycleHook:
+        """Register a hook called when the agent stops.
+
+            @agent.on_stop
+            async def cleanup():
+                await agent.state["db"].close()
+        """
+        self._on_stop_hooks.append(fn)
+        return fn
+
+    async def request(self, signal: Signal, timeout: float = 30.0) -> Signal:
+        """Emit a signal and wait for a correlated response.
+
+        This is the agent request/response pattern. The signal is tagged with a
+        correlation ID. When a response with a matching correlation ID arrives
+        in this agent's inbox, the future resolves.
+
+        Requires a return path in the mesh (bidirectional connection).
+
+            response = await planner.request(
+                TaskSignal(task="analyze data"), timeout=5.0
+            )
+        """
+        cid = uuid4().hex
+        request_signal = signal.evolve(correlation_id=cid)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Signal] = loop.create_future()
+        self._pending_requests[cid] = future
+        try:
+            await self.emit(request_signal)
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self._pending_requests.pop(cid, None)
+
+    async def reply(self, original: Signal, response: Signal) -> None:
+        """Reply to a request signal with a correlated response.
+
+        The response signal inherits the correlation ID from the original,
+        enabling the requesting agent to match it.
+
+            @worker.on(TaskSignal)
+            async def handle(signal: TaskSignal):
+                result = await process(signal.task)
+                await worker.reply(signal, ResultSignal(result=result))
+        """
+        if original.correlation_id:
+            reply_signal = response.evolve(correlation_id=original.correlation_id)
+            await self.emit(reply_signal)
+        else:
+            await self.emit(response)
 
     def use(self, middleware: Middleware) -> None:
         """Add middleware to the processing pipeline.
@@ -259,6 +335,18 @@ class Agent:
                     self._rejected_count += 1
                     self.dead_letters.add(signal, "gate_rejected", self.name)
                     continue
+
+                # Request/response: resolve pending futures for correlated responses
+                if (
+                    gated.correlation_id
+                    and gated.correlation_id in self._pending_requests
+                ):
+                    future = self._pending_requests[gated.correlation_id]
+                    if not future.done():
+                        future.set_result(gated)
+                    self._processed_count += 1
+                    continue
+
                 self._processed_count += 1
                 await self._dispatch(gated)
 
@@ -282,6 +370,10 @@ class Agent:
         """Start the agent's processing loop with supervision."""
         if self._task is not None:
             return
+        for hook in self._on_start_hooks:
+            result = hook()
+            if isawaitable(result):
+                await result
         self._task = asyncio.create_task(
             self._supervised_loop(), name=f"agent:{self.name}"
         )
@@ -320,6 +412,10 @@ class Agent:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
             self._task = None
+        for hook in self._on_stop_hooks:
+            result = hook()
+            if isawaitable(result):
+                await result
 
     def _add_output(self, send_fn: Callable[[Signal], Coroutine[Any, Any, None]]) -> None:
         """Internal: register an output destination."""

@@ -225,3 +225,128 @@ async def test_mesh_custom_tracer():
     # The custom tracer should have been used
     assert tracer.span_count > 0
     assert mesh.tracer is tracer
+
+
+# --- Content-based Routing ---
+
+
+async def test_mesh_content_routing():
+    router = Agent("router")
+    fast = Agent("fast")
+    slow = Agent("slow")
+    fast_received: list[str] = []
+    slow_received: list[str] = []
+
+    @fast.on(TaskSignal)
+    async def handle_fast(s: TaskSignal):
+        fast_received.append(s.task)
+
+    @slow.on(TaskSignal)
+    async def handle_slow(s: TaskSignal):
+        slow_received.append(s.task)
+
+    mesh = Mesh([router, fast, slow])
+    mesh.route(router, [
+        (lambda s: s.priority >= 5, fast),
+        (lambda s: s.priority < 5, slow),
+    ])
+
+    async with mesh:
+        await router.emit(TaskSignal(task="urgent", priority=8))
+        await router.emit(TaskSignal(task="lazy", priority=2))
+        await asyncio.sleep(0.05)
+
+    assert fast_received == ["urgent"]
+    assert slow_received == ["lazy"]
+
+
+async def test_mesh_content_routing_default():
+    router = Agent("router")
+    special = Agent("special")
+    fallback = Agent("fallback")
+    special_received: list[int] = []
+    fallback_received: list[int] = []
+
+    @special.on(Signal)
+    async def handle_special(s: Signal):
+        special_received.append(s.priority)
+
+    @fallback.on(Signal)
+    async def handle_fallback(s: Signal):
+        fallback_received.append(s.priority)
+
+    mesh = Mesh([router, special, fallback])
+    mesh.route(
+        router,
+        [(lambda s: s.priority >= 10, special)],
+        default=fallback,
+    )
+
+    async with mesh:
+        await router.emit(Signal(priority=10))
+        await router.emit(Signal(priority=3))
+        await asyncio.sleep(0.05)
+
+    assert special_received == [10]
+    assert fallback_received == [3]
+
+
+async def test_mesh_content_routing_no_match_no_default():
+    router = Agent("router")
+    target = Agent("target")
+    received: list[int] = []
+
+    @target.on(Signal)
+    async def handle(s: Signal):
+        received.append(s.priority)
+
+    mesh = Mesh([router, target])
+    mesh.route(router, [
+        (lambda s: s.priority >= 100, target),
+    ])
+
+    async with mesh:
+        await router.emit(Signal(priority=1))
+        await asyncio.sleep(0.05)
+
+    assert received == []  # No match, no default, signal dropped
+
+
+async def test_mesh_content_routing_by_name():
+    router = Agent("router")
+    target = Agent("target")
+    received: list[int] = []
+
+    @target.on(Signal)
+    async def handle(s: Signal):
+        received.append(s.priority)
+
+    mesh = Mesh([router, target])
+    mesh.route("router", [
+        (lambda s: True, "target"),
+    ])
+
+    async with mesh:
+        await router.emit(Signal(priority=42))
+        await asyncio.sleep(0.05)
+
+    assert received == [42]
+
+
+async def test_mesh_content_routing_traces():
+    router = Agent("router")
+    target = Agent("target")
+
+    @target.on(Signal)
+    async def handle(s: Signal):
+        pass
+
+    mesh = Mesh([router, target])
+    mesh.route(router, [(lambda s: True, target)])
+
+    async with mesh:
+        await router.emit(Signal())
+        await asyncio.sleep(0.05)
+
+    actions = mesh.tracer.summary().get("actions", {})
+    assert "routed" in actions
