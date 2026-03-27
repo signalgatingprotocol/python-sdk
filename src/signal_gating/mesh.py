@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from inspect import isawaitable
 from typing import Any
+from uuid import uuid4
 
 from signal_gating.agent import Agent
 from signal_gating.errors import MeshError
@@ -14,6 +16,8 @@ from signal_gating.signal import Signal
 from signal_gating.tracing import Tracer
 
 logger = logging.getLogger("signal_gating.mesh")
+
+Interceptor = Callable[[Signal, str, str], Signal | None | Awaitable[Signal | None]]
 
 
 class Edge:
@@ -52,6 +56,8 @@ class Mesh:
         self._agents: dict[str, Agent] = {}
         self._edges: list[Edge] = []
         self._running = False
+        self._interceptors: list[Interceptor] = []
+        self._capabilities: dict[str, set[str]] = {}
         self.tracer = tracer or Tracer()
         for agent in agents or []:
             self.add(agent)
@@ -94,8 +100,22 @@ class Mesh:
         edge = Edge(src, tgt, gate)
         self._edges.append(edge)
         tracer = self.tracer
+        mesh = self
 
         async def route(signal: Signal) -> None:
+            # Apply mesh-level interceptors
+            intercepted = await mesh._apply_interceptors(signal, src.name, tgt.name)
+            if intercepted is None:
+                tracer.record(
+                    trace_id=signal.trace_id,
+                    signal_id=signal.id,
+                    agent=f"{src.name}->{tgt.name}",
+                    gate="interceptor",
+                    action="intercepted",
+                )
+                return
+            signal = intercepted
+
             if gate is not None:
                 result = await gate.process(signal)
                 if result is None:
@@ -245,12 +265,6 @@ class Mesh:
             len(self._edges),
         )
 
-    async def stop(self) -> None:
-        """Stop all agents gracefully."""
-        self._running = False
-        await asyncio.gather(*(agent.stop() for agent in self._agents.values()))
-        logger.info("Mesh stopped")
-
     async def inject(self, target: Agent | str, signal: Signal) -> None:
         """Inject a signal directly into an agent's inbox."""
         agent = self._resolve(target)
@@ -288,6 +302,151 @@ class Mesh:
                 for e in self._edges
             ],
         }
+
+    # --- Interceptors ---
+
+    def intercept(self, fn: Interceptor) -> None:
+        """Add a mesh-level interceptor for all signal routing.
+
+        Interceptors see every signal that flows through mesh edges.
+        They receive (signal, source_name, target_name) and return:
+        - The signal (possibly modified) to allow routing
+        - None to block the signal
+
+        Use for cross-cutting concerns: auth, logging, metrics, rate limiting.
+
+            def log_all(signal, source, target):
+                print(f"{source} -> {target}: {signal}")
+                return signal
+
+            mesh.intercept(log_all)
+        """
+        self._interceptors.append(fn)
+
+    async def _apply_interceptors(
+        self, signal: Signal, source: str, target: str
+    ) -> Signal | None:
+        """Apply all interceptors to a signal. Returns None if any blocks it."""
+        current: Signal | None = signal
+        for interceptor in self._interceptors:
+            if current is None:
+                return None
+            result = interceptor(current, source, target)
+            if isawaitable(result):
+                current = await result
+            else:
+                current = result
+        return current
+
+    # --- Capability Discovery ---
+
+    def declare_capabilities(self, agent: Agent | str, *capabilities: str) -> None:
+        """Declare what an agent can do. Enables discovery by capability.
+
+            mesh.declare_capabilities(analyst, "analysis", "summarization")
+            mesh.declare_capabilities(coder, "code_generation", "debugging")
+
+            # Later, find agents by what they can do
+            analysts = mesh.find_capable("analysis")
+        """
+        name = agent if isinstance(agent, str) else agent.name
+        if name not in self._agents:
+            raise MeshError(f"Agent '{name}' not in mesh")
+        self._capabilities.setdefault(name, set()).update(capabilities)
+
+    def find_capable(self, capability: str) -> list[Agent]:
+        """Find all agents that have declared a given capability."""
+        return [
+            self._agents[name]
+            for name, caps in self._capabilities.items()
+            if capability in caps
+        ]
+
+    def agent_capabilities(self, agent: Agent | str) -> set[str]:
+        """Get all declared capabilities for an agent."""
+        name = agent if isinstance(agent, str) else agent.name
+        return set(self._capabilities.get(name, set()))
+
+    # --- Scatter / Gather ---
+
+    async def scatter(
+        self,
+        signal: Signal,
+        targets: list[Agent | str],
+        timeout: float = 30.0,
+    ) -> list[Signal]:
+        """Scatter a signal to multiple agents and gather all correlated responses.
+
+        This is THE fundamental multi-agent coordination pattern:
+        send work to N agents in parallel, wait for all to respond.
+
+            responses = await mesh.scatter(
+                TaskSignal(task="analyze"),
+                [analyst1, analyst2, analyst3],
+                timeout=10.0,
+            )
+
+        Each target agent must `reply()` to the signal for gather to complete.
+        Returns responses in the same order as targets.
+        """
+        cid = uuid4().hex
+        tagged = signal.evolve(correlation_id=cid)
+        resolved = [self._resolve(t) for t in targets]
+
+        loop = asyncio.get_running_loop()
+        futures: list[asyncio.Future[Signal]] = []
+
+        # Create a temporary collector agent to gather responses
+        for target in resolved:
+            future: asyncio.Future[Signal] = loop.create_future()
+            futures.append(future)
+            target_cid = f"{cid}:{target.name}"
+            response_signal = tagged.evolve(correlation_id=target_cid)
+            await target.inbox.send(response_signal)
+
+        # Wait for all responses or timeout — agents reply via correlation_id
+        # We register pending requests on each target
+        per_target_futures: list[asyncio.Future[Signal]] = []
+        for target in resolved:
+            target_future: asyncio.Future[Signal] = loop.create_future()
+            target_cid = f"{cid}:{target.name}"
+            target._pending_requests[target_cid] = target_future  # noqa: SLF001
+            per_target_futures.append(target_future)
+            await target.inbox.send(tagged.evolve(correlation_id=target_cid))
+
+        try:
+            done, _ = await asyncio.wait(per_target_futures, timeout=timeout)
+            results: list[Signal] = []
+            for f in per_target_futures:
+                if f.done() and not f.cancelled() and f.exception() is None:
+                    results.append(f.result())
+                else:
+                    results.append(tagged)  # Placeholder for timed-out targets
+            return results
+        finally:
+            for target in resolved:
+                target_cid = f"{cid}:{target.name}"
+                target._pending_requests.pop(target_cid, None)  # noqa: SLF001
+
+    # --- Graceful Shutdown ---
+
+    async def stop(self, drain: bool = False) -> None:
+        """Stop all agents gracefully.
+
+        Args:
+            drain: If True, wait for agents to process all pending signals
+                   before shutting down. If False, stop immediately.
+        """
+        self._running = False
+        if drain:
+            # Wait for all inboxes to empty
+            for _ in range(100):  # Max 10 seconds
+                all_empty = all(a.inbox.pending == 0 for a in self._agents.values())
+                if all_empty:
+                    break
+                await asyncio.sleep(0.1)
+        await asyncio.gather(*(agent.stop() for agent in self._agents.values()))
+        logger.info("Mesh stopped")
 
     def _resolve(self, agent: Agent | str) -> Agent:
         if isinstance(agent, str):

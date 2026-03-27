@@ -169,8 +169,38 @@ class PriorityChannel(Generic[T]):
                 self._has_items.clear()
             await self._has_items.wait()
 
+    async def send_wait(self, signal: T, timeout: float | None = None) -> None:
+        """Send a signal, waiting for space if the channel is full.
+
+        Unlike `send()`, this method applies backpressure by blocking until
+        buffer space is available instead of raising ChannelFull.
+        """
+        if self._closed:
+            raise ChannelClosed()
+
+        async def _wait_and_send() -> None:
+            while True:
+                async with self._lock:
+                    if not self._max_size or len(self._heap) < self._max_size:
+                        heapq.heappush(
+                            self._heap, (-signal.priority, self._counter, signal)
+                        )
+                        self._counter += 1
+                        self._has_items.set()
+                        return
+                await asyncio.sleep(0.01)
+
+        if timeout is not None:
+            await asyncio.wait_for(_wait_and_send(), timeout=timeout)
+        else:
+            await _wait_and_send()
+
     def try_receive(self) -> T | None:
-        """Non-blocking receive of the highest-priority signal."""
+        """Non-blocking receive of the highest-priority signal.
+
+        Note: This is not concurrency-safe with async operations.
+        Use `receive()` for concurrent access.
+        """
         if self._heap:
             _, _, signal = heapq.heappop(self._heap)
             if not self._heap:

@@ -99,6 +99,26 @@ async def handle(signal: TaskSignal):
     await worker.reply(signal, ResultSignal(result=result))
 ```
 
+**AgentContext** — handlers can receive a context object, eliminating closure boilerplate:
+
+```python
+from signal_gating import AgentContext
+
+@worker.on(TaskSignal)
+async def handle(signal: TaskSignal, ctx: AgentContext):
+    ctx.state["count"] = ctx.state.get("count", 0) + 1
+    await ctx.emit(ResultSignal(result="done"))
+    await ctx.reply(ResultSignal(result="response"))  # auto-correlates
+```
+
+**once()** — handlers that fire exactly once, then auto-remove:
+
+```python
+@worker.once(StartupSignal)
+async def first_only(signal: StartupSignal):
+    print("Initialization complete — won't fire again")
+```
+
 Request/response — agents can ask questions and wait for answers:
 
 ```python
@@ -124,9 +144,41 @@ mesh.route(coordinator, [
     (lambda s: isinstance(s, AnalysisTask), analyst),
 ], default=general_worker)
 
-# Lifecycle
+# Lifecycle with graceful drain
 async with mesh:
     await coordinator.emit(TaskSignal(task="analyze"))
+await mesh.stop(drain=True)  # Wait for all pending signals to complete
+```
+
+**Interceptors** — mesh-level cross-cutting concerns (auth, logging, metrics):
+
+```python
+def audit_log(signal, source, target):
+    print(f"[AUDIT] {source} -> {target}: {type(signal).__name__}")
+    return signal  # Return None to block
+
+mesh.intercept(audit_log)
+```
+
+**Capability Discovery** — find agents by what they can do, not just by name:
+
+```python
+mesh.declare_capabilities(analyst, "analysis", "summarization")
+mesh.declare_capabilities(coder, "code_generation", "debugging")
+
+# Find all agents capable of analysis
+agents = mesh.find_capable("analysis")
+```
+
+**Scatter/Gather** — the fundamental multi-agent coordination pattern:
+
+```python
+# Send work to N agents in parallel, collect all responses
+responses = await mesh.scatter(
+    TaskSignal(task="analyze market"),
+    [analyst1, analyst2, analyst3],
+    timeout=10.0,
+)
 ```
 
 ### Pipeline
