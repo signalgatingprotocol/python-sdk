@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+from collections.abc import AsyncIterator
 from typing import Generic, TypeVar
 
 from signal_gating.errors import ChannelClosed, ChannelFull
@@ -109,6 +110,44 @@ class Channel(Generic[T]):
             if item is not None:
                 signals.append(item)
         return signals
+
+    @staticmethod
+    async def merge(*channels: Channel[T]) -> AsyncIterator[T]:
+        """Merge multiple channels into a single async stream.
+
+        Yields signals from any channel as they arrive. When all channels
+        are closed, the iterator ends. This is the agent-native multiplexer —
+        essential when an agent needs to consume from multiple sources without
+        dedicating a task to each.
+
+            async for signal in Channel.merge(inbox_a, inbox_b, inbox_c):
+                process(signal)
+        """
+        output: asyncio.Queue[T | None] = asyncio.Queue()
+        active = len(channels)
+
+        async def _reader(ch: Channel[T]) -> None:
+            nonlocal active
+            try:
+                async for signal in ch:
+                    await output.put(signal)
+            except (ChannelClosed, StopAsyncIteration):
+                pass
+            finally:
+                active -= 1
+                if active <= 0:
+                    await output.put(None)
+
+        tasks = [asyncio.create_task(_reader(ch)) for ch in channels]
+        try:
+            while True:
+                item = await output.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            for t in tasks:
+                t.cancel()
 
 
 class PriorityChannel(Generic[T]):
