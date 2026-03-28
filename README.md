@@ -76,7 +76,7 @@ both = high_priority & Gate.filter(lambda s: s.source == "sensor")  # and
 not_low = ~Gate.by_priority(1)  # invert
 ```
 
-Built-in gates: `filter`, `transform`, `by_type`, `by_priority`, `rate_limit`, `throttle`, `deduplicate`, `retry`, `circuit_breaker`, `timeout`, `ttl`, `debounce`, `sample`, `when`, `passthrough`, `block`.
+Built-in gates: `filter`, `transform`, `by_type`, `by_priority`, `rate_limit`, `throttle`, `deduplicate`, `retry`, `circuit_breaker`, `timeout`, `ttl`, `debounce`, `sample`, `when`, `passthrough`, `block`, `tap`, `batch`, `parallel`, `fallback`, `window`, `map`.
 
 **Real-time signal control:**
 
@@ -218,6 +218,85 @@ responses = await mesh.scatter(
     [analyst1, analyst2, analyst3],
     timeout=10.0,
 )
+```
+
+**Map/Reduce** — parallel analysis, then synthesis:
+
+```python
+# Distribute to N analysts, then combine through a synthesizer
+result = await mesh.map_reduce(
+    AnalyzeSignal(data="quarterly revenue report"),
+    mappers=[trend_analyst, risk_analyst, sentiment_analyst],
+    reducer=synthesizer,
+    timeout=30.0,
+)
+# synthesizer receives all three analyses in metadata["responses"]
+```
+
+**Branching Workflows** — conditional agent chains:
+
+```python
+# Route through different agent chains based on signal content
+result = await mesh.branch_workflow(
+    TaskSignal(task="analyze", priority=9),
+    router=lambda s: "critical" if s.priority >= 8 else "normal",
+    branches={
+        "critical": [validator, deep_analyzer, reviewer],
+        "normal": [quick_analyzer],
+    },
+)
+```
+
+**Sequential Workflows** — ordered multi-step processing:
+
+```python
+# Chain agents: each response becomes the next agent's input
+result = await mesh.workflow(
+    TaskSignal(task="analyze quarterly revenue"),
+    steps=[data_fetcher, analyzer, summarizer, formatter],
+    timeout=60.0,
+)
+```
+
+**Race** — first response wins:
+
+```python
+# Try multiple strategies in parallel, take the fastest
+result = await mesh.race(
+    AnalyzeSignal(data=data),
+    [cache_lookup, fast_analyzer, deep_analyzer],
+    timeout=5.0,
+)
+```
+
+### Tool Calling — Agent-Native RPC
+
+Agents can expose tools that other agents (or LLMs) discover and invoke. This is the bridge between signal-based communication and structured function calling:
+
+```python
+from signal_gating import Agent, Mesh, ToolSpec
+
+analyst = Agent("analyst")
+
+@analyst.tool(description="Analyze data and return insights")
+async def analyze(data: str, depth: int = 1) -> dict:
+    return {"insights": await run_analysis(data, depth)}
+
+@analyst.tool(description="Summarize text")
+async def summarize(text: str) -> str:
+    return text[:100] + "..."
+
+# Discover tools across the mesh
+mesh = Mesh([analyst, coordinator])
+all_tools = mesh.discover_tools()
+# {"analyst": [ToolSpec(name="analyze", ...), ToolSpec(name="summarize", ...)]}
+
+# Call tools directly through the mesh
+result = await mesh.call_tool(analyst, "analyze", data="revenue Q4", depth=2)
+
+# Export tool schemas for LLM integration
+schema = analyst.tools_schema()
+# [{"name": "analyze", "description": "...", "parameters": {...}}]
 ```
 
 ### Pipeline
