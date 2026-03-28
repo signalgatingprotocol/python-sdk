@@ -44,6 +44,8 @@ class Gate:
 
     def __rshift__(self, other: Gate) -> Gate:
         """Chain gates: signal flows through self, then other."""
+        if not isinstance(other, Gate):
+            return NotImplemented
         left, right = self, other
 
         async def chained(signal: Signal) -> Signal | None:
@@ -317,13 +319,15 @@ class Gate:
         """
         min_interval = 1.0 / max_per_second
         state: dict[str, float] = {"last": 0.0}
+        lock = asyncio.Lock()
 
-        def fn(signal: Signal) -> Signal | None:
-            now = time.monotonic()
-            if now - state["last"] < min_interval:
-                return None
-            state["last"] = now
-            return signal
+        async def fn(signal: Signal) -> Signal | None:
+            async with lock:
+                now = time.monotonic()
+                if now - state["last"] < min_interval:
+                    return None
+                state["last"] = now
+                return signal
 
         return cls(fn, name=name)
 
@@ -342,6 +346,35 @@ class Gate:
             return signal if age <= seconds else None
 
         return cls(fn, name=name)
+
+    @classmethod
+    def tap(
+        cls,
+        fn: Callable[[Signal], Any],
+        name: str = "tap",
+    ) -> Gate:
+        """Tap gate — execute a side-effect without affecting signal flow.
+
+        The signal always passes through unchanged. The tap function is called
+        for observation only. Essential for logging, metrics, debugging, and
+        auditing signal flow without modifying the processing pipeline.
+
+        Supports both sync and async tap functions.
+
+            gate = Gate.tap(lambda s: print(f"Saw: {s}"))
+            gate = Gate.tap(lambda s: metrics.increment("signals", tags={"type": type(s).__name__}))
+
+            # Async tap
+            gate = Gate.tap(lambda s: audit_log.write(s))
+        """
+
+        async def tap_fn(signal: Signal) -> Signal:
+            result = fn(signal)
+            if isawaitable(result):
+                await result
+            return signal
+
+        return cls(tap_fn, name=name)
 
     @classmethod
     def debounce(cls, seconds: float, name: str = "debounce") -> Gate:

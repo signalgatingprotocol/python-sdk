@@ -31,7 +31,7 @@ Quick start:
         await planner.emit(TaskSignal(task="build", priority=5))
 """
 
-from signal_gating.agent import Agent, AgentContext, DeadLetterQueue
+from signal_gating.agent import Agent, AgentContext, DeadLetterQueue, ErrorHook
 from signal_gating.channel import Channel, PriorityChannel
 from signal_gating.errors import (
     AgentError,
@@ -61,6 +61,7 @@ __all__ = [
     "CircuitOpenError",
     "DeadLetterQueue",
     "Edge",
+    "ErrorHook",
     "Gate",
     "GateRejected",
     "Mesh",

@@ -49,6 +49,16 @@ class Pipeline:
             result = result >> gate
         return result
 
+    def __rshift__(self, other: Gate | Pipeline) -> Pipeline:
+        """Compose pipeline with a gate or another pipeline using >>."""
+        if isinstance(other, Pipeline):
+            return Pipeline(self._gates + other._gates)
+        return Pipeline(self._gates + [other])
+
+    def __rrshift__(self, other: Gate) -> Pipeline:
+        """Allow Gate >> Pipeline composition."""
+        return Pipeline([other] + self._gates)
+
     def __len__(self) -> int:
         return len(self._gates)
 

@@ -21,6 +21,7 @@ Handler = Callable[..., Coroutine[Any, Any, Any]]
 NextFn = Callable[..., Coroutine[Any, Any, Signal | None]]
 Middleware = Callable[[Signal, NextFn], Coroutine[Any, Any, Signal | None]]
 LifecycleHook = Callable[[], Any]
+ErrorHook = Callable[[Signal, Exception], Any]
 
 logger = logging.getLogger("signal_gating.agent")
 
@@ -208,6 +209,7 @@ class Agent:
         # Lifecycle hooks
         self._on_start_hooks: list[LifecycleHook] = []
         self._on_stop_hooks: list[LifecycleHook] = []
+        self._on_error_hooks: list[ErrorHook] = []
 
         # Request/response pending futures
         self._pending_requests: dict[str, asyncio.Future[Signal]] = {}
@@ -326,6 +328,22 @@ class Agent:
                 await agent.state["db"].close()
         """
         self._on_stop_hooks.append(fn)
+        return fn
+
+    def on_error(self, fn: ErrorHook) -> ErrorHook:
+        """Register a hook called when signal processing fails.
+
+        Error hooks receive the signal and exception, enabling custom error
+        handling like alerting, retry logic, or signal rerouting. Hooks run
+        AFTER the signal is added to the dead letter queue.
+
+        Supports both sync and async hooks.
+
+            @agent.on_error
+            async def handle_error(signal: Signal, error: Exception):
+                await alert_service.notify(f"Failed: {error}")
+        """
+        self._on_error_hooks.append(fn)
         return fn
 
     async def request(self, signal: Signal, timeout: float = 30.0) -> Signal:
@@ -529,6 +547,16 @@ class Agent:
                     logger.error(
                         "Handler error in agent '%s': %s", self.name, e, exc_info=True
                     )
+                    for hook in self._on_error_hooks:
+                        try:
+                            result = hook(gated, e)
+                            if isawaitable(result):
+                                await result
+                        except Exception as hook_err:
+                            logger.error(
+                                "Agent '%s' on_error hook failed: %s",
+                                self.name, hook_err, exc_info=True,
+                            )
                     continue
 
                 if self._tracer is not None:
