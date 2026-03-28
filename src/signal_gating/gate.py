@@ -108,8 +108,14 @@ class Gate:
         return cls(fn, name=name)
 
     @classmethod
-    def transform(cls, fn: Callable[[Signal], Signal], name: str = "transform") -> Gate:
-        """Create a gate that transforms passing signals."""
+    def transform(cls, fn: GateFn, name: str = "transform") -> Gate:
+        """Create a gate that transforms passing signals.
+
+        Accepts both sync and async transform functions:
+
+            gate = Gate.transform(lambda s: s.evolve(priority=10))
+            gate = Gate.transform(async_enrich)  # async works too
+        """
         return cls(fn, name=name)
 
     @classmethod
@@ -542,3 +548,86 @@ class Gate:
                 return None
 
         return cls(fn, name=name)
+
+    @classmethod
+    def window(
+        cls,
+        seconds: float,
+        min_signals: int = 1,
+        name: str = "window",
+    ) -> Gate:
+        """Sliding time window gate — passes signals enriched with window context.
+
+        Maintains a rolling window of the last ``seconds`` seconds. Each
+        incoming signal is checked against the window: if at least
+        ``min_signals`` exist within the window, the signal passes through
+        enriched with rate and count metadata. Otherwise it is rejected.
+
+        This is THE observability primitive for agent systems — detect
+        bursts, anomalies, and patterns in real-time signal flow.
+
+            # Detect bursts: only pass when 5+ signals arrive in 10 seconds
+            gate = Gate.window(seconds=10, min_signals=5)
+
+            # Enrich every signal with rate context
+            gate = Gate.window(seconds=60, min_signals=1)
+            # signal.metadata["window_size"]  → count of signals in last 60s
+            # signal.metadata["window_rate"]  → signals per second
+        """
+        if seconds <= 0:
+            raise ValueError("window seconds must be > 0")
+        state: dict[str, list[tuple[float, str]]] = {"buffer": []}
+        lock = asyncio.Lock()
+
+        async def fn(signal: Signal) -> Signal | None:
+            async with lock:
+                now = time.monotonic()
+                state["buffer"].append((now, signal.id))
+                # Evict signals outside the window
+                state["buffer"] = [
+                    (t, sid) for t, sid in state["buffer"] if now - t <= seconds
+                ]
+                window_size = len(state["buffer"])
+                if window_size >= min_signals:
+                    return signal.with_metadata(
+                        window_size=window_size,
+                        window_rate=round(window_size / seconds, 4),
+                    )
+                return None
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def map(
+        cls,
+        fn: Callable[[Signal], Any],
+        name: str = "map",
+    ) -> Gate:
+        """Async-first transformation gate that can also reject signals.
+
+        Like ``transform()`` but semantically designed for async operations
+        and transformations that may fail (return None). This is the primary
+        gate for LLM-powered agent transformations where the transform
+        involves I/O, API calls, or other async work.
+
+            # Async LLM enrichment
+            async def enrich(signal):
+                result = await llm.analyze(signal.metadata["text"])
+                return signal.with_metadata(analysis=result)
+
+            gate = Gate.map(enrich)
+
+            # Sync works too
+            gate = Gate.map(lambda s: s.evolve(priority=s.priority + 1))
+
+            # Return None to reject
+            gate = Gate.map(lambda s: s if s.priority > 0 else None)
+        """
+
+        async def map_fn(signal: Signal) -> Signal | None:
+            result = fn(signal)
+            if isawaitable(result):
+                result = await result
+            return result
+
+        return cls(map_fn, name=name)
