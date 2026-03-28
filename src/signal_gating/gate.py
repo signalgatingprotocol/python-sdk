@@ -377,6 +377,143 @@ class Gate:
         return cls(tap_fn, name=name)
 
     @classmethod
+    def batch(cls, size: int, timeout: float = 0.0, name: str = "batch") -> Gate:
+        """Accumulate signals into batches, releasing when size or timeout is reached.
+
+        Signals accumulate silently (returning None) until the batch threshold
+        is met. Then the last signal is returned with metadata containing the
+        full batch. This is THE throughput primitive for agent systems —
+        processing signals individually is wasteful when they can be batched.
+
+        The returned signal carries:
+            - metadata["batch"]: list of serialized signals in the batch
+            - metadata["batch_size"]: number of signals in the batch
+
+        With timeout > 0, the batch also flushes if ``timeout`` seconds have
+        elapsed since the first signal in the current batch was received.
+        The timeout is checked on each incoming signal (not via background task),
+        so it prevents signals from sitting in the buffer indefinitely in
+        low-throughput scenarios.
+
+            gate = Gate.batch(10)             # flush every 10 signals
+            gate = Gate.batch(10, timeout=5)  # flush every 10 signals or 5s
+        """
+        if size < 1:
+            raise ValueError("batch size must be >= 1")
+        state: dict[str, Any] = {"buffer": [], "first_at": 0.0}
+        lock = asyncio.Lock()
+
+        async def fn(signal: Signal) -> Signal | None:
+            async with lock:
+                now = time.monotonic()
+                if not state["buffer"]:
+                    state["first_at"] = now
+                state["buffer"].append(signal)
+
+                timed_out = timeout > 0 and (now - state["first_at"]) >= timeout
+                if len(state["buffer"]) >= size or timed_out:
+                    batch = list(state["buffer"])
+                    state["buffer"] = []
+                    state["first_at"] = 0.0
+                    return signal.with_metadata(
+                        batch=[s.model_dump() for s in batch],
+                        batch_size=len(batch),
+                    )
+                return None  # Accumulating
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def parallel(
+        cls,
+        *gates: Gate,
+        mode: str = "all",
+        name: str = "parallel",
+    ) -> Gate:
+        """Run multiple gates concurrently on the same signal.
+
+        This is the agent-native fan-out/fan-in for gate evaluation —
+        when you need to check multiple conditions simultaneously instead
+        of sequentially, or race gates against each other.
+
+        Modes:
+            ``all``: Signal must pass ALL gates. Returns the last result.
+            ``any``: Signal passes if ANY gate accepts. Returns first non-None.
+            ``race``: Whichever gate completes first wins. Others are cancelled.
+
+            gate = Gate.parallel(auth_gate, rate_gate, schema_gate, mode="all")
+            gate = Gate.parallel(cache_gate, compute_gate, mode="any")
+            gate = Gate.parallel(local_gate, remote_gate, mode="race")
+        """
+        if not gates:
+            raise ValueError("parallel requires at least one gate")
+        if mode not in ("all", "any", "race"):
+            raise ValueError(f"Unknown parallel mode: {mode!r}")
+        gate_list = list(gates)
+
+        async def fn(signal: Signal) -> Signal | None:
+            if mode == "race":
+                tasks = [asyncio.create_task(g.process(signal)) for g in gate_list]
+                try:
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for t in pending:
+                        t.cancel()
+                    for t in done:
+                        return t.result()
+                    return None
+                except Exception:
+                    for t in tasks:
+                        t.cancel()
+                    raise
+
+            results = await asyncio.gather(*(g.process(signal) for g in gate_list))
+
+            if mode == "all":
+                for r in results:
+                    if r is None:
+                        return None
+                return results[-1]
+            else:  # any
+                for r in results:
+                    if r is not None:
+                        return r
+                return None
+
+        return cls(fn, name=name)
+
+    @classmethod
+    def fallback(
+        cls,
+        primary: Gate,
+        *fallbacks: Gate,
+        name: str = "fallback",
+    ) -> Gate:
+        """Try primary gate first, then fallbacks in order until one passes.
+
+        Unlike ``|`` (OR) which evaluates both sides, fallback is lazy — it
+        only tries the next gate if the previous one rejected. This matters
+        when gates have side effects or are expensive.
+
+            gate = Gate.fallback(
+                cache_lookup,      # Try cache first
+                database_lookup,   # Fall back to database
+                default_value,     # Last resort
+            )
+        """
+        all_gates = [primary, *fallbacks]
+
+        async def fn(signal: Signal) -> Signal | None:
+            for gate in all_gates:
+                result = await gate.process(signal)
+                if result is not None:
+                    return result
+            return None
+
+        return cls(fn, name=name)
+
+    @classmethod
     def debounce(cls, seconds: float, name: str = "debounce") -> Gate:
         """Debounce gate — only passes a signal after a quiet period.
 

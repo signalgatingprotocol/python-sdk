@@ -609,6 +609,55 @@ class Mesh:
             raise MeshError(f"Topic '{name}' does not exist")
         del self._topics[name]
 
+    # --- Request / Response ---
+
+    async def request(
+        self,
+        target: Agent | str,
+        signal: Signal,
+        timeout: float = 30.0,
+    ) -> Signal:
+        """Send a signal to a specific agent and wait for a correlated response.
+
+        This is the workflow building block — the agent-native RPC pattern.
+        Unlike Agent.request() which emits through the outbox (to all connected
+        agents), Mesh.request() injects directly into a specific agent's inbox
+        and captures the response.
+
+        The target agent must call ``reply()`` or emit a signal with the
+        matching correlation_id for the request to resolve.
+
+            response = await mesh.request(analyst, TaskSignal(task="analyze"))
+            print(response.metadata)
+
+        Chain requests to build multi-step workflows:
+
+            r1 = await mesh.request(fetcher, FetchSignal(url="..."))
+            r2 = await mesh.request(parser, ParseSignal(data=r1))
+            r3 = await mesh.request(storer, StoreSignal(parsed=r2))
+        """
+        resolved = self._resolve(target)
+        cid = uuid4().hex
+        tagged = signal.evolve(correlation_id=cid)
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Signal] = loop.create_future()
+
+        # Capture the reply from the target's outbox
+        async def capture(sig: Signal) -> None:
+            if sig.correlation_id == cid and not future.done():
+                future.set_result(sig)
+
+        resolved._outbox.append(capture)
+        try:
+            await resolved.inbox.send(tagged)
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            try:
+                resolved._outbox.remove(capture)
+            except ValueError:
+                pass
+
     # --- Scatter / Gather ---
 
     async def scatter(

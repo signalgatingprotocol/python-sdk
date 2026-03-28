@@ -572,6 +572,7 @@ class Agent:
         except Exception as e:
             if self._running:
                 logger.error("Agent '%s' loop error: %s", self.name, e, exc_info=True)
+                raise  # Propagate to _supervised_loop for restart
         finally:
             self._running = False
 
