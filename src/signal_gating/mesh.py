@@ -731,6 +731,173 @@ class Mesh:
                 except ValueError:
                     pass
 
+    # --- Workflow Orchestration ---
+
+    async def workflow(
+        self,
+        signal: Signal,
+        steps: list[Agent | str],
+        timeout: float = 60.0,
+        step_timeout: float = 30.0,
+    ) -> Signal:
+        """Execute a sequential multi-agent workflow — THE agent orchestration primitive.
+
+        Sends a signal through a chain of agents where each agent's response
+        becomes the next agent's input. This is the fundamental pattern for
+        building complex agent pipelines: fetch → parse → analyze → store.
+
+        Each step uses the mesh request/response pattern, so target agents
+        must call ``reply()`` or emit a correlated response.
+
+        Args:
+            signal: The initial signal to send to the first step.
+            steps: Ordered list of agents to process the signal through.
+            timeout: Maximum total time for the entire workflow.
+            step_timeout: Maximum time for each individual step.
+
+        Returns:
+            The final response signal from the last agent in the chain.
+
+        Example::
+
+            result = await mesh.workflow(
+                TaskSignal(task="analyze quarterly revenue"),
+                steps=[data_fetcher, analyzer, summarizer, formatter],
+                timeout=60.0,
+                step_timeout=15.0,
+            )
+            # result is the formatter's response, carrying the full
+            # lineage of transformations through all four agents
+
+        Chain workflows for complex orchestration::
+
+            # Parallel preparation, then sequential processing
+            prep = await mesh.scatter(SetupSignal(), [db_agent, cache_agent])
+            result = await mesh.workflow(
+                AnalyzeSignal(context=prep),
+                steps=[analyzer, reviewer, publisher],
+            )
+        """
+        if not steps:
+            raise MeshError("workflow requires at least one step")
+
+        async def _run() -> Signal:
+            current = signal
+            for i, step in enumerate(steps):
+                resolved = self._resolve(step)
+                self.tracer.record(
+                    trace_id=signal.trace_id,
+                    signal_id=current.id,
+                    agent="mesh",
+                    gate="workflow",
+                    action="step_start",
+                    step=i,
+                    target=resolved.name,
+                )
+                current = await self.request(resolved, current, timeout=step_timeout)
+                self.tracer.record(
+                    trace_id=signal.trace_id,
+                    signal_id=current.id,
+                    agent="mesh",
+                    gate="workflow",
+                    action="step_complete",
+                    step=i,
+                    target=resolved.name,
+                )
+            return current
+
+        return await asyncio.wait_for(_run(), timeout=timeout)
+
+    async def race(
+        self,
+        signal: Signal,
+        targets: list[Agent | str],
+        timeout: float = 30.0,
+    ) -> Signal:
+        """Race a signal across multiple agents — first response wins.
+
+        Sends the same signal to N agents in parallel and returns the
+        first response received. All other pending responses are discarded.
+        This is THE competitive execution primitive for agent systems.
+
+        Use cases:
+        - Try multiple strategies in parallel, take the fastest
+        - Query multiple data sources, return first available
+        - Run fast/cheap and slow/thorough agents, take whichever finishes first
+        - Speculative execution with automatic cancellation
+
+        Args:
+            signal: The signal to send to all targets.
+            targets: Agents that will race to respond.
+            timeout: Maximum time to wait for the first response.
+
+        Returns:
+            The first response signal received from any target.
+
+        Example::
+
+            result = await mesh.race(
+                AnalyzeSignal(data=data),
+                [cache_lookup, fast_analyzer, deep_analyzer],
+                timeout=5.0,
+            )
+            # result comes from whichever agent responds first
+        """
+        if not targets:
+            raise MeshError("race requires at least one target")
+
+        cid = uuid4().hex
+        resolved = [self._resolve(t) for t in targets]
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Signal] = loop.create_future()
+        capture_fns: list[tuple[Agent, Any]] = []
+
+        for target in resolved:
+            target_cid = f"{cid}:{target.name}"
+
+            def _make_capture(
+                f: asyncio.Future[Signal], tcid: str,
+            ) -> Any:
+                async def capture(sig: Signal) -> None:
+                    if sig.correlation_id == tcid and not f.done():
+                        f.set_result(sig)
+
+                return capture
+
+            capture = _make_capture(future, target_cid)
+            target._outbox.append(capture)
+            capture_fns.append((target, capture))
+
+        # Send to all targets in parallel
+        for target in resolved:
+            target_cid = f"{cid}:{target.name}"
+            self.tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=signal.id,
+                agent="mesh",
+                gate="race",
+                action="sent",
+                target=target.name,
+            )
+            await target.inbox.send(signal.evolve(correlation_id=target_cid))
+
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout)
+            self.tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=result.id,
+                agent="mesh",
+                gate="race",
+                action="winner",
+            )
+            return result
+        finally:
+            for target, capture in capture_fns:
+                try:
+                    target._outbox.remove(capture)
+                except ValueError:
+                    pass
+
     # --- Graceful Shutdown ---
 
     async def stop(self, drain: bool = False, drain_timeout: float = 10.0) -> None:
