@@ -122,12 +122,12 @@ class AgentPool:
             worker.once(signal_type)(handler)
         for mw in self._middleware:
             worker.use(mw)
-        for hook in self._on_start_hooks:
-            worker._on_start_hooks.append(hook)
-        for hook in self._on_stop_hooks:
-            worker._on_stop_hooks.append(hook)
-        for hook in self._on_error_hooks:
-            worker._on_error_hooks.append(hook)
+        for start_hook in self._on_start_hooks:
+            worker._on_start_hooks.append(start_hook)
+        for stop_hook in self._on_stop_hooks:
+            worker._on_stop_hooks.append(stop_hook)
+        for err_hook in self._on_error_hooks:
+            worker._on_error_hooks.append(err_hook)
         return worker
 
     # --- Handler Registration (mirrors Agent API) ---

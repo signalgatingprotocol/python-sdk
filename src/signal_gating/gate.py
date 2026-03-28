@@ -544,7 +544,8 @@ class Gate:
             async with lock:
                 # Only pass if no newer signal arrived
                 if state["last_time"] <= now:
-                    return state["last_signal"]
+                    result: Signal | None = state["last_signal"]
+                    return result
                 return None
 
         return cls(fn, name=name)
@@ -625,9 +626,10 @@ class Gate:
         """
 
         async def map_fn(signal: Signal) -> Signal | None:
-            result = fn(signal)
-            if isawaitable(result):
-                result = await result
+            raw = fn(signal)
+            if isawaitable(raw):
+                raw = await raw
+            result: Signal | None = raw
             return result
 
         return cls(map_fn, name=name)

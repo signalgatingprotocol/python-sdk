@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from signal_gating.agent import Agent
-from signal_gating.errors import MeshError
+from signal_gating.agent import Agent, ToolCallSignal, ToolResultSignal, ToolSpec
+from signal_gating.errors import AgentError, MeshError
 from signal_gating.gate import Gate
 from signal_gating.signal import Signal
 from signal_gating.tracing import Tracer
@@ -248,7 +248,7 @@ class Mesh:
     def load_balance(
         self,
         source: Agent | str,
-        targets: list[Agent | str],
+        targets: Sequence[Agent | str],
         gate: Gate | None = None,
     ) -> None:
         """Round-robin load balancing across multiple target agents.
@@ -897,6 +897,239 @@ class Mesh:
                     target._outbox.remove(capture)
                 except ValueError:
                     pass
+
+    # --- Tool Calling ---
+
+    async def call_tool(
+        self,
+        target: Agent | str,
+        tool_name: str,
+        timeout: float = 30.0,
+        **arguments: Any,
+    ) -> Any:
+        """Call a tool on a target agent and return the result.
+
+        This is the agent-native RPC primitive. Sends a ToolCallSignal to
+        the target agent, waits for the ToolResultSignal, and returns the
+        result value. If the tool errors, raises AgentError.
+
+        Args:
+            target: The agent that exposes the tool.
+            tool_name: Name of the tool to invoke.
+            timeout: Maximum time to wait for the result.
+            **arguments: Keyword arguments passed to the tool function.
+
+        Returns:
+            The tool function's return value.
+
+        Raises:
+            AgentError: If the tool returns an error.
+            asyncio.TimeoutError: If the call exceeds the timeout.
+
+        Example::
+
+            result = await mesh.call_tool(
+                analyst, "analyze",
+                data="quarterly revenue", depth=2,
+            )
+        """
+        resolved = self._resolve(target)
+        signal = ToolCallSignal(
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        response = await self.request(resolved, signal, timeout=timeout)
+        if isinstance(response, ToolResultSignal):
+            if response.error:
+                raise AgentError(resolved.name, f"Tool '{tool_name}' failed: {response.error}")
+            return response.result
+        return response
+
+    def discover_tools(
+        self,
+        agent: Agent | str | None = None,
+    ) -> dict[str, list[ToolSpec]]:
+        """Discover tools across the mesh — the agent-native service registry.
+
+        Without arguments, returns all tools from all agents. With an agent
+        specified, returns only that agent's tools.
+
+        This is how LLM-based agents discover what capabilities are available
+        in the mesh at runtime. Feed this to an LLM's tool selection to enable
+        dynamic, self-organizing multi-agent systems.
+
+            # Discover all available tools
+            all_tools = mesh.discover_tools()
+            for agent_name, tools in all_tools.items():
+                for tool in tools:
+                    print(f"{agent_name}.{tool.name}: {tool.description}")
+
+            # Discover tools for a specific agent
+            tools = mesh.discover_tools(analyst)
+        """
+        if agent is not None:
+            resolved = self._resolve(agent)
+            return {resolved.name: resolved.list_tools()}
+        return {
+            a.name: a.list_tools()
+            for a in self._agents.values()
+            if a.list_tools()
+        }
+
+    # --- Map/Reduce ---
+
+    async def map_reduce(
+        self,
+        signal: Signal,
+        mappers: list[Agent | str],
+        reducer: Agent | str,
+        timeout: float = 60.0,
+        mapper_timeout: float = 30.0,
+    ) -> Signal:
+        """Parallel map across agents, then reduce through a single agent.
+
+        This is THE multi-agent intelligence pattern: distribute work across
+        N specialized agents in parallel, then synthesize their outputs through
+        a reducer. This is how you build systems where multiple AI agents
+        analyze the same data from different angles, then a synthesizer
+        combines their insights.
+
+        Each mapper receives the signal and must ``reply()`` with its result.
+        The reducer receives a signal carrying all mapper responses in its
+        metadata (``metadata["responses"]``) and must ``reply()`` with the
+        final combined result.
+
+        Args:
+            signal: The signal to distribute to all mappers.
+            mappers: Agents that process the signal in parallel.
+            reducer: Agent that combines all mapper responses.
+            timeout: Maximum total time for the entire operation.
+            mapper_timeout: Maximum time for each mapper.
+
+        Returns:
+            The reducer's response signal.
+
+        Example::
+
+            result = await mesh.map_reduce(
+                AnalyzeSignal(data="quarterly revenue report"),
+                mappers=[trend_analyst, risk_analyst, sentiment_analyst],
+                reducer=synthesizer,
+                timeout=30.0,
+            )
+            # synthesizer receives all three analyses and combines them
+        """
+        if not mappers:
+            raise MeshError("map_reduce requires at least one mapper")
+
+        async def _run() -> Signal:
+            # Map phase: scatter to all mappers
+            responses = await self.scatter(
+                signal, mappers, timeout=mapper_timeout
+            )
+
+            # Build the reduce signal with all responses
+            reduce_signal = signal.evolve(
+                metadata={
+                    **signal.metadata,
+                    "responses": [r.model_dump() for r in responses],
+                    "mapper_count": len(responses),
+                },
+            )
+
+            self.tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=signal.id,
+                agent="mesh",
+                gate="map_reduce",
+                action="reduce_start",
+                mapper_count=len(responses),
+            )
+
+            # Reduce phase: send combined result to reducer
+            result = await self.request(
+                reducer, reduce_signal, timeout=mapper_timeout
+            )
+
+            self.tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=result.id,
+                agent="mesh",
+                gate="map_reduce",
+                action="reduce_complete",
+            )
+            return result
+
+        return await asyncio.wait_for(_run(), timeout=timeout)
+
+    # --- Branching Workflow ---
+
+    async def branch_workflow(
+        self,
+        signal: Signal,
+        router: Callable[[Signal], str],
+        branches: dict[str, list[Agent | str]],
+        timeout: float = 60.0,
+        step_timeout: float = 30.0,
+    ) -> Signal:
+        """Conditional workflow — route signals through different agent chains.
+
+        This is the agent-native decision tree. A router function inspects the
+        signal and returns a branch key. The signal then flows through the
+        corresponding agent chain. This enables workflows that adapt their
+        processing path based on signal content — not just static topology.
+
+        Args:
+            signal: The signal to route.
+            router: Function that inspects the signal and returns a branch key.
+            branches: Dict mapping branch keys to ordered lists of agents.
+            timeout: Maximum total time for the entire workflow.
+            step_timeout: Maximum time for each individual step.
+
+        Returns:
+            The final response signal from the chosen branch.
+
+        Raises:
+            MeshError: If the router returns a key not in branches.
+
+        Example::
+
+            result = await mesh.branch_workflow(
+                TaskSignal(task="analyze", priority=9),
+                router=lambda s: "critical" if s.priority >= 8 else "normal",
+                branches={
+                    "critical": [validator, deep_analyzer, reviewer],
+                    "normal": [quick_analyzer],
+                },
+            )
+        """
+        if not branches:
+            raise MeshError("branch_workflow requires at least one branch")
+
+        async def _run() -> Signal:
+            branch_key = router(signal)
+            if branch_key not in branches:
+                raise MeshError(
+                    f"Router returned unknown branch {branch_key!r}. "
+                    f"Available: {list(branches.keys())}"
+                )
+
+            steps = branches[branch_key]
+            self.tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=signal.id,
+                agent="mesh",
+                gate="branch_workflow",
+                action="branch_selected",
+                branch=branch_key,
+                steps=len(steps),
+            )
+
+            return await self.workflow(
+                signal, steps, timeout=timeout, step_timeout=step_timeout
+            )
+
+        return await asyncio.wait_for(_run(), timeout=timeout)
 
     # --- Graceful Shutdown ---
 

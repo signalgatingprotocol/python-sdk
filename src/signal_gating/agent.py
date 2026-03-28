@@ -7,6 +7,7 @@ import inspect
 import logging
 import time
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import Any, TypeVar, get_type_hints
 from uuid import uuid4
@@ -22,6 +23,53 @@ NextFn = Callable[..., Coroutine[Any, Any, Signal | None]]
 Middleware = Callable[[Signal, NextFn], Coroutine[Any, Any, Signal | None]]
 LifecycleHook = Callable[[], Any]
 ErrorHook = Callable[[Signal, Exception], Any]
+ToolFn = Callable[..., Any]
+
+
+# --- Tool Protocol Signals ---
+
+
+class ToolCallSignal(Signal):
+    """Signal requesting invocation of a named tool on a target agent.
+
+    This is the wire format for agent-to-agent tool calling. An agent emits
+    this signal to invoke a tool on another agent. The target agent processes
+    it, executes the tool, and replies with a ToolResultSignal.
+
+    Used automatically by ``Agent.call_tool()`` and ``Mesh.call_tool()``.
+    """
+
+    tool_name: str
+    arguments: dict[str, Any] = {}
+
+
+class ToolResultSignal(Signal):
+    """Signal carrying the result of a tool invocation.
+
+    Emitted by agents in response to a ToolCallSignal. Carries the tool's
+    return value (or error) back to the caller.
+    """
+
+    tool_name: str
+    result: Any = None
+    error: str = ""
+
+
+@dataclass(slots=True)
+class ToolSpec:
+    """Specification for a tool exposed by an agent.
+
+    Tools are the agent-native RPC primitive. When an agent registers a tool,
+    it becomes discoverable and callable by other agents through the mesh.
+    This bridges the gap between signal-based communication and structured
+    function calling — essential for LLM-based agents that think in terms
+    of tool use.
+    """
+
+    name: str
+    description: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    fn: ToolFn | None = field(default=None, repr=False)
 
 logger = logging.getLogger("signal_gating.agent")
 
@@ -213,6 +261,9 @@ class Agent:
 
         # Request/response pending futures
         self._pending_requests: dict[str, asyncio.Future[Signal]] = {}
+
+        # Tool registry — agent-native function calling
+        self._tools: dict[str, ToolSpec] = {}
 
     def _make_inbox(self) -> Channel[Signal] | PriorityChannel[Signal]:
         """Create a fresh inbox channel."""
@@ -651,6 +702,137 @@ class Agent:
                 logger.error(
                     "Agent '%s' on_stop hook failed: %s", self.name, e, exc_info=True
                 )
+
+    # --- Tool Registry ---
+
+    def tool(
+        self,
+        name: str | None = None,
+        description: str = "",
+    ) -> Callable[[ToolFn], ToolFn]:
+        """Register a function as a tool that other agents can discover and call.
+
+        This is THE bridge between signal-based agent systems and LLM tool-calling.
+        Tools are the agent-native RPC primitive — they let agents expose structured
+        capabilities that other agents (or LLMs) can discover and invoke.
+
+        When a tool is registered, the agent automatically handles ToolCallSignal
+        for that tool name, executes the function, and replies with a ToolResultSignal.
+
+        Supports both sync and async tool functions.
+
+            @worker.tool(description="Analyze data and return insights")
+            async def analyze(data: str, depth: int = 1) -> dict:
+                return {"insights": await run_analysis(data, depth)}
+
+            # Other agents can discover and call this tool:
+            tools = worker.list_tools()
+            result = await mesh.call_tool(worker, "analyze", data="revenue Q4")
+
+        Args:
+            name: Tool name (defaults to function name).
+            description: Human-readable description of what the tool does.
+
+        Returns:
+            Decorator that registers the function as a tool.
+        """
+        agent = self
+
+        def decorator(fn: ToolFn) -> ToolFn:
+            tool_name = name or fn.__name__
+            # Extract parameter schema from function signature
+            sig = inspect.signature(fn)
+            params: dict[str, Any] = {}
+            try:
+                hints = get_type_hints(fn)
+            except Exception:
+                hints = getattr(fn, "__annotations__", {})
+            for pname, param in sig.parameters.items():
+                param_info: dict[str, Any] = {}
+                if pname in hints:
+                    ann = hints[pname]
+                    param_info["type"] = getattr(ann, "__name__", str(ann))
+                if param.default is not inspect.Parameter.empty:
+                    param_info["default"] = param.default
+                param_info["required"] = param.default is inspect.Parameter.empty
+                params[pname] = param_info
+
+            spec = ToolSpec(
+                name=tool_name,
+                description=description or (fn.__doc__ or "").strip(),
+                parameters=params,
+                fn=fn,
+            )
+            agent._tools[tool_name] = spec
+
+            # Auto-register handler for ToolCallSignal if not already present
+            if ToolCallSignal not in agent._handlers:
+                @agent.on(ToolCallSignal)
+                async def _handle_tool_call(
+                    signal: ToolCallSignal, ctx: AgentContext,
+                ) -> None:
+                    tool = agent._tools.get(signal.tool_name)
+                    if tool is None or tool.fn is None:
+                        await ctx.reply(ToolResultSignal(
+                            tool_name=signal.tool_name,
+                            error=f"Unknown tool: {signal.tool_name}",
+                        ))
+                        return
+                    try:
+                        result = tool.fn(**signal.arguments)
+                        if isawaitable(result):
+                            result = await result
+                        await ctx.reply(ToolResultSignal(
+                            tool_name=signal.tool_name,
+                            result=result,
+                        ))
+                    except Exception as e:
+                        await ctx.reply(ToolResultSignal(
+                            tool_name=signal.tool_name,
+                            error=f"{type(e).__name__}: {e}",
+                        ))
+
+            return fn
+
+        return decorator
+
+    def list_tools(self) -> list[ToolSpec]:
+        """List all tools exposed by this agent.
+
+        Returns tool specifications that can be used by LLMs for tool selection,
+        by other agents for capability discovery, or by orchestrators for
+        building dynamic workflows.
+
+            tools = agent.list_tools()
+            for tool in tools:
+                print(f"{tool.name}: {tool.description}")
+                print(f"  params: {tool.parameters}")
+        """
+        return list(self._tools.values())
+
+    def get_tool(self, name: str) -> ToolSpec | None:
+        """Get a specific tool spec by name."""
+        return self._tools.get(name)
+
+    def tools_schema(self) -> list[dict[str, Any]]:
+        """Export all tools as a JSON-serializable schema.
+
+        This is designed to be directly usable as the ``tools`` parameter
+        in LLM API calls. Each tool's parameter types and descriptions
+        are extracted from the function signature and docstring.
+
+            # Feed directly to an LLM
+            schema = agent.tools_schema()
+            response = await llm.complete(messages, tools=schema)
+        """
+        return [
+            {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            }
+            for spec in self._tools.values()
+        ]
 
     def _add_output(self, send_fn: Callable[[Signal], Coroutine[Any, Any, None]]) -> None:
         """Internal: register an output destination."""

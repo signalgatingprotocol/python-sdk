@@ -124,19 +124,21 @@ class Channel(Generic[T]):
                 process(signal)
         """
         output: asyncio.Queue[T | None] = asyncio.Queue()
-        active = len(channels)
+        remaining = len(channels)
+        lock = asyncio.Lock()
 
         async def _reader(ch: Channel[T]) -> None:
-            nonlocal active
+            nonlocal remaining
             try:
                 async for signal in ch:
                     await output.put(signal)
             except (ChannelClosed, StopAsyncIteration):
                 pass
             finally:
-                active -= 1
-                if active <= 0:
-                    await output.put(None)
+                async with lock:
+                    remaining -= 1
+                    if remaining <= 0:
+                        await output.put(None)
 
         tasks = [asyncio.create_task(_reader(ch)) for ch in channels]
         try:
