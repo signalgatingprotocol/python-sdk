@@ -25,7 +25,7 @@ import logging
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from signal_gating.agent import Agent, Handler, LifecycleHook, Middleware
+from signal_gating.agent import Agent, ErrorHook, Handler, LifecycleHook, Middleware
 from signal_gating.gate import Gate
 from signal_gating.signal import Signal
 
@@ -81,10 +81,12 @@ class AgentPool:
         self._middleware: list[Middleware] = []
         self._on_start_hooks: list[LifecycleHook] = []
         self._on_stop_hooks: list[LifecycleHook] = []
+        self._on_error_hooks: list[ErrorHook] = []
 
         # Create workers
         self._workers: list[Agent] = []
-        self._counter = itertools.count()
+        self._name_counter = itertools.count()
+        self._robin_counter = itertools.count()
         for _ in range(size):
             self._workers.append(self._create_worker())
 
@@ -102,7 +104,7 @@ class AgentPool:
 
     def _create_worker(self) -> Agent:
         """Create a new worker with the pool's configuration."""
-        index = next(self._counter)
+        index = next(self._name_counter)
         worker = Agent(
             name=f"{self.name}[{index}]",
             gates=list(self._gates),
@@ -124,6 +126,8 @@ class AgentPool:
             worker._on_start_hooks.append(hook)
         for hook in self._on_stop_hooks:
             worker._on_stop_hooks.append(hook)
+        for hook in self._on_error_hooks:
+            worker._on_error_hooks.append(hook)
         return worker
 
     # --- Handler Registration (mirrors Agent API) ---
@@ -169,6 +173,13 @@ class AgentPool:
         self._on_stop_hooks.append(fn)
         for worker in self._workers:
             worker._on_stop_hooks.append(fn)
+        return fn
+
+    def on_error(self, fn: ErrorHook) -> ErrorHook:
+        """Register an error hook for all pool workers."""
+        self._on_error_hooks.append(fn)
+        for worker in self._workers:
+            worker._on_error_hooks.append(fn)
         return fn
 
     def use(self, middleware: Middleware) -> None:
@@ -241,7 +252,7 @@ class AgentPool:
         if self._strategy == "least_loaded":
             return min(self._workers, key=lambda w: w.inbox.pending)
         # round_robin (default)
-        return self._workers[next(self._counter) % len(self._workers)]
+        return self._workers[next(self._robin_counter) % len(self._workers)]
 
     # --- Lifecycle ---
 

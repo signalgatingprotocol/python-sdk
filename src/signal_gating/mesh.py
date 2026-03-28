@@ -136,6 +136,41 @@ class Mesh:
         src._remove_outputs(target=tgt_name)
         return before - len(self._edges)
 
+    def pipe(
+        self,
+        *agents: Agent | str,
+        gate: Gate | None = None,
+    ) -> None:
+        """Connect agents in a linear chain — the most common topology pattern.
+
+        Instead of writing N separate connect() calls:
+
+            mesh.connect(fetcher, parser)
+            mesh.connect(parser, validator)
+            mesh.connect(validator, storer)
+
+        Write one pipe():
+
+            mesh.pipe(fetcher, parser, validator, storer)
+
+        An optional gate is applied to every edge in the chain.
+        All agents are auto-added to the mesh if not already present.
+
+            mesh.pipe(fetcher, parser, validator, storer, gate=Gate.by_priority(3))
+        """
+        if len(agents) < 2:
+            raise MeshError("pipe() requires at least 2 agents")
+        resolved: list[Agent] = []
+        for a in agents:
+            agent = a if isinstance(a, Agent) else self._agents.get(a)
+            if agent is None:
+                raise MeshError(f"Agent '{a}' not found in mesh — add it first")
+            if agent.name not in self._agents:
+                self.add(agent)
+            resolved.append(agent)
+        for i in range(len(resolved) - 1):
+            self.connect(resolved[i], resolved[i + 1], gate)
+
     def broadcast_connect(
         self,
         source: Agent | str,
@@ -683,6 +718,57 @@ class Mesh:
 
     async def __aexit__(self, *exc: Any) -> None:
         await self.stop()
+
+    def visualize(self) -> str:
+        """Text-based topology visualization for introspection and debugging.
+
+        Returns a human-readable string showing all agents, their connections,
+        topics, and capabilities. Agents can use this to understand their own
+        network topology at runtime.
+
+            print(mesh.visualize())
+            # Mesh (3 agents, 2 edges)
+            # ├── fetcher [2 handlers]
+            # │   └──> parser (via priority_filter)
+            # ├── parser [1 handler]
+            # │   └──> storer
+            # └── storer [1 handler]
+        """
+        lines: list[str] = []
+        agents = list(self._agents.values())
+        lines.append(f"Mesh ({len(agents)} agents, {len(self._edges)} edges)")
+
+        for i, agent in enumerate(agents):
+            is_last_agent = i == len(agents) - 1
+            prefix = "└── " if is_last_agent else "├── "
+            child_prefix = "    " if is_last_agent else "│   "
+
+            n_handlers = sum(len(h) for h in agent._handlers.values())
+            status = "running" if agent.running else "stopped"
+            line = f"{prefix}{agent.name} [{n_handlers} handlers, {status}]"
+
+            caps = self._capabilities.get(agent.name, set())
+            if caps:
+                line += f" caps={{{', '.join(sorted(caps))}}}"
+            lines.append(line)
+
+            # Show outgoing edges
+            outgoing = [e for e in self._edges if e.source.name == agent.name]
+            for j, edge in enumerate(outgoing):
+                is_last_edge = j == len(outgoing) - 1
+                edge_prefix = child_prefix + ("└──> " if is_last_edge else "├──> ")
+                gate_info = f" (via {edge.gate.name})" if edge.gate else ""
+                lines.append(f"{edge_prefix}{edge.target.name}{gate_info}")
+
+        # Show topics
+        if self._topics:
+            lines.append("")
+            lines.append("Topics:")
+            for topic, subscribers in self._topics.items():
+                sub_names = [a.name for a in subscribers]
+                lines.append(f"  {topic}: [{', '.join(sub_names)}]")
+
+        return "\n".join(lines)
 
     def __repr__(self) -> str:
         return f"Mesh(agents={len(self._agents)}, edges={len(self._edges)})"
