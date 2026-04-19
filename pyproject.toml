@@ -7,7 +7,7 @@ name = "signal-gating"
 version = "0.1.0"
 description = "The Signal Gating Protocol SDK — agent-native signal orchestration for autonomous AI systems"
 readme = "README.md"
-license = "Apache-2.0"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
     { name = "Signal Gating Protocol" },
