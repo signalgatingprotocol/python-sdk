@@ -1,9 +1,7 @@
 """AgentPool — elastic horizontal scaling for agent workloads.
 
-The AgentPool is THE agent-native primitive for scaling. Instead of manually
-creating and wiring identical agents, a pool manages N workers that share
-the same handler configuration, distributes signals across them, and can
-scale up or down at runtime.
+A pool manages N workers that share the same handler configuration, distributes
+signals across them, and can scale up or down at runtime.
 
     pool = AgentPool("workers", size=3, gates=[Gate.by_priority(3)])
 
@@ -197,7 +195,6 @@ class AgentPool:
         (if scaling down). Scaling down returns stopped workers — the caller
         must await their stop() if they are running.
 
-        This is the agent-native autoscaling primitive:
             pool.scale_to(10)   # Handle traffic spike
             pool.scale_to(2)    # Scale back down
         """

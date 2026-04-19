@@ -275,9 +275,8 @@ class Gate:
         otherwise: Gate | None = None,
         name: str = "when",
     ) -> Gate:
-        """Conditional branching gate — the agent-native if/else for signal flow.
+        """Conditional branching gate: route signals through different paths based on a predicate.
 
-        Routes signals through different gate paths based on a condition.
         If no `otherwise` gate is provided, non-matching signals pass through unchanged.
 
             gate = Gate.when(
@@ -318,8 +317,7 @@ class Gate:
 
         Unlike `rate_limit` which applies backpressure (sleeps), throttle
         silently drops excess signals. Use when dropping is preferable to
-        queuing — essential for real-time agent systems where stale signals
-        have no value.
+        queuing.
 
             gate = Gate.throttle(100)  # Allow max 100 signals/sec, drop rest
         """
@@ -388,8 +386,7 @@ class Gate:
 
         Signals accumulate silently (returning None) until the batch threshold
         is met. Then the last signal is returned with metadata containing the
-        full batch. This is THE throughput primitive for agent systems —
-        processing signals individually is wasteful when they can be batched.
+        full batch.
 
         The returned signal carries:
             - metadata["batch"]: list of serialized signals in the batch
@@ -438,8 +435,7 @@ class Gate:
     ) -> Gate:
         """Run multiple gates concurrently on the same signal.
 
-        This is the agent-native fan-out/fan-in for gate evaluation —
-        when you need to check multiple conditions simultaneously instead
+        Use when you need to check multiple conditions simultaneously instead
         of sequentially, or race gates against each other.
 
         Modes:

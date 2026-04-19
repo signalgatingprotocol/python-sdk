@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from dataclasses import dataclass
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -31,6 +32,24 @@ class Edge:
         self.source = source
         self.target = target
         self.gate = gate
+
+
+@dataclass
+class RouteFn:
+    """A mesh output route, carrying the send function plus routing metadata.
+
+    Metadata lets the mesh find and tear down routes by source, target, or
+    tag (e.g. disconnecting a specific edge or removing all load-balanced
+    routes from an agent).
+    """
+
+    fn: Callable[[Signal], Coroutine[Any, Any, None]]
+    source: str
+    target: str | None = None
+    tag: str = ""
+
+    async def __call__(self, signal: Signal) -> None:
+        await self.fn(signal)
 
 
 class Mesh:
@@ -91,9 +110,6 @@ class Mesh:
 
     async def remove(self, agent: Agent | str) -> None:
         """Remove an agent from the mesh, stopping it and cleaning up edges.
-
-        Dynamic topology is essential for agent systems — agents join and leave
-        at runtime based on demand, failures, or scaling decisions.
 
         This removes all edges, routing functions, and capabilities — the agent
         is fully severed from the mesh.
@@ -202,8 +218,7 @@ class Mesh:
         First matching predicate wins. If no predicate matches and a default is
         specified, the signal goes there. Otherwise it is dropped.
 
-        This is the agent-native way to build intelligent signal routing —
-        signals go where they need to based on their content, not just topology.
+        Signals are routed based on their content, not just topology.
 
             mesh.route(coordinator, [
                 (lambda s: s.priority >= 8, critical_handler),
@@ -241,9 +256,7 @@ class Mesh:
                 )
                 await resolved_default.inbox.send(signal)
 
-        content_route._mesh_tag = "content_route"  # type: ignore[attr-defined]
-        content_route._mesh_source = src.name  # type: ignore[attr-defined]
-        src._add_output(content_route)
+        src._add_output(RouteFn(fn=content_route, source=src.name, tag="content_route"))
 
     def load_balance(
         self,
@@ -282,9 +295,7 @@ class Mesh:
             )
             await target.inbox.send(signal)
 
-        balanced_route._mesh_tag = "load_balance"  # type: ignore[attr-defined]
-        balanced_route._mesh_source = src.name  # type: ignore[attr-defined]
-        src._add_output(balanced_route)
+        src._add_output(RouteFn(fn=balanced_route, source=src.name, tag="load_balance"))
 
     async def start(self) -> None:
         """Start all agents in the mesh."""
@@ -530,11 +541,9 @@ class Mesh:
             )
             await tgt.inbox.send(signal)
 
-        # Tag route function so disconnect/remove can find and remove it
-        route._mesh_target = tgt.name  # type: ignore[attr-defined]
-        route._mesh_source = src.name  # type: ignore[attr-defined]
-        route._mesh_tag = "connect"  # type: ignore[attr-defined]
-        src._add_output(route)
+        src._add_output(
+            RouteFn(fn=route, source=src.name, target=tgt.name, tag="connect")
+        )
 
     # --- Pub/Sub Topics ---
 
@@ -619,7 +628,6 @@ class Mesh:
     ) -> Signal:
         """Send a signal to a specific agent and wait for a correlated response.
 
-        This is the workflow building block — the agent-native RPC pattern.
         Unlike Agent.request() which emits through the outbox (to all connected
         agents), Mesh.request() injects directly into a specific agent's inbox
         and captures the response.
@@ -668,8 +676,7 @@ class Mesh:
     ) -> list[Signal]:
         """Scatter a signal to multiple agents and gather all correlated responses.
 
-        This is THE fundamental multi-agent coordination pattern:
-        send work to N agents in parallel, wait for all to respond.
+        Send work to N agents in parallel, then wait for all to respond.
 
             responses = await mesh.scatter(
                 TaskSignal(task="analyze"),
@@ -909,9 +916,8 @@ class Mesh:
     ) -> Any:
         """Call a tool on a target agent and return the result.
 
-        This is the agent-native RPC primitive. Sends a ToolCallSignal to
-        the target agent, waits for the ToolResultSignal, and returns the
-        result value. If the tool errors, raises AgentError.
+        Sends a ToolCallSignal to the target agent, waits for the ToolResultSignal,
+        and returns the result value. If the tool errors, raises AgentError.
 
         Args:
             target: The agent that exposes the tool.
@@ -988,10 +994,9 @@ class Mesh:
     ) -> Signal:
         """Parallel map across agents, then reduce through a single agent.
 
-        This is THE multi-agent intelligence pattern: distribute work across
-        N specialized agents in parallel, then synthesize their outputs through
-        a reducer. This is how you build systems where multiple AI agents
-        analyze the same data from different angles, then a synthesizer
+        Distributes work across N specialized agents in parallel, then
+        synthesizes their outputs through a reducer. Useful when multiple
+        agents analyze the same data from different angles and a synthesizer
         combines their insights.
 
         Each mapper receives the signal and must ``reply()`` with its result.

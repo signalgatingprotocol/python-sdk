@@ -16,6 +16,7 @@ from signal_gating.channel import Channel, PriorityChannel
 from signal_gating.errors import AgentError
 from signal_gating.gate import Gate
 from signal_gating.signal import Signal
+from signal_gating.tracing import Tracer
 
 T = TypeVar("T", bound=Signal)
 Handler = Callable[..., Coroutine[Any, Any, Any]]
@@ -59,11 +60,9 @@ class ToolResultSignal(Signal):
 class ToolSpec:
     """Specification for a tool exposed by an agent.
 
-    Tools are the agent-native RPC primitive. When an agent registers a tool,
-    it becomes discoverable and callable by other agents through the mesh.
-    This bridges the gap between signal-based communication and structured
-    function calling — essential for LLM-based agents that think in terms
-    of tool use.
+    When an agent registers a tool, it becomes discoverable and callable by
+    other agents through the mesh. Bridges signal-based communication and
+    structured function calling for LLM-based agents.
     """
 
     name: str
@@ -231,7 +230,6 @@ class Agent:
         self._priority_inbox = priority_inbox
         self.inbox: Channel[Signal] | PriorityChannel[Signal] = self._make_inbox()
         self._handlers: dict[type[Signal], list[Handler]] = {}
-        self._handler_context_cache: dict[int, bool] = {}
         self._middleware: list[Middleware] = []
         self._outbox: list[Callable[[Signal], Coroutine[Any, Any, None]]] = []
         self._task: asyncio.Task[None] | None = None
@@ -252,7 +250,7 @@ class Agent:
         self.dead_letters = DeadLetterQueue()
 
         # Tracer (set by mesh or manually)
-        self._tracer: Any = None
+        self._tracer: Tracer | None = None
 
         # Lifecycle hooks
         self._on_start_hooks: list[LifecycleHook] = []
@@ -271,7 +269,7 @@ class Agent:
             return PriorityChannel(Signal, buffer_size=self._buffer_size)
         return Channel(Signal, buffer_size=self._buffer_size)
 
-    def set_tracer(self, tracer: Any) -> None:
+    def set_tracer(self, tracer: Tracer) -> None:
         """Attach a tracer for observability. Called by Mesh or manually."""
         self._tracer = tracer
 
@@ -506,23 +504,7 @@ class Agent:
             )
 
     def _handler_wants_context(self, handler: Handler) -> bool:
-        """Check if a handler's signature includes an AgentContext parameter.
-
-        Results are cached per handler identity for performance — this avoids
-        expensive introspection on every signal dispatch.
-        """
-        handler_id = id(handler)
-        cached = self._handler_context_cache.get(handler_id)
-        if cached is not None:
-            return cached
-
-        result = self._inspect_handler_context(handler)
-        self._handler_context_cache[handler_id] = result
-        return result
-
-    @staticmethod
-    def _inspect_handler_context(handler: Handler) -> bool:
-        """Introspect a handler's signature for AgentContext parameter."""
+        """Check if a handler's signature includes an AgentContext parameter."""
         try:
             fn = getattr(handler, "__wrapped__", handler)
             sig = inspect.signature(fn)
@@ -712,12 +694,10 @@ class Agent:
     ) -> Callable[[ToolFn], ToolFn]:
         """Register a function as a tool that other agents can discover and call.
 
-        This is THE bridge between signal-based agent systems and LLM tool-calling.
-        Tools are the agent-native RPC primitive — they let agents expose structured
-        capabilities that other agents (or LLMs) can discover and invoke.
-
-        When a tool is registered, the agent automatically handles ToolCallSignal
-        for that tool name, executes the function, and replies with a ToolResultSignal.
+        Tools let agents expose structured capabilities that other agents
+        (or LLMs) can discover and invoke. When a tool is registered, the agent
+        automatically handles ToolCallSignal for that tool name, executes the
+        function, and replies with a ToolResultSignal.
 
         Supports both sync and async tool functions.
 
@@ -843,16 +823,22 @@ class Agent:
     ) -> int:
         """Internal: remove output destinations by target name or tag.
 
+        Only RouteFn-wrapped outputs carry metadata; plain callables are kept.
         Returns the number of removed entries.
         """
+        from signal_gating.mesh import RouteFn
+
+        def should_remove(fn: Any) -> bool:
+            if not isinstance(fn, RouteFn):
+                return False
+            if target is not None and fn.target == target:
+                return True
+            if tag is not None and fn.tag == tag:
+                return True
+            return False
+
         before = len(self._outbox)
-        self._outbox = [
-            fn for fn in self._outbox
-            if not (
-                (target is not None and getattr(fn, "_mesh_target", None) == target)
-                or (tag is not None and getattr(fn, "_mesh_tag", None) == tag)
-            )
-        ]
+        self._outbox = [fn for fn in self._outbox if not should_remove(fn)]
         return before - len(self._outbox)
 
     def __repr__(self) -> str:
