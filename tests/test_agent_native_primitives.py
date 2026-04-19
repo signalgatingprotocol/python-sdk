@@ -7,7 +7,6 @@ import pytest
 
 from signal_gating import Agent, AgentContext, Channel, Gate, Mesh, Signal
 
-
 # --- Signal types for testing ---
 
 
@@ -281,7 +280,6 @@ class TestGateFallback:
     async def test_fallback_chain(self):
         """Fallback with multiple levels."""
         transform1 = Gate.transform(lambda s: s.with_metadata(source="primary"))
-        transform2 = Gate.transform(lambda s: s.with_metadata(source="backup"))
 
         gate = Gate.fallback(Gate.block(), transform1)
         result = await gate.process(Signal(priority=1))
