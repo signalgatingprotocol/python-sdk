@@ -14,7 +14,6 @@ from signal_gating import (
     ToolSpec,
 )
 
-
 # --- Signal types for tests ---
 
 

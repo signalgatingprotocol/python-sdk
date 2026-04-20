@@ -1,7 +1,6 @@
 """Tests for codebase review improvements: bug fixes and new features."""
 
 import asyncio
-import time
 
 import pytest
 
@@ -14,7 +13,6 @@ from signal_gating import (
     Pipeline,
     Signal,
 )
-
 
 # --- Signal types for testing ---
 

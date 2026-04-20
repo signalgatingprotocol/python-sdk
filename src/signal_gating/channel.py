@@ -116,9 +116,8 @@ class Channel(Generic[T]):
         """Merge multiple channels into a single async stream.
 
         Yields signals from any channel as they arrive. When all channels
-        are closed, the iterator ends. This is the agent-native multiplexer —
-        essential when an agent needs to consume from multiple sources without
-        dedicating a task to each.
+        are closed, the iterator ends. Useful when an agent consumes from
+        multiple sources without dedicating a task to each.
 
             async for signal in Channel.merge(inbox_a, inbox_b, inbox_c):
                 process(signal)

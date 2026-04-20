@@ -6,7 +6,6 @@ import pytest
 
 from signal_gating import Agent, Gate, Mesh, Signal
 
-
 # -- Signal types for testing --
 
 
@@ -270,7 +269,7 @@ class TestMeshWorkflow:
         mesh = Mesh([a, b])
         initial = Signal()
         async with mesh:
-            result = await mesh.workflow(initial, steps=[a, b], timeout=5.0)
+            await mesh.workflow(initial, steps=[a, b], timeout=5.0)
             # Trace is recorded
             assert mesh.tracer.span_count > 0
 

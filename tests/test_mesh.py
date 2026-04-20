@@ -465,3 +465,28 @@ async def test_mesh_health():
         assert "a" in health["agents"]
         assert "b" in health["agents"]
         assert health["agents"]["a"]["healthy"] is True
+
+
+class TestDrainOnStop:
+    """Mesh.stop(drain=True) waits for pending signals to complete."""
+
+    async def test_drain_stop_works(self):
+        agent = Agent("worker")
+        processed: list[str] = []
+
+        class DrainTask(Signal):
+            task: str
+
+        @agent.on(DrainTask)
+        async def handle(signal: DrainTask):
+            await asyncio.sleep(0.01)
+            processed.append(signal.task)
+
+        mesh = Mesh([agent])
+        await mesh.start()
+
+        for i in range(3):
+            await agent.inbox.send(DrainTask(task=f"task-{i}"))
+
+        await mesh.stop(drain=True)
+        assert len(processed) == 3

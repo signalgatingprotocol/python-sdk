@@ -57,7 +57,6 @@ class Signal(BaseModel):
         The child preserves the trace_id for correlation and records this
         signal's id as parent_id, enabling full signal lineage trees.
 
-        This is the agent-native way to create derived signals:
             task = TaskSignal(task="analyze")
             subtask = task.child(task="analyze_section_1", priority=8)
             # subtask.parent_id == task.id

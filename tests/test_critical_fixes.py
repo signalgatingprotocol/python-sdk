@@ -3,7 +3,7 @@
 import asyncio
 import time
 
-from signal_gating import Agent, AgentContext, Gate, Mesh, Signal
+from signal_gating import Agent, Gate, Mesh, Signal
 
 
 class TaskSignal(Signal):
@@ -203,34 +203,6 @@ class TestExponentialBackoff:
         assert agent._restart_delay == 1.0
 
 
-# === Handler context caching ===
-
-
-class TestHandlerContextCache:
-    def test_context_detection_is_cached(self):
-        agent = Agent("test")
-
-        async def handler_with_ctx(s: Signal, ctx: AgentContext) -> None:
-            pass
-
-        # First call computes
-        result1 = agent._handler_wants_context(handler_with_ctx)
-        assert result1 is True
-
-        # Second call uses cache
-        assert id(handler_with_ctx) in agent._handler_context_cache
-        result2 = agent._handler_wants_context(handler_with_ctx)
-        assert result2 is True
-
-    def test_no_context_handler_cached(self):
-        agent = Agent("test")
-
-        async def handler_no_ctx(s: Signal) -> None:
-            pass
-
-        result = agent._handler_wants_context(handler_no_ctx)
-        assert result is False
-        assert id(handler_no_ctx) in agent._handler_context_cache
 
 
 # === emit_many concurrency ===
@@ -368,9 +340,9 @@ class TestOutboxTagging:
 
         assert len(a._outbox) == 1
         route_fn = a._outbox[0]
-        assert getattr(route_fn, "_mesh_target", None) == "b"
-        assert getattr(route_fn, "_mesh_source", None) == "a"
-        assert getattr(route_fn, "_mesh_tag", None) == "connect"
+        assert route_fn.target == "b"
+        assert route_fn.source == "a"
+        assert route_fn.tag == "connect"
 
     def test_disconnect_removes_tagged_routes(self):
         a = Agent("a")
@@ -383,7 +355,7 @@ class TestOutboxTagging:
 
         mesh.disconnect(a, b)
         assert len(a._outbox) == 1
-        assert getattr(a._outbox[0], "_mesh_target", None) == "c"
+        assert a._outbox[0].target == "c"
 
     def test_load_balance_tags_route(self):
         src = Agent("src")
@@ -393,4 +365,4 @@ class TestOutboxTagging:
         mesh.load_balance(src, [t1, t2])
 
         assert len(src._outbox) == 1
-        assert getattr(src._outbox[0], "_mesh_tag", None) == "load_balance"
+        assert src._outbox[0].tag == "load_balance"

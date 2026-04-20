@@ -7,8 +7,10 @@ The Signal Gating Protocol provides composable primitives for building multi-age
 ## Install
 
 ```bash
-pip install signal-gating
+pip install git+https://github.com/signalgatingprotocol/python-sdk
 ```
+
+> Alpha release. Not yet published to PyPI.
 
 ## Quick Start
 
@@ -361,4 +363,4 @@ mypy src/
 
 ## License
 
-MIT
+Apache 2.0
