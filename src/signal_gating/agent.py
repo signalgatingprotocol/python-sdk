@@ -263,6 +263,10 @@ class Agent:
         # Tool registry — agent-native function calling
         self._tools: dict[str, ToolSpec] = {}
 
+        # Per-handler cache of "does this handler want an AgentContext?".
+        # Computed once at registration; avoids per-signal inspect calls.
+        self._handler_wants_ctx: dict[Handler, bool] = {}
+
     def _make_inbox(self) -> Channel[Signal] | PriorityChannel[Signal]:
         """Create a fresh inbox channel."""
         if self._priority_inbox:
@@ -327,14 +331,14 @@ class Agent:
         """
 
         def decorator(fn: Handler) -> Handler:
-            self._handlers.setdefault(signal_type, []).append(fn)
+            self._register_handler(signal_type, fn)
             return fn
 
         return decorator
 
     def on_any(self, fn: Handler) -> Handler:
         """Register a handler for all signal types."""
-        self._handlers.setdefault(Signal, []).append(fn)
+        self._register_handler(Signal, fn)
         return fn
 
     def once(self, signal_type: type[T]) -> Callable[[Handler], Handler]:
@@ -346,18 +350,28 @@ class Agent:
         """
 
         def decorator(fn: Handler) -> Handler:
+            wants_ctx = self._detect_wants_context(fn)
+
             async def wrapper(*args: Any, **kwargs: Any) -> Any:
                 result = await fn(*args, **kwargs)
                 handlers = self._handlers.get(signal_type, [])
                 if wrapper in handlers:
                     handlers.remove(wrapper)
+                self._handler_wants_ctx.pop(wrapper, None)
                 return result
 
             wrapper.__wrapped__ = fn  # type: ignore[attr-defined]
             self._handlers.setdefault(signal_type, []).append(wrapper)
+            # Wrapper inherits the wrapped handler's context preference.
+            self._handler_wants_ctx[wrapper] = wants_ctx
             return fn
 
         return decorator
+
+    def _register_handler(self, signal_type: type[Signal], fn: Handler) -> None:
+        """Internal: register a handler and cache its context preference."""
+        self._handlers.setdefault(signal_type, []).append(fn)
+        self._handler_wants_ctx[fn] = self._detect_wants_context(fn)
 
     def on_start(self, fn: LifecycleHook) -> LifecycleHook:
         """Register a hook called when the agent starts.
@@ -454,7 +468,10 @@ class Agent:
     async def emit(self, signal: Signal) -> None:
         """Emit a signal to all connected downstream agents."""
         tagged = signal.with_source(self.name) if not signal.source else signal
-        for send_fn in self._outbox:
+        # Snapshot the outbox: connect/disconnect can mutate it concurrently
+        # (e.g. while we're awaiting a slow downstream send). Iterating the
+        # live list would skip or double-deliver entries.
+        for send_fn in tuple(self._outbox):
             await send_fn(tagged)
 
     async def emit_many(self, signals: list[Signal]) -> None:
@@ -503,8 +520,9 @@ class Agent:
                 "Agent '%s': no handler for %s", self.name, type(signal).__name__
             )
 
-    def _handler_wants_context(self, handler: Handler) -> bool:
-        """Check if a handler's signature includes an AgentContext parameter."""
+    @staticmethod
+    def _detect_wants_context(handler: Handler) -> bool:
+        """Inspect a handler's signature once to see if it expects AgentContext."""
         try:
             fn = getattr(handler, "__wrapped__", handler)
             sig = inspect.signature(fn)
@@ -530,8 +548,14 @@ class Agent:
     ) -> None:
         """Execute a single handler wrapped in the middleware chain."""
 
+        wants_ctx = self._handler_wants_ctx.get(handler)
+        if wants_ctx is None:
+            # Defensive: handler registered through an internal path. Compute once.
+            wants_ctx = self._detect_wants_context(handler)
+            self._handler_wants_ctx[handler] = wants_ctx
+
         async def call_handler(sig: Signal) -> Signal | None:
-            if self._handler_wants_context(handler):
+            if wants_ctx:
                 ctx = AgentContext(self, sig)
                 await handler(sig, ctx)
             else:
@@ -612,12 +636,19 @@ class Agent:
     async def start(self) -> None:
         """Start the agent's processing loop with supervision.
 
-        Can be called after stop() — a fresh inbox is created automatically
-        if the previous one was closed, enabling agent restart patterns.
+        Idempotent: returns immediately if the agent is already running.
+        Restartable: if a previous run exited (cleanly or via max restarts),
+        the task slot is cleared, the restart counter is reset, and a fresh
+        inbox is created if the prior one was closed.
         """
-        if self._task is not None:
+        # Already running.
+        if self._task is not None and not self._task.done():
             return
-        # Recreate inbox if it was closed (enables restart after stop)
+        # Previous run finished — collect it before starting fresh so that
+        # exceptions don't get silently buried in the task object.
+        if self._task is not None and self._task.done():
+            self._task = None
+        self._restart_count = 0
         if self.inbox.closed:
             self.inbox = self._make_inbox()
         for hook in self._on_start_hooks:
@@ -665,15 +696,34 @@ class Agent:
                 await asyncio.sleep(current_delay)
                 current_delay *= 2  # Exponential backoff
 
-    async def stop(self) -> None:
-        """Stop the agent gracefully."""
+    async def stop(self, timeout: float = 5.0) -> None:
+        """Stop the agent gracefully.
+
+        Closes the inbox so the run loop drains and exits. If the loop does
+        not exit within ``timeout`` seconds, it is cancelled and we wait for
+        cancellation to fully propagate before returning. The agent is left
+        in a clean restartable state.
+        """
         self._running = False
         self.inbox.close()
-        if self._task is not None:
+        task = self._task
+        if task is not None:
             try:
-                await asyncio.wait_for(self._task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                self._task.cancel()
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except asyncio.CancelledError:
+                # Outer caller cancelled us — propagate after best-effort cleanup.
+                if not task.done():
+                    task.cancel()
+                raise
+            except Exception:
+                # Loop raised; we still consider the agent stopped.
+                pass
             self._task = None
         for hook in self._on_stop_hooks:
             try:
