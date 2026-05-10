@@ -26,14 +26,19 @@ class Channel(Generic[T]):
         # Consumer
         async for signal in channel:
             process(signal)
+
+    Close semantics: pending items are drained, then receivers raise
+    ChannelClosed. Receivers blocked on a full closed channel wake up
+    immediately — close never silently strands a waiter.
     """
 
     def __init__(self, signal_type: type[T] | None = None, buffer_size: int = 0):
         self.signal_type = signal_type
-        self._queue: asyncio.Queue[T | None] = asyncio.Queue(
+        self._queue: asyncio.Queue[T] = asyncio.Queue(
             maxsize=buffer_size if buffer_size > 0 else 0
         )
         self._closed = False
+        self._close_event = asyncio.Event()
 
     @property
     def closed(self) -> bool:
@@ -50,7 +55,7 @@ class Channel(Generic[T]):
         try:
             self._queue.put_nowait(signal)
         except asyncio.QueueFull:
-            raise ChannelFull()
+            raise ChannelFull() from None
 
     async def send_wait(self, signal: T, timeout: float | None = None) -> None:
         """Send a signal, waiting for space if the channel is full.
@@ -66,32 +71,56 @@ class Channel(Generic[T]):
             await self._queue.put(signal)
 
     async def receive(self) -> T:
-        """Receive the next signal. Blocks until one is available."""
-        if self._closed and self._queue.empty():
+        """Receive the next signal. Blocks until one is available or the channel closes."""
+        # Fast path: item already available.
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        if self._closed:
             raise ChannelClosed()
-        item = await self._queue.get()
-        if item is None:
-            raise ChannelClosed()
-        return item
+
+        # Slow path: race a get against close. Either the producer hands us
+        # an item, or close() fires and we raise. No sentinel; no silent strands.
+        get_task: asyncio.Task[T] = asyncio.ensure_future(self._queue.get())
+        close_task = asyncio.ensure_future(self._close_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {get_task, close_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if get_task in done:
+                return get_task.result()
+            # Close fired. Drain anything that landed concurrently.
+            if get_task.done():
+                return get_task.result()
+            try:
+                return self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                raise ChannelClosed() from None
+        finally:
+            for t in (get_task, close_task):
+                if not t.done():
+                    t.cancel()
 
     def try_receive(self) -> T | None:
-        """Non-blocking receive. Returns None if no signal is available."""
+        """Non-blocking receive. Returns None if no signal is available.
+
+        To distinguish "empty" from "closed and drained", check `closed`.
+        """
         try:
-            item = self._queue.get_nowait()
-            if item is None:
-                return None
-            return item
+            return self._queue.get_nowait()
         except asyncio.QueueEmpty:
             return None
 
     def close(self) -> None:
-        """Close the channel. Pending signals can still be drained."""
+        """Close the channel. Pending signals can still be drained.
+
+        Wakes all blocked receivers. Future sends raise ChannelClosed.
+        """
+        if self._closed:
+            return
         self._closed = True
-        # Wake up any waiting receivers
-        try:
-            self._queue.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        self._close_event.set()
 
     def __aiter__(self) -> Channel[T]:
         return self
@@ -100,16 +129,16 @@ class Channel(Generic[T]):
         try:
             return await self.receive()
         except ChannelClosed:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
 
     async def drain(self) -> list[T]:
         """Drain all pending signals from the channel."""
         signals: list[T] = []
-        while not self._queue.empty():
-            item = self._queue.get_nowait()
-            if item is not None:
-                signals.append(item)
-        return signals
+        while True:
+            try:
+                signals.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                return signals
 
     @staticmethod
     async def merge(*channels: Channel[T]) -> AsyncIterator[T]:
@@ -246,19 +275,21 @@ class PriorityChannel(Generic[T]):
     def try_receive(self) -> T | None:
         """Non-blocking receive of the highest-priority signal.
 
-        Note: This is not concurrency-safe with async operations.
-        Use `receive()` for concurrent access.
+        Note: not safe to interleave with concurrent receive() — locking would
+        require an async API. Use receive() in concurrent code paths.
         """
-        if self._heap:
-            _, _, signal = heapq.heappop(self._heap)
-            if not self._heap:
-                self._has_items.clear()
-            self._has_space.set()
-            return signal
-        return None
+        if not self._heap:
+            return None
+        _, _, signal = heapq.heappop(self._heap)
+        if not self._heap:
+            self._has_items.clear()
+        self._has_space.set()
+        return signal
 
     def close(self) -> None:
         """Close the channel. Pending signals can still be drained."""
+        if self._closed:
+            return
         self._closed = True
         self._has_items.set()
 
@@ -269,7 +300,7 @@ class PriorityChannel(Generic[T]):
         try:
             return await self.receive()
         except ChannelClosed:
-            raise StopAsyncIteration
+            raise StopAsyncIteration from None
 
     async def drain(self) -> list[T]:
         """Drain all pending signals in priority order (highest first)."""
