@@ -398,6 +398,29 @@ mesh.add(planner)
 
 The loop is bounded by `max_tool_rounds` (default 4).
 
+### Trajectories
+
+Capture a verifiable, structured record of every signal that crosses the mesh,
+exportable as JSONL for audit, learning, or training. Attach a recorder with one
+line; it is a pure observer (never blocks):
+
+```python
+from signal_gating import TrajectoryRecorder
+
+recorder = TrajectoryRecorder()
+mesh.intercept(recorder)
+
+async with mesh:
+    await mesh.inject(planner, Topic(text="..."))
+
+recorder.trajectories()              # {trace_id: [Receipt, ...]}, grouped per run
+recorder.export_jsonl("runs.jsonl")  # one Receipt per line
+```
+
+Each `Receipt` carries the signal's lineage (`trace_id` / `parent_id`), routing
+(`source` -> `target`), typed domain `payload`, and a `digest` (sha256) so the
+record is tamper-evident: `receipt.verify()`.
+
 ## Architecture
 
 ```

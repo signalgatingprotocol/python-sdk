@@ -58,6 +58,7 @@ from signal_gating.pipeline import Pipeline
 from signal_gating.pool import AgentPool
 from signal_gating.signal import Signal
 from signal_gating.tracing import Span, Tracer
+from signal_gating.trajectory import Receipt, TrajectoryRecorder
 
 __all__ = [
     "Agent",
@@ -80,6 +81,7 @@ __all__ = [
     "Message",
     "Pipeline",
     "PriorityChannel",
+    "Receipt",
     "Signal",
     "SignalGatingError",
     "SignalValidationError",
@@ -89,6 +91,7 @@ __all__ = [
     "ToolResultSignal",
     "ToolSpec",
     "Tracer",
+    "TrajectoryRecorder",
 ]
 
 __version__ = "0.1.0"
