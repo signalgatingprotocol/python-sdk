@@ -1,4 +1,4 @@
-"""Gates — composable predicates that control signal flow.
+"""Gates: composable predicates that control signal flow.
 
 Gates are the core innovation of the Signal Gating Protocol. They decide whether
 a signal passes through, gets transformed, or gets rejected.
@@ -247,7 +247,7 @@ class Gate:
 
     @classmethod
     def timeout(cls, gate: Gate, seconds: float, name: str = "timeout") -> Gate:
-        """Wrap a gate with a timeout — rejects if processing takes too long."""
+        """Wrap a gate with a timeout; rejects if processing takes too long."""
 
         async def fn(signal: Signal) -> Signal | None:
             try:
@@ -297,7 +297,7 @@ class Gate:
 
     @classmethod
     def sample(cls, rate: float, name: str = "sample") -> Gate:
-        """Probabilistic sampling gate — passes signals at the given rate (0.0-1.0).
+        """Probabilistic sampling gate: passes signals at the given rate (0.0-1.0).
 
         Essential for high-throughput systems where you want to observe
         or process only a fraction of signals:
@@ -313,7 +313,7 @@ class Gate:
 
     @classmethod
     def throttle(cls, max_per_second: float, name: str = "throttle") -> Gate:
-        """Throttle gate — drops signals that exceed the rate instead of sleeping.
+        """Throttle gate: drops signals that exceed the rate instead of sleeping.
 
         Unlike `rate_limit` which applies backpressure (sleeps), throttle
         silently drops excess signals. Use when dropping is preferable to
@@ -337,7 +337,7 @@ class Gate:
 
     @classmethod
     def ttl(cls, seconds: float, name: str = "ttl") -> Gate:
-        """Time-to-live gate — drops signals older than the specified age.
+        """Time-to-live gate: drops signals older than the specified age.
 
         Prevents stale signals from consuming agent resources. Critical for
         systems where signal freshness determines value:
@@ -357,7 +357,7 @@ class Gate:
         fn: Callable[[Signal], Any],
         name: str = "tap",
     ) -> Gate:
-        """Tap gate — execute a side-effect without affecting signal flow.
+        """Tap gate: execute a side-effect without affecting signal flow.
 
         The signal always passes through unchanged. The tap function is called
         for observation only. Essential for logging, metrics, debugging, and
@@ -494,7 +494,7 @@ class Gate:
     ) -> Gate:
         """Try primary gate first, then fallbacks in order until one passes.
 
-        Unlike ``|`` (OR) which evaluates both sides, fallback is lazy — it
+        Unlike ``|`` (OR) which evaluates both sides, fallback is lazy: it
         only tries the next gate if the previous one rejected. This matters
         when gates have side effects or are expensive.
 
@@ -517,7 +517,7 @@ class Gate:
 
     @classmethod
     def debounce(cls, seconds: float, name: str = "debounce") -> Gate:
-        """Debounce gate — only passes a signal after a quiet period.
+        """Debounce gate: only passes a signal after a quiet period.
 
         Waits `seconds` after receiving a signal. If another signal arrives
         during the wait, the timer resets. Only the last signal in a burst
@@ -553,14 +553,14 @@ class Gate:
         min_signals: int = 1,
         name: str = "window",
     ) -> Gate:
-        """Sliding time window gate — passes signals enriched with window context.
+        """Sliding time window gate: passes signals enriched with window context.
 
         Maintains a rolling window of the last ``seconds`` seconds. Each
         incoming signal is checked against the window: if at least
         ``min_signals`` exist within the window, the signal passes through
         enriched with rate and count metadata. Otherwise it is rejected.
 
-        This is THE observability primitive for agent systems — detect
+        This is THE observability primitive for agent systems. Detect
         bursts, anomalies, and patterns in real-time signal flow.
 
             # Detect bursts: only pass when 5+ signals arrive in 10 seconds

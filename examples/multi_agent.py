@@ -1,4 +1,4 @@
-"""Multi-agent example — agents communicating through a mesh with gates."""
+"""Multi-agent example: agents communicating through a mesh with gates."""
 
 import asyncio
 

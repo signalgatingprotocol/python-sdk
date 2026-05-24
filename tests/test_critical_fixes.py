@@ -59,7 +59,7 @@ class TestDisconnectStopsFlow:
         mesh.connect(sender, receiver)
 
         async with mesh:
-            # Send before disconnect — should arrive
+            # Send before disconnect (should arrive)
             await sender.emit(TaskSignal(task="before"))
             await asyncio.sleep(0.05)
             assert received == ["before"]
@@ -67,7 +67,7 @@ class TestDisconnectStopsFlow:
             # Disconnect
             mesh.disconnect(sender, receiver)
 
-            # Send after disconnect — should NOT arrive
+            # Send after disconnect (should NOT arrive)
             await sender.emit(TaskSignal(task="after"))
             await asyncio.sleep(0.05)
             assert received == ["before"]  # Still only one
@@ -118,7 +118,7 @@ class TestDisconnectStopsFlow:
 
         async with mesh:
             await mesh.remove(middle)
-            # Middle's outbox should be cleared — no route to receiver
+            # Middle's outbox should be cleared (no route to receiver)
             assert len(middle._outbox) == 0
 
 
@@ -143,7 +143,7 @@ class TestAgentRestart:
         await agent.stop()
         assert received == ["first"]
 
-        # Second lifecycle — should work after stop
+        # Second lifecycle: should work after stop
         await agent.start()
         await asyncio.sleep(0)  # Yield so task starts
         assert agent.running
@@ -325,7 +325,7 @@ class TestDrainTimeout:
                 await agent.inbox.send(Signal())
             await asyncio.sleep(0.1)
 
-        # Should complete without hanging — the drain has a timeout
+        # Should complete without hanging (the drain has a timeout)
 
 
 # === Outbox tagging ===

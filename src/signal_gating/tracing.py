@@ -1,4 +1,4 @@
-"""Tracing — observability for signal flow through the protocol."""
+"""Tracing: observability for signal flow through the protocol."""
 
 from __future__ import annotations
 

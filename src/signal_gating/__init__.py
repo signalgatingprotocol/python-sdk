@@ -1,15 +1,15 @@
-"""Signal Gating Protocol — agent-native signal orchestration.
+"""Signal Gating Protocol: agent-native signal orchestration.
 
 The Signal Gating Protocol provides composable primitives for building
 autonomous multi-agent systems with controlled, observable signal flow.
 
 Core primitives:
-    Signal   — Typed, immutable events that flow through the system
-    Gate     — Composable predicates that control signal flow
-    Channel  — Async typed conduits for signal transport
-    Agent    — Autonomous signal processors with lifecycle management
-    Pipeline — Ordered gate chains for building processing flows
-    Mesh     — Agent network topology with gated connections
+    Signal   : Typed, immutable events that flow through the system
+    Gate     : Composable predicates that control signal flow
+    Channel  : Async typed conduits for signal transport
+    Agent    : Autonomous signal processors with lifecycle management
+    Pipeline : Ordered gate chains for building processing flows
+    Mesh     : Agent network topology with gated connections
 
 Quick start:
     from signal_gating import Signal, Gate, Agent, Mesh
@@ -52,7 +52,7 @@ from signal_gating.errors import (
     SignalValidationError,
 )
 from signal_gating.gate import Gate
-from signal_gating.llm import LLMAgent, Message
+from signal_gating.llm import LLMAgent, MeshToolProvider, Message, ToolProvider
 from signal_gating.mesh import Edge, Mesh
 from signal_gating.pipeline import Pipeline
 from signal_gating.pool import AgentPool
@@ -75,8 +75,9 @@ __all__ = [
     "GateRejected",
     "LLMAgent",
     "Mesh",
-    "Message",
     "MeshError",
+    "MeshToolProvider",
+    "Message",
     "Pipeline",
     "PriorityChannel",
     "Signal",
@@ -84,6 +85,7 @@ __all__ = [
     "SignalValidationError",
     "Span",
     "ToolCallSignal",
+    "ToolProvider",
     "ToolResultSignal",
     "ToolSpec",
     "Tracer",

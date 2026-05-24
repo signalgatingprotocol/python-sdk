@@ -1,4 +1,4 @@
-"""Tests for AgentPool — horizontal scaling primitive."""
+"""Tests for AgentPool: horizontal scaling primitive."""
 
 import asyncio
 
@@ -301,7 +301,7 @@ class TestPoolStrategies:
         mesh.add_pool(pool)
 
         async with mesh:
-            # Send directly using select_worker — which picks least loaded
+            # Send directly using select_worker (which picks least loaded)
             for i in range(6):
                 worker = pool.select_worker()
                 await worker.inbox.send(TaskSignal(task=f"job-{i}"))
