@@ -51,8 +51,10 @@ async def main() -> None:
     mesh.connect(writer, reporter)
 
     async with mesh:
-        await planner.emit(
-            Topic(text="why signal gating matters for multi-agent systems")
+        # inject() feeds the planner's inbox so it processes the topic;
+        # planner.emit() would send it past the planner, straight to the writer.
+        await mesh.inject(
+            planner, Topic(text="why signal gating matters for multi-agent systems")
         )
         await asyncio.sleep(5.0)
 

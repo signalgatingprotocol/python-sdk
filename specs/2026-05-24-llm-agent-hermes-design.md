@@ -154,7 +154,7 @@ async def main():
     mesh.connect(planner, writer)
     mesh.connect(writer, reporter)
     async with mesh:
-        await planner.emit(Topic(text="why signal gating matters for multi-agent systems"))
+        await mesh.inject(planner, Topic(text="why signal gating matters for multi-agent systems"))
         await asyncio.sleep(2.0)
 
 asyncio.run(main())
