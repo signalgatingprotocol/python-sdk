@@ -7,10 +7,22 @@ The Signal Gating Protocol provides composable primitives for building multi-age
 ## Install
 
 ```bash
+pip install signal-gating
+```
+
+For LLM-backed agents (the optional `openai` client):
+
+```bash
+pip install "signal-gating[llm]"
+```
+
+Or from source:
+
+```bash
 pip install git+https://github.com/signalgatingprotocol/python-sdk
 ```
 
-> Alpha release. Not yet published to PyPI.
+> Alpha: the API surface is still moving.
 
 ## Quick Start
 
