@@ -246,10 +246,10 @@ class TestDynamicTopology:
         await mesh.remove("a")
         assert len(mesh.agents) == 0
 
-    def test_remove_nonexistent_raises(self):
+    async def test_remove_nonexistent_raises(self):
         mesh = Mesh()
         with pytest.raises(MeshError):
-            asyncio.get_event_loop().run_until_complete(mesh.remove("ghost"))
+            await mesh.remove("ghost")
 
     def test_disconnect(self):
         a = Agent("a")
