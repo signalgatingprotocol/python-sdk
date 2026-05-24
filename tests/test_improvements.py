@@ -136,7 +136,7 @@ class TestGateSample:
         gate = Gate.sample(0.5)
         results = [await gate.process(Signal()) for _ in range(1000)]
         passed = sum(1 for r in results if r is not None)
-        # Should be roughly 50% — allow wide margin for randomness
+        # Should be roughly 50%; allow wide margin for randomness
         assert 300 < passed < 700
 
 

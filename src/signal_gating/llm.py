@@ -1,4 +1,4 @@
-"""LLM-backed agents — give an SGP Agent an OpenAI-compatible brain (e.g. Hermes)."""
+"""LLM-backed agents: give an SGP Agent an OpenAI-compatible brain (e.g. Hermes)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from signal_gating.signal import Signal
 
 
 class Message(Signal):
-    """A generic text-carrying signal — the zero-config input/output for LLMAgent."""
+    """A generic text-carrying signal; the zero-config input/output for LLMAgent."""
 
     text: str = ""
 

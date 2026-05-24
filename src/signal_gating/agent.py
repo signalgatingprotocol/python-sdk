@@ -1,4 +1,4 @@
-"""Agents — autonomous signal processors that form the backbone of the protocol."""
+"""Agents: autonomous signal processors that form the backbone of the protocol."""
 
 from __future__ import annotations
 
@@ -239,7 +239,7 @@ class Agent:
         self._error_count = 0
         self._restart_count = 0
 
-        # Agent state — persistent memory across signal processing cycles
+        # Agent state: persistent memory across signal processing cycles
         self.state: dict[str, Any] = {}
 
         # Supervision
@@ -260,7 +260,7 @@ class Agent:
         # Request/response pending futures
         self._pending_requests: dict[str, asyncio.Future[Signal]] = {}
 
-        # Tool registry — agent-native function calling
+        # Tool registry: agent-native function calling
         self._tools: dict[str, ToolSpec] = {}
 
         # Per-handler cache of "does this handler want an AgentContext?".
@@ -346,7 +346,7 @@ class Agent:
 
             @agent.once(StartupSignal)
             async def handle(signal: StartupSignal):
-                print("First signal received — won't fire again")
+                print("First signal received. Won't fire again")
         """
 
         def decorator(fn: Handler) -> Handler:
@@ -477,7 +477,7 @@ class Agent:
     async def emit_many(self, signals: list[Signal]) -> None:
         """Emit multiple signals concurrently.
 
-        Uses asyncio.gather for true parallel emission — all signals are sent
+        Uses asyncio.gather for true parallel emission; all signals are sent
         to all downstream agents simultaneously instead of sequentially.
         Essential for high-throughput agent patterns like fan-out and map operations.
         """
@@ -644,7 +644,7 @@ class Agent:
         # Already running.
         if self._task is not None and not self._task.done():
             return
-        # Previous run finished — collect it before starting fresh so that
+        # Previous run finished; collect it before starting fresh so that
         # exceptions don't get silently buried in the task object.
         if self._task is not None and self._task.done():
             self._task = None
@@ -717,7 +717,7 @@ class Agent:
                 except (asyncio.CancelledError, Exception):
                     pass
             except asyncio.CancelledError:
-                # Outer caller cancelled us — propagate after best-effort cleanup.
+                # Outer caller cancelled us; propagate after best-effort cleanup.
                 if not task.done():
                     task.cancel()
                 raise

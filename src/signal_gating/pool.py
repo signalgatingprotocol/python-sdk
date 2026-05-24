@@ -1,4 +1,4 @@
-"""AgentPool — elastic horizontal scaling for agent workloads.
+"""AgentPool: elastic horizontal scaling for agent workloads.
 
 A pool manages N workers that share the same handler configuration, distributes
 signals across them, and can scale up or down at runtime.
@@ -72,7 +72,7 @@ class AgentPool:
         self._priority_inbox = priority_inbox
         self._strategy = strategy
 
-        # Handler registry — applied to all workers on creation
+        # Handler registry: applied to all workers on creation
         self._handler_registry: list[tuple[type[Signal], Handler]] = []
         self._any_handlers: list[Handler] = []
         self._once_handlers: list[tuple[type[Signal], Handler]] = []
@@ -192,7 +192,7 @@ class AgentPool:
         """Scale the pool to the specified number of workers.
 
         Returns newly created workers (if scaling up) or removed workers
-        (if scaling down). Scaling down returns stopped workers — the caller
+        (if scaling down). Scaling down returns stopped workers; the caller
         must await their stop() if they are running.
 
             pool.scale_to(10)   # Handle traffic spike
@@ -217,7 +217,7 @@ class AgentPool:
             )
             return new_workers
 
-        # Scale down — remove from the end
+        # Scale down: remove from the end
         removed: list[Agent] = []
         while len(self._workers) > size:
             worker = self._workers.pop()

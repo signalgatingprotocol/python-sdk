@@ -45,7 +45,7 @@ class SignalValidationError(SignalGatingError):
 
 
 class CircuitOpenError(SignalGatingError):
-    """Circuit breaker is open — calls are being rejected."""
+    """Circuit breaker is open; calls are being rejected."""
 
     def __init__(self, gate_name: str, until: float):
         self.gate_name = gate_name

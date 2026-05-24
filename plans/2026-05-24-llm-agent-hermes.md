@@ -16,7 +16,7 @@
 
 - **Commits:** Per the project's CLAUDE.md, commit **only when the user authorizes**. Commit steps below are ready-to-run; treat them as "stage + commit once authorized." Branch is `claude/llm-agent-hermes` (not default).
 - **Working dir:** `/Users/p/code/github/signalgatingprotocol/python-sdk`.
-- **Test runner:** `pytest` (asyncio auto mode — `async def test_*` needs no decorator).
+- **Test runner:** `pytest` (asyncio auto mode; `async def test_*` needs no decorator).
 
 ## File structure
 
@@ -31,7 +31,7 @@
 
 ---
 
-## Task 1: Module scaffold — `Message`, `LLMClient` Protocol, default render
+## Task 1: Module scaffold: `Message`, `LLMClient` Protocol, default render
 
 **Files:**
 - Create: `src/signal_gating/llm.py`
@@ -64,13 +64,13 @@ def test_default_render_falls_back_to_repr():
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_llm_agent.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'signal_gating.llm'`.
+Expected: FAIL (`ModuleNotFoundError: No module named 'signal_gating.llm'`).
 
 - [ ] **Step 3: Write minimal implementation**
 
 Create `src/signal_gating/llm.py`:
 ```python
-"""LLM-backed agents — give an SGP Agent an OpenAI-compatible brain (e.g. Hermes)."""
+"""LLM-backed agents: give an SGP Agent an OpenAI-compatible brain (e.g. Hermes)."""
 
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ from signal_gating.signal import Signal
 
 
 class Message(Signal):
-    """A generic text-carrying signal — the zero-config input/output for LLMAgent."""
+    """A generic text-carrying signal; the zero-config input/output for LLMAgent."""
 
     text: str = ""
 
@@ -138,7 +138,7 @@ git commit -m "feat(llm): add Message signal and LLMClient protocol scaffold"
 
 ---
 
-## Task 2: `LLMAgent` — constructor, reasoning loop, default build
+## Task 2: `LLMAgent`: constructor, reasoning loop, default build
 
 **Files:**
 - Modify: `src/signal_gating/llm.py`
@@ -273,7 +273,7 @@ def test_emit_without_text_field_rejected_at_construction():
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_llm_agent.py -q`
-Expected: FAIL — `ImportError: cannot import name 'LLMAgent'`.
+Expected: FAIL (`ImportError: cannot import name 'LLMAgent'`).
 
 - [ ] **Step 3: Implement `LLMAgent`**
 
@@ -363,7 +363,7 @@ git commit -m "feat(llm): add LLMAgent reasoning loop with lineage-preserving em
 
 ---
 
-## Task 3: `LLMAgent.from_openai` — lazy client construction
+## Task 3: `LLMAgent.from_openai`: lazy client construction
 
 **Files:**
 - Modify: `src/signal_gating/llm.py`
@@ -411,7 +411,7 @@ def test_from_openai_builds_agent(monkeypatch):
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_llm_agent.py -q -k from_openai`
-Expected: FAIL — `AttributeError: type object 'LLMAgent' has no attribute 'from_openai'`.
+Expected: FAIL (`AttributeError: type object 'LLMAgent' has no attribute 'from_openai'`).
 
 - [ ] **Step 3: Implement `from_openai`**
 
@@ -488,7 +488,7 @@ def test_import_does_not_pull_openai():
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/test_llm_agent.py -q -k "exports or pull_openai"`
-Expected: FAIL — `AssertionError` (no `LLMAgent` attribute / not in `__all__`).
+Expected: FAIL (`AssertionError`, no `LLMAgent` attribute / not in `__all__`).
 
 - [ ] **Step 3: Add the exports**
 
@@ -496,7 +496,7 @@ In `src/signal_gating/__init__.py`, add an import line (after the existing `from
 ```python
 from signal_gating.llm import LLMAgent, Message
 ```
-Then add `"LLMAgent"` and `"Message"` to the `__all__` list (keep it alphabetically ordered — insert `"LLMAgent"` after `"GateRejected"` and `"Message"` after `"MeshError"`):
+Then add `"LLMAgent"` and `"Message"` to the `__all__` list (keep it alphabetically ordered; insert `"LLMAgent"` after `"GateRejected"` and `"Message"` after `"MeshError"`):
 ```python
     "LLMAgent",
 ```
@@ -518,7 +518,7 @@ git commit -m "feat(llm): export LLMAgent and Message from package root"
 
 ---
 
-## Task 5: `pyproject.toml` — `[llm]` extra + mypy override
+## Task 5: `pyproject.toml`: `[llm]` extra + mypy override
 
 **Files:**
 - Modify: `pyproject.toml`
@@ -555,7 +555,7 @@ git commit -m "build(llm): add optional [llm] extra and openai mypy override"
 
 ---
 
-## Task 6: Example — `examples/hermes_mesh.py`
+## Task 6: Example: `examples/hermes_mesh.py`
 
 **Files:**
 - Create: `examples/hermes_mesh.py`
@@ -641,7 +641,7 @@ git commit -m "docs(llm): add Hermes multi-agent mesh example"
 
 ---
 
-## Task 7: README — "LLM-backed agents (Hermes)" section
+## Task 7: README: "LLM-backed agents (Hermes)" section
 
 **Files:**
 - Modify: `README.md`
@@ -652,7 +652,7 @@ In `README.md`, add a new `### LLM-backed agents (Hermes)` subsection at the end
 ````markdown
 ### LLM-backed agents (Hermes)
 
-`LLMAgent` gives an agent an OpenAI-compatible brain — Nous Hermes, or any
+`LLMAgent` gives an agent an OpenAI-compatible brain. Nous Hermes, or any
 OpenAI-compatible server. Install the extra:
 
 ```bash

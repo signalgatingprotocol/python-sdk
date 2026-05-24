@@ -1,4 +1,4 @@
-"""Pipelines — composable chains of gates for building signal processing flows."""
+"""Pipelines: composable chains of gates for building signal processing flows."""
 
 from __future__ import annotations
 

@@ -197,7 +197,7 @@ async def test_circuit_breaker_closes_after_threshold():
         result = await gate.process(Signal())
         assert result is None
 
-    # Now circuit is open — rejects without calling inner
+    # Now circuit is open; rejects without calling inner
     result = await gate.process(Signal())
     assert result is None
 

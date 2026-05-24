@@ -1,4 +1,4 @@
-"""Core signal types — the fundamental unit of the Signal Gating Protocol."""
+"""Core signal types: the fundamental unit of the Signal Gating Protocol."""
 
 from __future__ import annotations
 

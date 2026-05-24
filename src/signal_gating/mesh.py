@@ -1,4 +1,4 @@
-"""Mesh — the agent network topology that ties everything together."""
+"""Mesh: the agent network topology that ties everything together."""
 
 from __future__ import annotations
 
@@ -111,7 +111,7 @@ class Mesh:
     async def remove(self, agent: Agent | str) -> None:
         """Remove an agent from the mesh, stopping it and cleaning up edges.
 
-        This removes all edges, routing functions, and capabilities — the agent
+        This removes all edges, routing functions, and capabilities; the agent
         is fully severed from the mesh.
         """
         resolved = self._resolve(agent)
@@ -135,7 +135,7 @@ class Mesh:
     def disconnect(self, source: Agent | str, target: Agent | str) -> int:
         """Remove all edges between source and target. Returns count removed.
 
-        Enables runtime topology rewiring — agents can be reconnected
+        Enables runtime topology rewiring. Agents can be reconnected
         to different targets without restarting the mesh.
 
         This removes both the edge records AND the actual routing functions,
@@ -157,7 +157,7 @@ class Mesh:
         *agents: Agent | str,
         gate: Gate | None = None,
     ) -> None:
-        """Connect agents in a linear chain — the most common topology pattern.
+        """Connect agents in a linear chain (the most common topology pattern).
 
         Instead of writing N separate connect() calls:
 
@@ -180,7 +180,7 @@ class Mesh:
         for a in agents:
             agent = a if isinstance(a, Agent) else self._agents.get(a)
             if agent is None:
-                raise MeshError(f"Agent '{a}' not found in mesh — add it first")
+                raise MeshError(f"Agent '{a}' not found in mesh; add it first")
             if agent.name not in self._agents:
                 self.add(agent)
             resolved.append(agent)
@@ -552,7 +552,7 @@ class Mesh:
 
         Topics decouple producers from consumers. Any agent can publish to a
         topic, and all subscribers receive the signal. This is the agent-native
-        broadcast pattern — essential when the number and identity of consumers
+        broadcast pattern, essential when the number and identity of consumers
         is dynamic.
 
             mesh.create_topic("events")
@@ -569,7 +569,7 @@ class Mesh:
     def subscribe(self, agent: Agent | str, topic: str) -> None:
         """Subscribe an agent to a topic. It will receive all published signals."""
         if topic not in self._topics:
-            raise MeshError(f"Topic '{topic}' does not exist — create it first")
+            raise MeshError(f"Topic '{topic}' does not exist; create it first")
         resolved = self._resolve(agent)
         if resolved not in self._topics[topic]:
             self._topics[topic].append(resolved)
@@ -585,7 +585,7 @@ class Mesh:
         """Publish a signal to all subscribers of a topic.
 
         Returns the number of subscribers that received the signal.
-        This is fire-and-forget — the signal is sent to each subscriber's
+        This is fire-and-forget: the signal is sent to each subscriber's
         inbox without waiting for processing.
 
             count = await mesh.publish("events", AlertSignal(message="alert"))
@@ -747,7 +747,7 @@ class Mesh:
         timeout: float = 60.0,
         step_timeout: float = 30.0,
     ) -> Signal:
-        """Execute a sequential multi-agent workflow — THE agent orchestration primitive.
+        """Execute a sequential multi-agent workflow. THE agent orchestration primitive.
 
         Sends a signal through a chain of agents where each agent's response
         becomes the next agent's input. This is the fundamental pattern for
@@ -821,7 +821,7 @@ class Mesh:
         targets: list[Agent | str],
         timeout: float = 30.0,
     ) -> Signal:
-        """Race a signal across multiple agents — first response wins.
+        """Race a signal across multiple agents; first response wins.
 
         Sends the same signal to N agents in parallel and returns the
         first response received. All other pending responses are discarded.
@@ -955,7 +955,7 @@ class Mesh:
         self,
         agent: Agent | str | None = None,
     ) -> dict[str, list[ToolSpec]]:
-        """Discover tools across the mesh — the agent-native service registry.
+        """Discover tools across the mesh (the agent-native service registry).
 
         Without arguments, returns all tools from all agents. With an agent
         specified, returns only that agent's tools.
@@ -1077,12 +1077,12 @@ class Mesh:
         timeout: float = 60.0,
         step_timeout: float = 30.0,
     ) -> Signal:
-        """Conditional workflow — route signals through different agent chains.
+        """Conditional workflow: route signals through different agent chains.
 
         This is the agent-native decision tree. A router function inspects the
         signal and returns a branch key. The signal then flows through the
         corresponding agent chain. This enables workflows that adapt their
-        processing path based on signal content — not just static topology.
+        processing path based on signal content, not just static topology.
 
         Args:
             signal: The signal to route.
@@ -1163,7 +1163,7 @@ class Mesh:
         if isinstance(agent, str):
             return self.get(agent)
         if agent.name not in self._agents:
-            raise MeshError(f"Agent '{agent.name}' not in mesh — add it first")
+            raise MeshError(f"Agent '{agent.name}' not in mesh; add it first")
         return agent
 
     async def __aenter__(self) -> Mesh:

@@ -435,7 +435,7 @@ async def test_mesh_load_balance_by_name():
 
     mesh = Mesh([dispatcher, w1, w2])
     mesh.load_balance("dispatcher", ["w1", "w2"])
-    # Should not raise — just verifying the API accepts strings
+    # Should not raise; just verifying the API accepts strings
 
 
 # --- Mesh Health ---

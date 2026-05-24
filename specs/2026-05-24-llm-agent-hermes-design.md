@@ -1,21 +1,21 @@
-# LLMAgent — Autonomous LLM-backed Agents (Hermes)
+# LLMAgent: Autonomous LLM-backed Agents (Hermes)
 
 - **Date:** 2026-05-24
-- **Status:** Design — approved, pending spec review
+- **Status:** Design (approved, pending spec review)
 - **Repo:** `signalgatingprotocol/python-sdk`
 - **Scope:** v1 of the "autonomous agent" direction. Adds a reusable `LLMAgent` that backs an SGP `Agent` with an OpenAI-compatible LLM brain (Hermes being the documented backend).
 
 ## Problem
 
-The SDK's `Agent` is "LLM-ready" — `@agent.tool` / `tools_schema()` exist as the bridge for LLM-based agents — but ships **no LLM integration**. All examples are deterministic stubs. The docs now say "an `Agent` is where a runtime like Hermes plugs in," but nothing actually plugs one in. This closes that gap.
+The SDK's `Agent` is "LLM-ready" (`@agent.tool` / `tools_schema()` exist as the bridge for LLM-based agents) but ships **no LLM integration**. All examples are deterministic stubs. The docs now say "an `Agent` is where a runtime like Hermes plugs in," but nothing actually plugs one in. This closes that gap.
 
 ## Goal
 
-A reusable, importable `LLMAgent` that, on receiving a signal, calls an OpenAI-compatible chat-completions endpoint and emits a result signal — autonomous out of the box, composable into a `Mesh` like any other agent. Demonstrated with ≥2 Hermes-backed agents coordinating.
+A reusable, importable `LLMAgent` that, on receiving a signal, calls an OpenAI-compatible chat-completions endpoint and emits a result signal. Autonomous out of the box, composable into a `Mesh` like any other agent. Demonstrated with ≥2 Hermes-backed agents coordinating.
 
 ## Non-goals (v1)
 
-- **LLM-driven tool-calling** (an agent's LLM invoking other agents' tools across the mesh). Deferred to v2 — the bridge (`tools_schema()`, `mesh.call_tool`) already exists, so it is a clean extension.
+- **LLM-driven tool-calling** (an agent's LLM invoking other agents' tools across the mesh). Deferred to v2; the bridge (`tools_schema()`, `mesh.call_tool`) already exists, so it is a clean extension.
 - A hard `openai` dependency in the core. It stays an optional extra.
 - Streaming, multi-turn memory, retries beyond what the existing Agent supervision/DLQ provides.
 - Any change to `Signal`, `Gate`, `Mesh`, or the base `Agent`.
@@ -62,8 +62,8 @@ The zero-config input/output type, so two agents can be wired without defining d
 
 ### Customization hooks
 
-- `render: Callable[[Signal], str]` — turns the incoming signal into the user prompt. Default: `signal.text` if present, else `str(signal)`.
-- `build: Callable[[Signal, str], Signal]` — turns the LLM reply text into the output signal. Default: `input_signal.child()` cast to `emit` type with its text field set, preserving `trace_id`, `priority`, and lineage. (Default `build` requires `emit` to have a `text` field — documented; supply a custom `build` otherwise.)
+- `render: Callable[[Signal], str]`: turns the incoming signal into the user prompt. Default: `signal.text` if present, else `str(signal)`.
+- `build: Callable[[Signal, str], Signal]`: turns the LLM reply text into the output signal. Default: `input_signal.child()` cast to `emit` type with its text field set, preserving `trace_id`, `priority`, and lineage. (Default `build` requires `emit` to have a `text` field; documented. Supply a custom `build` otherwise.)
 
 ### `LLMClient` Protocol
 
@@ -96,15 +96,15 @@ Output signals are children of the input (`signal.child(...)`), so trace lineage
 
 ## Testing
 
-Unit tests (`tests/test_llm_agent.py`) — **no live server, CI-safe**:
+Unit tests (`tests/test_llm_agent.py`), **no live server, CI-safe**:
 
 - **FakeClient** implementing `LLMClient`, returning a canned completion object (`choices[0].message.content`).
-- `test_emits_response_text` — input signal → output signal of type `emit` carrying the canned text.
-- `test_lineage_preserved` — output `trace_id == input.trace_id`, `parent_id == input.id`.
-- `test_render_and_build_customization` — custom `render`/`build` are honored.
-- `test_input_type_filtering` — only `on`-type signals trigger the loop.
-- `test_empty_response_dead_letters` — `None` content routes to the DLQ.
-- `test_from_openai_missing_dependency` — monkeypatch import to assert the clear `ImportError` hint (and a happy-path build with a stubbed `openai` module).
+- `test_emits_response_text`: input signal produces output signal of type `emit` carrying the canned text.
+- `test_lineage_preserved`: output `trace_id == input.trace_id`, `parent_id == input.id`.
+- `test_render_and_build_customization`: custom `render`/`build` are honored.
+- `test_input_type_filtering`: only `on`-type signals trigger the loop.
+- `test_empty_response_dead_letters`: `None` content routes to the DLQ.
+- `test_from_openai_missing_dependency`: monkeypatch import to assert the clear `ImportError` hint (and a happy-path build with a stubbed `openai` module).
 
 `examples/hermes_mesh.py` is **not** run in CI (needs a live Hermes server); it is smoke-documented in the README.
 
@@ -112,10 +112,10 @@ Unit tests (`tests/test_llm_agent.py`) — **no live server, CI-safe**:
 
 | File | Change |
 | --- | --- |
-| `src/signal_gating/llm.py` | New — `Message`, `LLMClient` Protocol, `LLMAgent` (+ `from_openai`). No top-level `openai` import. |
+| `src/signal_gating/llm.py` | New: `Message`, `LLMClient` Protocol, `LLMAgent` (+ `from_openai`). No top-level `openai` import. |
 | `src/signal_gating/__init__.py` | Export `LLMAgent`, `Message`; add to `__all__`. |
-| `tests/test_llm_agent.py` | New — unit tests with `FakeClient`. |
-| `examples/hermes_mesh.py` | New — planner (`Topic`→`Plan`) → writer (`Plan`→`Draft`) `LLMAgent`s in a `Mesh`, backed by Hermes via `from_openai`. |
+| `tests/test_llm_agent.py` | New: unit tests with `FakeClient`. |
+| `examples/hermes_mesh.py` | New: planner (`Topic`→`Plan`) → writer (`Plan`→`Draft`) `LLMAgent`s in a `Mesh`, backed by Hermes via `from_openai`. |
 | `pyproject.toml` | Add `[project.optional-dependencies] llm = ["openai>=1.0"]`. |
 | `README.md` | New "LLM-backed agents (Hermes)" section with the quickstart and a run note. |
 

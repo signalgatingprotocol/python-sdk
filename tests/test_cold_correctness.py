@@ -1,4 +1,4 @@
-"""Cold correctness — adversarial tests for silent foundational bugs.
+"""Cold correctness: adversarial tests for silent foundational bugs.
 
 Each test here targets a real, subtle bug that the broader suite missed:
 they exercise lifecycle edge cases, concurrent topology mutation, and
@@ -97,7 +97,7 @@ async def test_agent_restart_after_clean_stop():
     await asyncio.sleep(0.05)
     await agent.stop()
 
-    # Restart should work — inbox is recreated, handlers preserved.
+    # Restart should work: inbox is recreated, handlers preserved.
     await agent.start()
     await asyncio.sleep(0)  # let the supervised task start
     assert agent.running
@@ -133,7 +133,7 @@ async def test_agent_restart_after_max_restarts_exceeded():
     assert agent._task is not None and agent._task.done()
     assert agent._restart_count > agent._max_restarts
 
-    # Operator fixes the bug — swap to a passing gate — and restarts.
+    # Operator fixes the bug (swap to a passing gate) and restarts.
     agent.gates = []
     successes: list[int] = []
 

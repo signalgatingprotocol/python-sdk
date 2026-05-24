@@ -1,4 +1,4 @@
-"""Channels — async typed conduits for signal transport."""
+"""Channels: async typed conduits for signal transport."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class Channel(Generic[T]):
 
     Close semantics: pending items are drained, then receivers raise
     ChannelClosed. Receivers blocked on a full closed channel wake up
-    immediately — close never silently strands a waiter.
+    immediately; close never silently strands a waiter.
     """
 
     def __init__(self, signal_type: type[T] | None = None, buffer_size: int = 0):
@@ -248,7 +248,7 @@ class PriorityChannel(Generic[T]):
 
         Unlike `send()`, this method applies backpressure by blocking until
         buffer space is available instead of raising ChannelFull.
-        Uses event-driven notification — no polling.
+        Uses event-driven notification (no polling).
         """
         if self._closed:
             raise ChannelClosed()
@@ -275,7 +275,7 @@ class PriorityChannel(Generic[T]):
     def try_receive(self) -> T | None:
         """Non-blocking receive of the highest-priority signal.
 
-        Note: not safe to interleave with concurrent receive() — locking would
+        Note: not safe to interleave with concurrent receive(); locking would
         require an async API. Use receive() in concurrent code paths.
         """
         if not self._heap:
