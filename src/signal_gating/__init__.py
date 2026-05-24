@@ -52,6 +52,7 @@ from signal_gating.errors import (
     SignalValidationError,
 )
 from signal_gating.gate import Gate
+from signal_gating.llm import LLMAgent, Message
 from signal_gating.mesh import Edge, Mesh
 from signal_gating.pipeline import Pipeline
 from signal_gating.pool import AgentPool
@@ -72,7 +73,9 @@ __all__ = [
     "ErrorHook",
     "Gate",
     "GateRejected",
+    "LLMAgent",
     "Mesh",
+    "Message",
     "MeshError",
     "Pipeline",
     "PriorityChannel",
