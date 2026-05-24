@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "signal-gating"
 version = "0.1.0"
-description = "The Signal Gating Protocol SDK — agent-native signal orchestration for autonomous AI systems"
+description = "The Signal Gating Protocol SDK: agent-native signal orchestration for autonomous AI systems"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

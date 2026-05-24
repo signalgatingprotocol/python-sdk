@@ -76,7 +76,7 @@ class TestSupervisionFix:
         # All 3 signals were processed (handler called), errors went to DLQ
         assert call_count == 3
         assert agent.dead_letters.count == 3
-        # Agent did NOT restart — handler errors are isolated
+        # Agent did NOT restart (handler errors are isolated)
         assert agent._restart_count == 0
 
 

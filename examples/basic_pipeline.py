@@ -1,4 +1,4 @@
-"""Basic pipeline example — composing gates to control signal flow."""
+"""Basic pipeline example: composing gates to control signal flow."""
 
 import asyncio
 

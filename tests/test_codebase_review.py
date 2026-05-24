@@ -102,7 +102,7 @@ class TestPoolCounterSeparation:
 
 
 # =============================================================================
-# NEW: Gate.tap() — side-effect observability
+# NEW: Gate.tap() - side-effect observability
 # =============================================================================
 
 
@@ -141,12 +141,12 @@ class TestGateTap:
             >> Gate.tap(lambda s: log.append("after"))
         )
 
-        # High priority — passes through
+        # High priority: passes through
         result = await pipeline.process(Signal(priority=5))
         assert result is not None
         assert log == ["before", "after"]
 
-        # Low priority — rejected by priority gate, second tap never runs
+        # Low priority: rejected by priority gate, second tap never runs
         log.clear()
         result = await pipeline.process(Signal(priority=1))
         assert result is None
@@ -161,7 +161,7 @@ class TestGateTap:
 
 
 # =============================================================================
-# NEW: Mesh.pipe() — fluent chain-connect API
+# NEW: Mesh.pipe() - fluent chain-connect API
 # =============================================================================
 
 
@@ -234,7 +234,7 @@ class TestMeshPipe:
 
 
 # =============================================================================
-# NEW: Mesh.visualize() — topology introspection
+# NEW: Mesh.visualize() - topology introspection
 # =============================================================================
 
 
@@ -357,7 +357,7 @@ class TestAgentOnError:
         assert count["b"] == 1
 
     async def test_on_error_still_adds_to_dlq(self):
-        """Error hooks don't replace DLQ — they supplement it."""
+        """Error hooks don't replace DLQ; they supplement it."""
         agent = Agent("test")
 
         @agent.on(TaskSignal)
@@ -467,7 +467,7 @@ class TestPoolOnError:
         def capture(signal: Signal, error: Exception):
             errors.append(str(error))
 
-        # Scale up — new worker should also have the error hook
+        # Scale up: new worker should also have the error hook
         pool.scale_to(2)
         new_worker = pool.workers[1]
         assert len(new_worker._on_error_hooks) == 1

@@ -1,4 +1,4 @@
-"""Agent mesh example — fan-out, fan-in, and topology inspection."""
+"""Agent mesh example: fan-out, fan-in, and topology inspection."""
 
 import asyncio
 

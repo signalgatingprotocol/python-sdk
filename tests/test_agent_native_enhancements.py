@@ -74,7 +74,7 @@ class TestGateWindow:
             Gate.window(seconds=-1)
 
     async def test_window_default_min_signals(self):
-        """Default min_signals is 1 — every signal passes with enrichment."""
+        """Default min_signals is 1; every signal passes with enrichment."""
         gate = Gate.window(seconds=60)
         result = await gate.process(Signal())
         assert result is not None
@@ -463,7 +463,7 @@ class TestMeshRace:
 
 
 # =============================================================================
-# Integration tests — combining new features
+# Integration tests: combining new features
 # =============================================================================
 
 

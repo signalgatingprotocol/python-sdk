@@ -19,7 +19,7 @@ async def main():
     summarizer = Agent("summarizer")
     coordinator = Agent("coordinator")
 
-    # Handlers use AgentContext — no closure needed
+    # Handlers use AgentContext (no closure needed)
     @analyst.on(TaskSignal)
     async def analyze(signal: TaskSignal, ctx: AgentContext):
         ctx.state["tasks_done"] = ctx.state.get("tasks_done", 0) + 1

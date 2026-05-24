@@ -223,7 +223,7 @@ class TestAgentTool:
 
 
 class TestMeshCallTool:
-    """Tests for Mesh.call_tool() — the agent-native RPC primitive."""
+    """Tests for Mesh.call_tool(), the agent-native RPC primitive."""
 
     async def test_call_tool_basic(self):
         worker = Agent("worker")
@@ -290,7 +290,7 @@ class TestMeshCallTool:
 
 
 class TestMeshMapReduce:
-    """Tests for Mesh.map_reduce() — the parallel map-reduce primitive."""
+    """Tests for Mesh.map_reduce(), the parallel map-reduce primitive."""
 
     async def test_map_reduce_basic(self):
         mapper1 = Agent("mapper1")
@@ -361,7 +361,7 @@ class TestMeshMapReduce:
 
 
 class TestMeshBranchWorkflow:
-    """Tests for Mesh.branch_workflow() — conditional branching workflows."""
+    """Tests for Mesh.branch_workflow(), conditional branching workflows."""
 
     async def test_branch_workflow_routes_correctly(self):
         fast_agent = Agent("fast")
