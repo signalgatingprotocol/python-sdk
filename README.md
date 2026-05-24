@@ -340,6 +340,38 @@ trace = tracer.get_trace(trace_id)
 print(tracer.summary())
 ```
 
+### LLM-backed agents (Hermes)
+
+`LLMAgent` gives an agent an OpenAI-compatible brain — Nous Hermes, or any
+OpenAI-compatible server. Install the extra:
+
+```bash
+pip install "signal-gating[llm]"
+```
+
+```python
+from signal_gating import Mesh, Signal
+from signal_gating.llm import LLMAgent
+
+class Topic(Signal):
+    text: str = ""
+class Plan(Signal):
+    text: str = ""
+
+planner = LLMAgent.from_openai(
+    "planner",
+    base_url="http://127.0.0.1:8642/v1",  # Hermes' OpenAI-compatible server
+    api_key="change-me-local-dev",
+    model="hermes-agent",
+    system="Break the topic into a 3-bullet outline.",
+    on=Topic, emit=Plan,
+)
+```
+
+`LLMAgent` is a normal `Agent`: gate it, connect it in a `Mesh`, and coordinate
+several of them with `scatter` / `map_reduce` / `workflow`. See
+`examples/hermes_mesh.py` for two Hermes agents coordinating end-to-end.
+
 ## Architecture
 
 ```

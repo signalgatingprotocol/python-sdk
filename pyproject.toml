@@ -35,6 +35,9 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+llm = [
+    "openai>=1.0",
+]
 
 [project.urls]
 Repository = "https://github.com/signalgatingprotocol/python-sdk"
@@ -59,3 +62,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 [tool.mypy]
 python_version = "3.10"
 strict = true
+
+[[tool.mypy.overrides]]
+module = "openai.*"
+ignore_missing_imports = true
