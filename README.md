@@ -433,6 +433,44 @@ Each `Receipt` carries the signal's lineage (`trace_id` / `parent_id`), routing
 (`source` -> `target`), typed domain `payload`, and a `digest` (sha256) so the
 record is tamper-evident: `receipt.verify()`.
 
+### Wire format & durability
+
+A protocol that only lives inside one process is a library. Signals serialize to
+a self-describing JSON envelope and reconstruct as their **original subclass** —
+the foundation for persistence, durable replay, and crossing process or network
+boundaries. Subclasses register themselves automatically; no boilerplate:
+
+```python
+class TaskSignal(Signal):
+    task: str
+
+sig = TaskSignal(task="build", priority=5)
+raw = sig.to_json()                     # {"sgp": 1, "type": "TaskSignal", "data": {...}}
+
+restored = Signal.from_json(raw)        # -> TaskSignal, not a dict
+assert type(restored) is TaskSignal
+assert restored == sig                  # faithful: id, trace_id, timestamp, fields
+```
+
+`model_dump()` is lossy in the way that matters — it gives you a `dict` with no
+way back to `TaskSignal`. The registry closes that loop. Pin a stable wire name
+across refactors with `__signal_type__ = "task.v2"`, or register an alias with
+`register_signal`. Unknown types raise `UnknownSignalType`; pass `strict=False`
+to get a best-effort base `Signal` with the payload preserved in `metadata`.
+
+This makes recovery durable. Persist the dead-letter queue on shutdown, then
+reload and replay after a crash or redeploy — signals come back as their real
+types and dispatch to the same handlers:
+
+```python
+agent.dead_letters.to_jsonl("dlq.jsonl")   # persist failed signals + context
+
+# ... process restarts ...
+
+agent.dead_letters.load_jsonl("dlq.jsonl") # reconstruct as original types
+await agent.dead_letters.replay(agent.inbox)
+```
+
 ## Architecture
 
 ```
