@@ -433,6 +433,16 @@ Each `Receipt` carries the signal's lineage (`trace_id` / `parent_id`), routing
 (`source` -> `target`), typed domain `payload`, and a `digest` (sha256) so the
 record is tamper-evident: `receipt.verify()`.
 
+A trajectory isn't just readable, it's **replayable**. Each receipt also stores
+the full wire envelope, so a run persisted to disk reloads as the exact typed
+signals that produced it — to re-run, audit, or learn from after a restart:
+
+```python
+reloaded = TrajectoryRecorder()
+reloaded.load_jsonl("runs.jsonl")    # verifiable Receipts, after a restart
+signals = reloaded.replay()          # -> [TaskSignal, ...], original types and ids
+```
+
 ### Wire format & durability
 
 A protocol that only lives inside one process is a library. Signals serialize to
