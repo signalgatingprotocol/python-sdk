@@ -143,3 +143,101 @@ def test_exports():
     assert hasattr(signal_gating, "TrajectoryRecorder")
     assert "Receipt" in signal_gating.__all__
     assert "TrajectoryRecorder" in signal_gating.__all__
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Faithful replay via the wire format
+# ---------------------------------------------------------------------------
+
+
+def test_receipt_carries_wire_and_reconstructs_typed_signal():
+    sig = Ping(n=7, priority=3)
+    r = Receipt.from_signal(sig, source="a", target="b")
+    # The audit projection is unchanged...
+    assert r.payload == {"n": 7}
+    # ...and the wire envelope is the faithful, self-describing form.
+    assert r.wire == {"sgp": 1, "type": "Ping", "data": sig.model_dump(mode="json")}
+
+    back = r.to_signal()
+    assert isinstance(back, Ping)
+    assert back.n == 7
+    assert back.id == sig.id                  # identity preserved, not just shape
+    assert back.trace_id == sig.trace_id
+    assert back.priority == 3
+    assert back == sig
+
+
+def test_to_signal_preserves_full_lineage():
+    parent = Ping(n=0)
+    child = parent.child(n=1, priority=5)
+    r = Receipt.from_signal(child, source="a", target="b")
+    back = r.to_signal()
+    assert back.parent_id == parent.id
+    assert back.trace_id == parent.trace_id
+    assert back.id == child.id
+
+
+def test_digest_covers_wire_envelope():
+    r = Receipt.from_signal(Ping(n=1), source="a", target="b")
+    assert r.verify() is True
+    tampered_wire = {**r.wire, "data": {**r.wire["data"], "n": 999}}
+    tampered = Receipt(**{**r.to_dict(), "wire": tampered_wire})
+    assert tampered.verify() is False         # tampering with replay data is caught
+
+
+def test_from_dict_round_trips_and_stays_verifiable():
+    r = Receipt.from_signal(Ping(n=4, priority=2), source="x", target="y")
+    rebuilt = Receipt.from_dict(r.to_dict())
+    assert rebuilt == r
+    assert rebuilt.verify() is True
+    assert rebuilt.to_signal() == Ping.from_wire(r.wire)
+
+
+async def test_export_then_load_replays_typed_signals(tmp_path) -> None:
+    recorder = TrajectoryRecorder()
+    await _run_relay_mesh(recorder)
+    out = tmp_path / "runs.jsonl"
+    recorder.export_jsonl(out)
+
+    # A fresh recorder, as if after a process restart, reloads and replays.
+    reloaded = TrajectoryRecorder()
+    n = reloaded.load_jsonl(out)
+    assert n == 2
+    assert all(r.verify() for r in reloaded.receipts)   # digests survive the round-trip
+
+    signals = reloaded.replay()
+    assert [type(s).__name__ for s in signals] == ["Ping", "Ping"]
+    assert [s.n for s in signals] == [1, 2]             # type: ignore[attr-defined]
+    # Reconstructed signals match the originally captured ones, identity and all.
+    assert signals == [r.to_signal() for r in recorder.receipts]
+
+
+def test_replay_unknown_type_strict_then_lenient():
+    from signal_gating import UnknownSignalType
+
+    # A receipt referencing a type that is not registered in this process.
+    bogus = {
+        "trace_id": "t",
+        "signal_id": "s",
+        "parent_id": "",
+        "signal_type": "GhostSignal",
+        "source": "a",
+        "target": "b",
+        "priority": 0,
+        "timestamp": 0.0,
+        "payload": {"ghost": True},
+        "wire": {"sgp": 1, "type": "GhostSignal", "data": {"ghost": True}},
+        "digest": "",
+    }
+    r = Receipt.from_dict(bogus)
+    try:
+        r.to_signal()
+    except UnknownSignalType:
+        pass
+    else:  # pragma: no cover - guard
+        raise AssertionError("strict replay should reject an unknown type")
+
+    degraded = r.to_signal(strict=False)
+    assert isinstance(degraded, Signal)
+    assert degraded.metadata["_sgp_type"] == "GhostSignal"
+    assert degraded.metadata["_sgp_unmapped"] == {"ghost": True}

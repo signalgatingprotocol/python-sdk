@@ -63,3 +63,24 @@ class CircuitOpenError(SignalGatingError):
         self.gate_name = gate_name
         self.until = until
         super().__init__(f"Circuit '{gate_name}' is open until {until:.1f}")
+
+
+class SignalSerializationError(SignalGatingError):
+    """A signal could not be serialized to, or reconstructed from, its wire form."""
+
+
+class UnknownSignalType(SignalSerializationError):
+    """A wire envelope references a signal type that is not in the registry.
+
+    Raised by ``Signal.from_wire`` / ``from_json`` in strict mode when no class
+    is registered under the envelope's wire name. Import (or explicitly
+    register) the signal class so it self-registers, or pass ``strict=False``
+    to reconstruct a best-effort base ``Signal`` instead.
+    """
+
+    def __init__(self, type_name: str):
+        self.type_name = type_name
+        super().__init__(
+            f"Unknown signal type {type_name!r}: no class is registered under this "
+            "wire name. Import or register the class, or use strict=False."
+        )

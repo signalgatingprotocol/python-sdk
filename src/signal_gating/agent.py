@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from inspect import isawaitable
+from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
 from uuid import uuid4
 
@@ -221,6 +223,50 @@ class DeadLetterQueue:
         for signal in signals:
             await channel.send(signal)
         return len(signals)
+
+    def to_jsonl(self, path: str | Path) -> int:
+        """Persist the dead-lettered signals, with failure context, as JSON Lines.
+
+        Each line is ``{"entry": <context>, "signal": <wire envelope>}``. Because
+        signals are written in their wire form, ``load_jsonl`` reconstructs them
+        as their original types. This is the durability half of recovery: persist
+        on shutdown (or on a schedule), survive a crash or redeploy, then reload
+        and ``replay``. Returns the number of records written.
+        """
+        out = Path(path)
+        with out.open("w", encoding="utf-8") as f:
+            for entry, signal in zip(self._entries, self._signals):
+                record = {"entry": entry, "signal": signal.to_wire()}
+                f.write(json.dumps(record, default=str) + "\n")
+        return len(self._signals)
+
+    def load_jsonl(self, path: str | Path, *, strict: bool = True) -> int:
+        """Load dead-lettered signals from a JSONL file, appending to this queue.
+
+        Reconstructs each signal as its original type via the registry, so the
+        reloaded signals dispatch to the same handlers on ``replay``. Import the
+        modules that define your signal types before loading so they are
+        registered; with ``strict=True`` (default) an unknown type raises
+        ``UnknownSignalType`` rather than silently degrading to a base ``Signal``.
+        Honors ``max_size``, keeping the most recent entries. Returns the count
+        loaded.
+        """
+        src = Path(path)
+        loaded = 0
+        with src.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                signal = Signal.from_wire(record["signal"], strict=strict)
+                self._entries.append(record.get("entry", {}))
+                self._signals.append(signal)
+                loaded += 1
+        if len(self._entries) > self._max_size:
+            self._entries = self._entries[-self._max_size :]
+            self._signals = self._signals[-self._max_size :]
+        return loaded
 
     def clear(self) -> None:
         self._entries.clear()
