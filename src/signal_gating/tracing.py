@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib import import_module
 from typing import Any
 
 logger = logging.getLogger("signal_gating.tracing")
@@ -90,7 +91,7 @@ class OpenTelemetrySpanExporter:
     ) -> None:
         if tracer is None:
             try:
-                from opentelemetry import trace as otel_trace
+                otel_trace = import_module("opentelemetry.trace")
             except ImportError as e:  # pragma: no cover - depends on optional extra
                 raise ImportError(
                     "OpenTelemetrySpanExporter requires opentelemetry-api. "
@@ -116,9 +117,13 @@ class OpenTelemetrySpanExporter:
         try:
             if span.action == "error":
                 try:
-                    from opentelemetry.trace import Status, StatusCode
+                    otel_trace = import_module("opentelemetry.trace")
+                    status_type = getattr(otel_trace, "Status")
+                    status_code_type = getattr(otel_trace, "StatusCode")
 
-                    otel_span.set_status(Status(StatusCode.ERROR, span.action))
+                    otel_span.set_status(
+                        status_type(status_code_type.ERROR, span.action)
+                    )
                 except Exception:  # pragma: no cover - exporter compatibility
                     logger.debug("Could not set OpenTelemetry status", exc_info=True)
         finally:
