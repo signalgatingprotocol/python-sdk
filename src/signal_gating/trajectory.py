@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from signal_gating.errors import SignalSerializationError
 from signal_gating.signal import Signal
 
 # Base Signal envelope fields -- excluded from a Receipt's domain payload because
@@ -72,7 +73,7 @@ class Receipt:
             "trace_id": signal.trace_id,
             "signal_id": signal.id,
             "parent_id": signal.parent_id,
-            "signal_type": type(signal).__name__,
+            "signal_type": signal.wire_type(),
             "source": source,
             "target": target,
             "priority": signal.priority,
@@ -163,25 +164,33 @@ class TrajectoryRecorder:
                 f.write(json.dumps(r.to_dict(), default=str) + "\n")
         return len(self._receipts)
 
-    def load_jsonl(self, path: str | Path) -> int:
+    def load_jsonl(self, path: str | Path, *, verify: bool = True) -> int:
         """Load receipts from a file written by :meth:`export_jsonl`, appending.
 
         The durability half of the trajectory story: persist a run, survive a
         restart, then reload it as verifiable receipts you can inspect or
-        ``replay`` as typed signals. Returns the number of receipts loaded.
+        ``replay`` as typed signals. By default, each receipt's digest is
+        verified before it is accepted. Returns the number of receipts loaded.
         """
         src = Path(path)
-        loaded = 0
+        receipts: list[Receipt] = []
         with src.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                self._receipts.append(Receipt.from_dict(json.loads(line)))
-                loaded += 1
-        return loaded
+                receipt = Receipt.from_dict(json.loads(line))
+                if verify and not receipt.verify():
+                    raise SignalSerializationError(
+                        "trajectory receipt digest mismatch for "
+                        f"{receipt.signal_type} {receipt.signal_id!r} "
+                        f"on trace {receipt.trace_id!r}"
+                    )
+                receipts.append(receipt)
+        self._receipts.extend(receipts)
+        return len(receipts)
 
-    def replay(self, *, strict: bool = True) -> list[Signal]:
+    def replay(self, *, strict: bool = True, verify: bool = True) -> list[Signal]:
         """Reconstruct every captured signal as its original type, in capture order.
 
         The faithful counterpart to :meth:`export_jsonl`: a trajectory read off
@@ -189,8 +198,17 @@ class TrajectoryRecorder:
         re-run, audit, or learn from. Import the modules defining your signal
         types first so they are registered (see :meth:`Signal.from_wire`); with
         ``strict=False`` an unknown type degrades to a base ``Signal`` rather
-        than raising.
+        than raising. By default, every receipt digest is verified before any
+        signal is reconstructed.
         """
+        if verify:
+            for receipt in self._receipts:
+                if not receipt.verify():
+                    raise SignalSerializationError(
+                        "trajectory receipt digest mismatch for "
+                        f"{receipt.signal_type} {receipt.signal_id!r} "
+                        f"on trace {receipt.trace_id!r}"
+                    )
         return [r.to_signal(strict=strict) for r in self._receipts]
 
     def clear(self) -> None:

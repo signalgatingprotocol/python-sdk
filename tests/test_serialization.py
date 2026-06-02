@@ -33,6 +33,11 @@ class WireResult(Signal):
     score: float = 0.0
 
 
+class StableWireTask(Signal):
+    __signal_type__ = "tests.stable_wire_task"
+    task: str
+
+
 # --- Wire envelope shape ---
 
 
@@ -233,6 +238,14 @@ def test_dlq_persist_and_reload_roundtrip(tmp_path):
     # Failure context survives alongside the signal.
     assert fresh.entries[0]["reason"] == "handler_error"
     assert fresh.entries[1]["reason"] == "gate_rejected"
+
+
+def test_dlq_entries_use_stable_wire_type_names():
+    from signal_gating import DeadLetterQueue
+
+    dlq = DeadLetterQueue()
+    dlq.add(StableWireTask(task="audit"), "handler_error", "worker")
+    assert dlq.entries[0]["signal_type"] == "tests.stable_wire_task"
 
 
 def test_dlq_persisted_file_is_valid_jsonl(tmp_path):
