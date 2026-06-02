@@ -53,6 +53,13 @@ from signal_gating.errors import (
     SignalValidationError,
     UnknownSignalType,
 )
+from signal_gating.finance import (
+    MarketAction,
+    MarketDecision,
+    MarketGate,
+    MarketKeyFn,
+    MarketTick,
+)
 from signal_gating.gate import Gate
 from signal_gating.llm import LLMAgent, MeshToolProvider, Message, ToolProvider
 from signal_gating.mesh import Edge, Mesh, MeshEvent, MeshEventSink
@@ -92,6 +99,11 @@ __all__ = [
     "Gate",
     "GateRejected",
     "LLMAgent",
+    "MarketAction",
+    "MarketDecision",
+    "MarketGate",
+    "MarketKeyFn",
+    "MarketTick",
     "Mesh",
     "MeshEvent",
     "MeshEventSink",

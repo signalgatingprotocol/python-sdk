@@ -45,6 +45,7 @@ otel = [
 
 [project.urls]
 Repository = "https://github.com/signalgatingprotocol/python-sdk"
+Documentation = "https://signalgatingprotocol.github.io"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/signal_gating"]

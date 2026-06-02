@@ -13,6 +13,8 @@ from typing import Any
 logger = logging.getLogger("signal_gating.tracing")
 
 SpanSink = Callable[["Span"], None]
+_EVENT_METADATA_BLOCKLIST = frozenset({"arguments", "payload", "result", "responses", "wire"})
+_SPAN_FIELD_NAMES = frozenset({"trace_id", "signal_id", "agent", "gate", "action", "duration_ms"})
 
 
 def _otel_attribute_value(value: Any) -> Any:
@@ -191,6 +193,38 @@ class Tracer:
             self._evict()
         self._publish(span)
         return span
+
+    def record_event(self, event: Any) -> Span:
+        """Record a structured mesh event as a safe trace span.
+
+        Mesh events are the durable audit surface; this bridge makes the same
+        event stream visible through in-memory tracing and OpenTelemetry sinks
+        without exporting raw signal payloads, tool arguments, or model results.
+        """
+        signal = event.signal
+        metadata: dict[str, Any] = {
+            "event_kind": event.event_kind,
+            "source": event.source,
+            "target": event.target,
+            "signal_type": signal.wire_type(),
+            "priority": signal.priority,
+            "correlation_id": signal.correlation_id,
+            "parent_id": signal.parent_id,
+        }
+        for key, value in dict(event.metadata).items():
+            if key not in _EVENT_METADATA_BLOCKLIST:
+                metadata_key = f"event_{key}" if key in _SPAN_FIELD_NAMES else key
+                metadata[metadata_key] = value
+
+        agent = event.source if not event.target else f"{event.source}->{event.target}"
+        return self.record(
+            trace_id=signal.trace_id,
+            signal_id=signal.id,
+            agent=agent,
+            gate="mesh_event",
+            action=event.action,
+            **metadata,
+        )
 
     def add_sink(self, sink: SpanSink) -> None:
         """Stream subsequently recorded spans into ``sink``.

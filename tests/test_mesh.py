@@ -227,6 +227,32 @@ async def test_mesh_custom_tracer():
     assert mesh.tracer is tracer
 
 
+async def test_mesh_traces_direct_inject_events_without_recorder():
+    agent = Agent("worker")
+    seen = asyncio.Event()
+
+    @agent.on(Signal)
+    async def handle(_signal: Signal):
+        seen.set()
+
+    mesh = Mesh([agent])
+    signal = Signal(priority=4)
+
+    async with mesh:
+        await mesh.inject(agent, signal)
+        await asyncio.wait_for(seen.wait(), timeout=3.0)
+
+    event_spans = [
+        span for span in mesh.tracer.get_trace(signal.trace_id)
+        if span.gate == "mesh_event"
+    ]
+    assert any(span.action == "inject" for span in event_spans)
+    inject_span = next(span for span in event_spans if span.action == "inject")
+    assert inject_span.metadata["source"] == "mesh"
+    assert inject_span.metadata["target"] == "worker"
+    assert inject_span.metadata["priority"] == 4
+
+
 # --- Content-based Routing ---
 
 

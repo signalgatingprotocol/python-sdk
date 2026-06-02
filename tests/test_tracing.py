@@ -2,7 +2,7 @@
 
 import time
 
-from signal_gating import OpenTelemetrySpanExporter, Span, SpanSink, Tracer
+from signal_gating import MeshEvent, OpenTelemetrySpanExporter, Signal, Span, SpanSink, Tracer
 
 
 def test_record_span():
@@ -116,6 +116,45 @@ def test_record_streams_to_sinks():
     span = tracer.record("t1", "s1", "a", "g", "passed")
 
     assert received == [span]
+
+
+def test_record_event_maps_mesh_event_to_safe_span_metadata():
+    tracer = Tracer()
+    signal = Signal(priority=7, correlation_id="cid", parent_id="pid")
+    event = MeshEvent(
+        action="request_sent",
+        signal=signal,
+        source="mesh",
+        target="worker",
+        event_kind="mesh",
+        metadata={
+            "gate": "risk_check",
+            "tool_name": "rank",
+            "argument_names": ["symbol"],
+            "responses": [{"raw": "not exported"}],
+            "result": {"raw": "not exported"},
+        },
+    )
+
+    span = tracer.record_event(event)
+
+    assert span.trace_id == signal.trace_id
+    assert span.signal_id == signal.id
+    assert span.agent == "mesh->worker"
+    assert span.gate == "mesh_event"
+    assert span.action == "request_sent"
+    assert span.metadata["event_kind"] == "mesh"
+    assert span.metadata["source"] == "mesh"
+    assert span.metadata["target"] == "worker"
+    assert span.metadata["signal_type"] == "Signal"
+    assert span.metadata["priority"] == 7
+    assert span.metadata["correlation_id"] == "cid"
+    assert span.metadata["parent_id"] == "pid"
+    assert span.metadata["event_gate"] == "risk_check"
+    assert span.metadata["tool_name"] == "rank"
+    assert span.metadata["argument_names"] == ["symbol"]
+    assert "responses" not in span.metadata
+    assert "result" not in span.metadata
 
 
 def test_add_remove_sink():

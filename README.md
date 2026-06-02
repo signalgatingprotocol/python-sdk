@@ -7,25 +7,25 @@ The Signal Gating Protocol provides composable primitives for building multi-age
 ## Install
 
 ```bash
-pip install signal-gating
+pip install git+https://github.com/signalgatingprotocol/python-sdk
 ```
 
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm]"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel]"
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
-Or from source:
+For local development from a checkout:
 
 ```bash
-pip install git+https://github.com/signalgatingprotocol/python-sdk
+pip install -e ".[dev]"
 ```
 
 > Alpha: the API surface is still moving.
@@ -338,6 +338,41 @@ pipeline = Pipeline([
 result = await pipeline.process(signal)
 ```
 
+### Financial physics gates
+
+Finance-like agent meshes need controls that generic task examples do not
+stress: event-time freshness, sequence monotonicity, quote sanity, edge after
+slippage, and notional limits. The SDK keeps those as domain helpers in
+`signal_gating.finance` so they compose with ordinary gates without expanding
+the generic protocol surface:
+
+```python
+from signal_gating import MarketGate, MarketTick
+
+tick_gate = (
+    MarketGate.freshness(max_age_ms=250)
+    >> MarketGate.monotonic_sequence()
+    >> MarketGate.quote_sanity(max_spread_bps=12)
+)
+
+tick = MarketTick(
+    symbol="AAPL",
+    venue="XNAS",
+    bid=100.00,
+    ask=100.04,
+    event_ts=event_time,
+    sequence=101,
+    priority=8,
+)
+```
+
+`MarketDecision` and `MarketGate.decision_edge()` add a second control layer for
+execution-facing signals: only decisions with enough net edge after expected
+slippage and enough confidence pass. `MarketGate.notional_limit()` bounds the
+capital exposed by an execution path. See
+`examples/financial_physics_mesh.py` for an offline, deterministic market-signal
+mesh with trajectory receipts.
+
 ### Channel
 
 Async typed conduits with backpressure and priority ordering:
@@ -376,6 +411,13 @@ exported = tracer.export(OpenTelemetrySpanExporter())
 
 Tracing is lightweight observability. Trajectories are the durable audit/replay
 log for signal-carrying mesh events.
+
+Mesh execution events are bridged into tracing automatically. Direct
+orchestration paths such as `inject`, `request_sent`, `scatter_sent`,
+`response_received`, `tool_call_start`, and `tool_call_complete` become
+`mesh_event` spans even when no `TrajectoryRecorder` is attached. The bridge
+exports safe routing and correlation metadata, not raw signal payloads, tool
+arguments, or model results.
 
 ### LLM-backed agents (Hermes)
 

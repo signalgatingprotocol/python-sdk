@@ -417,8 +417,6 @@ class Mesh:
         event_kind: str = "mesh",
         **metadata: Any,
     ) -> None:
-        if not self._event_sinks:
-            return
         event = MeshEvent(
             action=action,
             signal=signal,
@@ -427,6 +425,9 @@ class Mesh:
             event_kind=event_kind,
             metadata=metadata,
         )
+        self.tracer.record_event(event)
+        if not self._event_sinks:
+            return
         for sink in tuple(self._event_sinks):
             try:
                 result = sink(event)
