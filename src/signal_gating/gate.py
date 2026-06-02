@@ -121,6 +121,8 @@ class Gate:
     @classmethod
     def rate_limit(cls, max_per_second: float, name: str = "rate_limit") -> Gate:
         """Create a gate that enforces a rate limit."""
+        if max_per_second <= 0:
+            raise ValueError("max_per_second must be > 0")
         min_interval = 1.0 / max_per_second
         state: dict[str, float] = {"last": 0.0}
         lock = asyncio.Lock()
@@ -139,6 +141,8 @@ class Gate:
     @classmethod
     def deduplicate(cls, window: float = 60.0, name: str = "dedup") -> Gate:
         """Create a gate that drops duplicate signals within a time window."""
+        if window < 0:
+            raise ValueError("window must be >= 0")
         seen: dict[str, float] = {}
         lock = asyncio.Lock()
 
@@ -183,6 +187,12 @@ class Gate:
         name: str = "retry",
     ) -> Gate:
         """Wrap a gate with retry logic and exponential backoff."""
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        if delay < 0:
+            raise ValueError("delay must be >= 0")
+        if backoff <= 0:
+            raise ValueError("backoff must be > 0")
 
         async def fn(signal: Signal) -> Signal | None:
             last_result: Signal | None = None
@@ -212,6 +222,10 @@ class Gate:
         and rejects all signals for `recovery_timeout` seconds. Then it
         enters half-open state and lets one signal through to test recovery.
         """
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be >= 1")
+        if recovery_timeout < 0:
+            raise ValueError("recovery_timeout must be >= 0")
         state: dict[str, float | int | str] = {
             "failures": 0,
             "opened_at": 0.0,
@@ -248,6 +262,8 @@ class Gate:
     @classmethod
     def timeout(cls, gate: Gate, seconds: float, name: str = "timeout") -> Gate:
         """Wrap a gate with a timeout; rejects if processing takes too long."""
+        if seconds <= 0:
+            raise ValueError("seconds must be > 0")
 
         async def fn(signal: Signal) -> Signal | None:
             try:
@@ -304,6 +320,8 @@ class Gate:
 
             gate = Gate.sample(0.1)  # Process ~10% of signals
         """
+        if not 0 <= rate <= 1:
+            raise ValueError("rate must be between 0.0 and 1.0")
         import random
 
         def fn(signal: Signal) -> Signal | None:
@@ -321,6 +339,8 @@ class Gate:
 
             gate = Gate.throttle(100)  # Allow max 100 signals/sec, drop rest
         """
+        if max_per_second <= 0:
+            raise ValueError("max_per_second must be > 0")
         min_interval = 1.0 / max_per_second
         state: dict[str, float] = {"last": 0.0}
         lock = asyncio.Lock()
@@ -344,6 +364,8 @@ class Gate:
 
             gate = Gate.ttl(30)  # Drop signals older than 30 seconds
         """
+        if seconds < 0:
+            raise ValueError("seconds must be >= 0")
 
         def fn(signal: Signal) -> Signal | None:
             age = time.time() - signal.timestamp
@@ -403,6 +425,8 @@ class Gate:
         """
         if size < 1:
             raise ValueError("batch size must be >= 1")
+        if timeout < 0:
+            raise ValueError("timeout must be >= 0")
         state: dict[str, Any] = {"buffer": [], "first_at": 0.0}
         lock = asyncio.Lock()
 
@@ -525,6 +549,8 @@ class Gate:
 
             gate = Gate.debounce(0.5)  # Wait 500ms of silence before passing
         """
+        if seconds < 0:
+            raise ValueError("seconds must be >= 0")
         state: dict[str, Any] = {"last_signal": None, "last_time": 0.0}
         lock = asyncio.Lock()
 
@@ -573,6 +599,8 @@ class Gate:
         """
         if seconds <= 0:
             raise ValueError("window seconds must be > 0")
+        if min_signals < 1:
+            raise ValueError("min_signals must be >= 1")
         state: dict[str, list[tuple[float, str]]] = {"buffer": []}
         lock = asyncio.Lock()
 

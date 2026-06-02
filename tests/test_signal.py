@@ -1,5 +1,7 @@
 """Tests for Signal core type."""
 
+import pytest
+
 from signal_gating import Signal
 
 
@@ -45,6 +47,12 @@ def test_signal_with_metadata():
     s2 = s.with_metadata(region="us-east", tier="premium")
     assert s2.metadata["region"] == "us-east"
     assert s2.metadata["tier"] == "premium"
+
+
+def test_signal_metadata_immutable():
+    s = Signal().with_metadata(region="us-east")
+    with pytest.raises(TypeError):
+        s.metadata["region"] = "eu-west"  # type: ignore[index]
 
 
 def test_signal_immutable():

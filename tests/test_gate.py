@@ -247,3 +247,34 @@ async def test_timeout_gate_rejects_slow_gate():
     gate = Gate.timeout(inner, seconds=0.01)
     result = await gate.process(Signal())
     assert result is None
+
+
+@pytest.mark.parametrize(
+    ("factory", "message"),
+    [
+        (lambda: Gate.rate_limit(0), "max_per_second"),
+        (lambda: Gate.deduplicate(-1), "window"),
+        (lambda: Gate.retry(Gate.passthrough(), max_attempts=0), "max_attempts"),
+        (lambda: Gate.retry(Gate.passthrough(), delay=-1), "delay"),
+        (lambda: Gate.retry(Gate.passthrough(), backoff=0), "backoff"),
+        (
+            lambda: Gate.circuit_breaker(Gate.passthrough(), failure_threshold=0),
+            "failure_threshold",
+        ),
+        (
+            lambda: Gate.circuit_breaker(Gate.passthrough(), recovery_timeout=-1),
+            "recovery_timeout",
+        ),
+        (lambda: Gate.timeout(Gate.passthrough(), seconds=0), "seconds"),
+        (lambda: Gate.sample(-0.1), "rate"),
+        (lambda: Gate.sample(1.1), "rate"),
+        (lambda: Gate.throttle(0), "max_per_second"),
+        (lambda: Gate.ttl(-1), "seconds"),
+        (lambda: Gate.batch(1, timeout=-1), "timeout"),
+        (lambda: Gate.debounce(-1), "seconds"),
+        (lambda: Gate.window(seconds=1, min_signals=0), "min_signals"),
+    ],
+)
+def test_gate_factory_validation(factory, message):
+    with pytest.raises(ValueError, match=message):
+        factory()

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 T = TypeVar("T", bound="Signal")
 
@@ -30,9 +32,18 @@ class Signal(BaseModel):
     trace_id: str = Field(default_factory=lambda: uuid4().hex)
     correlation_id: str = ""
     parent_id: str = ""
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    metadata: Mapping[str, Any] = Field(default_factory=dict, validate_default=True)
 
     model_config = {"frozen": True}
+
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def _freeze_metadata(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return MappingProxyType(dict(value))
+
+    @field_serializer("metadata")
+    def _serialize_metadata(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        return dict(value)
 
     def evolve(self: T, **kwargs: Any) -> T:
         """Create a new signal with updated fields, preserving the trace lineage."""

@@ -78,7 +78,9 @@ both = high_priority & Gate.filter(lambda s: s.source == "sensor")  # and
 not_low = ~Gate.by_priority(1)  # invert
 ```
 
-Built-in gates: `filter`, `transform`, `by_type`, `by_priority`, `rate_limit`, `throttle`, `deduplicate`, `retry`, `circuit_breaker`, `timeout`, `ttl`, `debounce`, `sample`, `when`, `passthrough`, `block`, `tap`, `batch`, `parallel`, `fallback`, `window`, `map`.
+Starter gates: `by_type`, `by_priority`, `filter`, `transform`, `deduplicate`, `passthrough`.
+
+Advanced gates: `rate_limit`, `throttle`, `retry`, `circuit_breaker`, `timeout`, `ttl`, `debounce`, `sample`, `when`, `block`, `tap`, `batch`, `parallel`, `fallback`, `window`, `map`.
 
 **Real-time signal control:**
 
@@ -296,7 +298,7 @@ all_tools = mesh.discover_tools()
 # Call tools directly through the mesh
 result = await mesh.call_tool(analyst, "analyze", data="revenue Q4", depth=2)
 
-# Export tool schemas for LLM integration
+# Export SGP tool schemas for discovery
 schema = analyst.tools_schema()
 # [{"name": "analyze", "description": "...", "parameters": {...}}]
 ```
@@ -346,7 +348,7 @@ print(tracer.summary())
 OpenAI-compatible server. Install the extra:
 
 ```bash
-pip install "signal-gating[llm]"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
 ```python

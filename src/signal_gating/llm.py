@@ -217,7 +217,18 @@ class LLMAgent(Agent):
                     }
                 )
                 for tc in tool_calls:
-                    args = json.loads(tc.function.arguments or "{}")
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError as e:
+                        raise AgentError(
+                            self.name,
+                            f"invalid JSON arguments for tool {tc.function.name!r}: {e.msg}",
+                        ) from e
+                    if not isinstance(args, dict):
+                        raise AgentError(
+                            self.name,
+                            f"tool {tc.function.name!r} arguments must decode to an object",
+                        )
                     result = await self._tool_provider.call_tool(tc.function.name, args)
                     messages.append(
                         {

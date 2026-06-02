@@ -56,6 +56,45 @@ async def test_mesh_tool_provider_unknown_tool_raises():
             await MeshToolProvider(mesh).call_tool("nope", {})
 
 
+async def test_mesh_tool_provider_rejects_missing_required_argument():
+    analyst = Agent("analyst")
+
+    @analyst.tool(description="Analyze a topic")
+    async def analyze(topic: str) -> dict:
+        return {"points": topic.upper()}
+
+    mesh = Mesh([analyst])
+    with pytest.raises(AgentError, match="missing required argument 'topic'"):
+        async with mesh:
+            await MeshToolProvider(mesh).call_tool("analyze", {})
+
+
+async def test_mesh_tool_provider_rejects_unexpected_argument():
+    analyst = Agent("analyst")
+
+    @analyst.tool(description="No inputs")
+    async def ping() -> str:
+        return "pong"
+
+    mesh = Mesh([analyst])
+    with pytest.raises(AgentError, match="unexpected argument 'extra'"):
+        async with mesh:
+            await MeshToolProvider(mesh).call_tool("ping", {"extra": True})
+
+
+async def test_mesh_tool_provider_rejects_wrong_argument_type():
+    analyst = Agent("analyst")
+
+    @analyst.tool(description="Analyze a topic")
+    async def analyze(topic: str) -> dict:
+        return {"points": topic.upper()}
+
+    mesh = Mesh([analyst])
+    with pytest.raises(AgentError, match="argument 'topic' expected str, got int"):
+        async with mesh:
+            await MeshToolProvider(mesh).call_tool("analyze", {"topic": 123})
+
+
 # --- Task 2: LLMAgent tool-calling loop ---
 
 
@@ -180,6 +219,26 @@ async def test_exceeds_max_tool_rounds_raises():
     )
     _capture(agent)
     with pytest.raises(AgentError, match="max_tool_rounds"):
+        await agent._dispatch(Topic(text="q"))
+
+
+async def test_invalid_tool_call_json_raises_agent_error():
+    client = ScriptedClient(_FMsg(tool_calls=[_FTC("c", "analyze", "{")]))
+    agent = LLMAgent(
+        "a", client=client, model="m", on=Topic, emit=Plan, tools=FakeProvider()
+    )
+    _capture(agent)
+    with pytest.raises(AgentError, match="invalid JSON arguments.*analyze"):
+        await agent._dispatch(Topic(text="q"))
+
+
+async def test_non_object_tool_call_arguments_raise_agent_error():
+    client = ScriptedClient(_FMsg(tool_calls=[_FTC("c", "analyze", "[]")]))
+    agent = LLMAgent(
+        "a", client=client, model="m", on=Topic, emit=Plan, tools=FakeProvider()
+    )
+    _capture(agent)
+    with pytest.raises(AgentError, match="arguments must decode to an object"):
         await agent._dispatch(Topic(text="q"))
 
 
