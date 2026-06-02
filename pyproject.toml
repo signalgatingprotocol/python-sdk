@@ -38,6 +38,10 @@ dev = [
 llm = [
     "openai>=1.0",
 ]
+otel = [
+    "opentelemetry-api>=1.25",
+    "opentelemetry-sdk>=1.25",
+]
 
 [project.urls]
 Repository = "https://github.com/signalgatingprotocol/python-sdk"

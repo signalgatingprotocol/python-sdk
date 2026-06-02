@@ -1,10 +1,11 @@
 """Trajectory replay example: record a multi-agent run, persist it, replay it.
 
-A TrajectoryRecorder captures a verifiable Receipt for every signal that crosses
-the mesh. Because each receipt now carries the full wire envelope, a trajectory
-isn't just an audit log you can read — it's replayable: persist it to disk, and
-in a fresh process reload it and get back the *exact* typed signals that produced
-it, ready to re-run, audit, or learn from.
+A TrajectoryRecorder captures verifiable Receipts for signal-carrying mesh
+events. Because each receipt carries the full signal wire envelope, a trajectory
+isn't just an audit log you can read — persisted signal events can be
+reconstructed exactly in a fresh process, ready to inspect or re-deliver through
+a compatible mesh. This is SGP signal replay, not Claude Agent SDK session
+resume.
 
 Run it twice with the same path to watch a "restart" recover a prior run:
 
@@ -15,7 +16,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-from signal_gating import Agent, Mesh, Signal, TrajectoryRecorder
+from signal_gating import Agent, Mesh, Signal, TrajectoryRecorder, TrajectoryReplayRunner
 
 
 class Step(Signal):
@@ -24,7 +25,7 @@ class Step(Signal):
 
 
 async def main(path: Path) -> None:
-    # If a prior run was persisted, reload it and replay the typed signals.
+    # If a prior run was persisted, reload it and reconstruct the typed signals.
     if path.exists():
         reloaded = TrajectoryRecorder()
         count = reloaded.load_jsonl(path)
@@ -34,6 +35,22 @@ async def main(path: Path) -> None:
         for sig in signals:
             assert isinstance(sig, Step)  # not a dict, not a base Signal
             print(f"  replayed {type(sig).__name__}(name={sig.name!r}, n={sig.n})")
+
+        replay_worker = Agent("a")
+        replay_seen = asyncio.Event()
+
+        @replay_worker.on(Step)
+        async def replay_sink(sig: Step) -> None:
+            print(f"  delivered to replay mesh: {sig.name!r}, n={sig.n}")
+            replay_seen.set()
+
+        replay_mesh = Mesh([replay_worker])
+        runner = TrajectoryReplayRunner.from_recorder(reloaded)
+        async with replay_mesh:
+            result = await runner.replay_into(replay_mesh, strict_targets=False)
+            if result.delivered:
+                await asyncio.wait_for(replay_seen.wait(), timeout=3.0)
+        print(f"  delivery replay: delivered={result.delivered}, skipped={result.skipped}")
         path.unlink()
         return
 
@@ -55,7 +72,7 @@ async def main(path: Path) -> None:
 
     recorder = TrajectoryRecorder()
     mesh = Mesh([a, b, c])
-    mesh.intercept(recorder)  # one line: capture on, pure observer
+    mesh.record(recorder)  # one line: capture direct orchestration + routes
     mesh.connect(a, b)
     mesh.connect(b, c)
 
@@ -64,8 +81,8 @@ async def main(path: Path) -> None:
         await asyncio.wait_for(done.wait(), timeout=3.0)
 
     for trace_id, receipts in recorder.trajectories().items():
-        hops = " -> ".join(f"{r.source}:{r.target}" for r in receipts)
-        print(f"Captured run {trace_id[:8]}: {hops}")
+        events = " -> ".join(f"{r.action}({r.source}:{r.target})" for r in receipts)
+        print(f"Captured run {trace_id[:8]}: {events}")
 
     written = recorder.export_jsonl(path)
     print(f"Persisted {written} receipt(s) to {path}")

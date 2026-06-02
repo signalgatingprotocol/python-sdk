@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger("signal_gating.tracing")
+
+SpanSink = Callable[["Span"], None]
+
+
+def _otel_attribute_value(value: Any) -> Any:
+    if value is None or isinstance(value, str | bool | int | float):
+        return value
+    if isinstance(value, tuple | list) and all(
+        item is None or isinstance(item, str | bool | int | float)
+        for item in value
+    ):
+        return list(value)
+    return json.dumps(value, default=str, sort_keys=True)
 
 
 @dataclass(slots=True)
@@ -16,9 +34,99 @@ class Span:
     agent: str
     gate: str
     action: str  # "passed", "rejected", "transformed", "error"
-    timestamp: float = field(default_factory=time.monotonic)
+    timestamp: float = field(default_factory=time.time)
     duration_ms: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation of this span."""
+        return {
+            "trace_id": self.trace_id,
+            "signal_id": self.signal_id,
+            "agent": self.agent,
+            "gate": self.gate,
+            "action": self.action,
+            "timestamp": self.timestamp,
+            "duration_ms": self.duration_ms,
+            "metadata": dict(self.metadata),
+        }
+
+    def to_otel_attributes(self, *, namespace: str = "sgp") -> dict[str, Any]:
+        """Convert this span into OpenTelemetry-safe attributes.
+
+        SGP trace IDs are protocol-level lineage identifiers, not OpenTelemetry
+        trace IDs. They are exported as attributes so backends can correlate
+        agent runs without forcing a specific OTel context model.
+        """
+        prefix = namespace.rstrip(".")
+        attrs: dict[str, Any] = {
+            f"{prefix}.trace_id": self.trace_id,
+            f"{prefix}.signal_id": self.signal_id,
+            f"{prefix}.agent": self.agent,
+            f"{prefix}.gate": self.gate,
+            f"{prefix}.action": self.action,
+            f"{prefix}.duration_ms": self.duration_ms,
+        }
+        for key, value in self.metadata.items():
+            attrs[f"{prefix}.{key}"] = _otel_attribute_value(value)
+        return attrs
+
+
+class OpenTelemetrySpanExporter:
+    """Callable sink that exports SGP spans as OpenTelemetry spans.
+
+    The OpenTelemetry import is lazy. Core users do not pay the dependency cost;
+    production users can install ``signal-gating[otel]`` or provide their own
+    compatible tracer object.
+    """
+
+    def __init__(
+        self,
+        *,
+        tracer: Any | None = None,
+        tracer_name: str = "signal_gating",
+        attributes_namespace: str = "sgp",
+        span_name: Callable[[Span], str] | None = None,
+    ) -> None:
+        if tracer is None:
+            try:
+                from opentelemetry import trace as otel_trace
+            except ImportError as e:  # pragma: no cover - depends on optional extra
+                raise ImportError(
+                    "OpenTelemetrySpanExporter requires opentelemetry-api. "
+                    "Install it with: pip install 'signal-gating[otel]'"
+                ) from e
+            tracer = otel_trace.get_tracer(tracer_name)
+        self._tracer = tracer
+        self._attributes_namespace = attributes_namespace
+        self._span_name = span_name or self._default_span_name
+
+    def __call__(self, span: Span) -> None:
+        """Export one SGP span into the configured OpenTelemetry tracer."""
+        name = self._span_name(span)
+        start_ns = int(span.timestamp * 1_000_000_000)
+        end_ns = int(
+            (span.timestamp + max(span.duration_ms, 0.0) / 1000.0) * 1_000_000_000
+        )
+        otel_span = self._tracer.start_span(
+            name,
+            start_time=start_ns,
+            attributes=span.to_otel_attributes(namespace=self._attributes_namespace),
+        )
+        try:
+            if span.action == "error":
+                try:
+                    from opentelemetry.trace import Status, StatusCode
+
+                    otel_span.set_status(Status(StatusCode.ERROR, span.action))
+                except Exception:  # pragma: no cover - exporter compatibility
+                    logger.debug("Could not set OpenTelemetry status", exc_info=True)
+        finally:
+            otel_span.end(end_time=end_ns)
+
+    @staticmethod
+    def _default_span_name(span: Span) -> str:
+        return f"signal_gating.{span.gate}.{span.action}"
 
 
 class Tracer:
@@ -38,9 +146,15 @@ class Tracer:
             print(f"{span.agent} -> {span.gate}: {span.action}")
     """
 
-    def __init__(self, max_spans: int = 10000):
+    def __init__(
+        self,
+        max_spans: int = 10000,
+        sinks: list[SpanSink] | None = None,
+    ):
         self._spans: list[Span] = []
         self._max_spans = max_spans
+        self._sinks: list[SpanSink] = list(sinks or [])
+        self._sink_errors = 0
         # Indexed lookups for O(1) access
         self._by_trace: dict[str, list[Span]] = {}
         self._by_agent: dict[str, list[Span]] = {}
@@ -70,7 +184,49 @@ class Tracer:
         self._by_agent.setdefault(agent, []).append(span)
         if len(self._spans) > self._max_spans:
             self._evict()
+        self._publish(span)
         return span
+
+    def add_sink(self, sink: SpanSink) -> None:
+        """Stream subsequently recorded spans into ``sink``.
+
+        Sinks are best-effort observers: if a sink raises, tracing records the
+        failure and keeps the agent system moving.
+        """
+        self._sinks.append(sink)
+
+    def remove_sink(self, sink: SpanSink) -> bool:
+        """Remove a sink. Returns ``True`` if it was registered."""
+        try:
+            self._sinks.remove(sink)
+            return True
+        except ValueError:
+            return False
+
+    def export(self, sink: SpanSink) -> int:
+        """Replay all retained spans into a sink. Returns the number exported."""
+        exported = 0
+        for span in list(self._spans):
+            try:
+                sink(span)
+                exported += 1
+            except Exception:
+                self._sink_errors += 1
+                logger.warning("Tracer sink failed during export", exc_info=True)
+        return exported
+
+    @property
+    def sink_errors(self) -> int:
+        """Number of sink failures suppressed by this tracer."""
+        return self._sink_errors
+
+    def _publish(self, span: Span) -> None:
+        for sink in tuple(self._sinks):
+            try:
+                sink(span)
+            except Exception:
+                self._sink_errors += 1
+                logger.warning("Tracer sink failed", exc_info=True)
 
     def _evict(self) -> None:
         """Evict oldest spans to stay within max_spans, rebuilding indexes."""
