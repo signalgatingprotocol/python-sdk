@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("signal_gating.mesh")
 
 Interceptor = Callable[[Signal, str, str], Signal | None | Awaitable[Signal | None]]
+MeshEventSink = Callable[["MeshEvent"], None | Awaitable[None]]
 
 
 class Edge:
@@ -32,6 +34,19 @@ class Edge:
         self.source = source
         self.target = target
         self.gate = gate
+
+
+@dataclass
+class MeshEvent:
+    """A structured mesh execution event for receipts, replay, and audit sinks."""
+
+    action: str
+    signal: Signal
+    source: str
+    target: str = ""
+    event_kind: str = "mesh"
+    timestamp: float = field(default_factory=time.time)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -80,6 +95,8 @@ class Mesh:
         self._edges: list[Edge] = []
         self._running = False
         self._interceptors: list[Interceptor] = []
+        self._event_sinks: list[MeshEventSink] = []
+        self._event_sink_errors = 0
         self._capabilities: dict[str, set[str]] = {}
         self._pools: dict[str, AgentPool] = {}
         self._topics: dict[str, list[Agent]] = {}
@@ -313,6 +330,7 @@ class Mesh:
     async def inject(self, target: Agent | str, signal: Signal) -> None:
         """Inject a signal directly into an agent's inbox."""
         agent = self._resolve(target)
+        await self._record_event("inject", signal, source="mesh", target=agent.name)
         await agent.inbox.send(signal)
 
     def health(self) -> dict[str, Any]:
@@ -367,6 +385,56 @@ class Mesh:
             mesh.intercept(log_all)
         """
         self._interceptors.append(fn)
+
+    def record(self, sink: MeshEventSink | Any) -> None:
+        """Record structured mesh execution events into a sink.
+
+        This is the production trajectory hook. Unlike interceptors, recorders
+        see direct orchestration paths such as ``inject()``, ``request()``,
+        ``scatter()``, ``race()``, ``publish()``, ``workflow()``, and
+        ``call_tool()``. If ``sink`` exposes ``record_event()``, that method is
+        registered; otherwise the object itself is treated as the event sink.
+        """
+        event_sink = getattr(sink, "record_event", sink)
+        self._event_sinks.append(event_sink)
+
+    def record_events(self, sink: MeshEventSink | Any) -> None:
+        """Alias for :meth:`record` with a more explicit name."""
+        self.record(sink)
+
+    @property
+    def event_sink_errors(self) -> int:
+        """Number of event sink failures suppressed by the mesh."""
+        return self._event_sink_errors
+
+    async def _record_event(
+        self,
+        action: str,
+        signal: Signal,
+        *,
+        source: str,
+        target: str = "",
+        event_kind: str = "mesh",
+        **metadata: Any,
+    ) -> None:
+        if not self._event_sinks:
+            return
+        event = MeshEvent(
+            action=action,
+            signal=signal,
+            source=source,
+            target=target,
+            event_kind=event_kind,
+            metadata=metadata,
+        )
+        for sink in tuple(self._event_sinks):
+            try:
+                result = sink(event)
+                if isawaitable(result):
+                    await result
+            except Exception:
+                self._event_sink_errors += 1
+                logger.warning("Mesh event sink failed", exc_info=True)
 
     async def _apply_interceptors(
         self, signal: Signal, source: str, target: str
@@ -509,6 +577,13 @@ class Mesh:
             # Apply mesh-level interceptors
             intercepted = await mesh._apply_interceptors(signal, src.name, tgt.name)
             if intercepted is None:
+                await mesh._record_event(
+                    "intercepted",
+                    signal,
+                    source=src.name,
+                    target=tgt.name,
+                    event_kind="signal",
+                )
                 tracer.record(
                     trace_id=signal.trace_id,
                     signal_id=signal.id,
@@ -522,6 +597,14 @@ class Mesh:
             if gate is not None:
                 result = await gate.process(signal)
                 if result is None:
+                    await mesh._record_event(
+                        "edge_rejected",
+                        signal,
+                        source=src.name,
+                        target=tgt.name,
+                        event_kind="signal",
+                        gate=gate.name,
+                    )
                     tracer.record(
                         trace_id=signal.trace_id,
                         signal_id=signal.id,
@@ -538,6 +621,13 @@ class Mesh:
                 gate="route",
                 action="routed",
                 target=tgt.name,
+            )
+            await mesh._record_event(
+                "routed",
+                signal,
+                source=src.name,
+                target=tgt.name,
+                event_kind="signal",
             )
             await tgt.inbox.send(signal)
 
@@ -594,6 +684,13 @@ class Mesh:
             raise MeshError(f"Topic '{topic}' does not exist")
         subscribers = self._topics[topic]
         for subscriber in subscribers:
+            await self._record_event(
+                "published",
+                signal,
+                source="mesh",
+                target=subscriber.name,
+                topic=topic,
+            )
             self.tracer.record(
                 trace_id=signal.trace_id,
                 signal_id=signal.id,
@@ -654,10 +751,24 @@ class Mesh:
         # Capture the reply from the target's outbox
         async def capture(sig: Signal) -> None:
             if sig.correlation_id == cid and not future.done():
+                await self._record_event(
+                    "response_received",
+                    sig,
+                    source=resolved.name,
+                    target="mesh",
+                    correlation_id=cid,
+                )
                 future.set_result(sig)
 
         resolved._outbox.append(capture)
         try:
+            await self._record_event(
+                "request_sent",
+                tagged,
+                source="mesh",
+                target=resolved.name,
+                correlation_id=cid,
+            )
             await resolved.inbox.send(tagged)
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
@@ -703,24 +814,37 @@ class Mesh:
             # This avoids the previous bug where registering on _pending_requests
             # caused the signal to be intercepted before reaching handlers.
             def _make_capture(
-                f: asyncio.Future[Signal], tcid: str
+                f: asyncio.Future[Signal], tcid: str, tname: str
             ) -> Any:
                 async def capture(sig: Signal) -> None:
                     if sig.correlation_id == tcid and not f.done():
+                        await self._record_event(
+                            "scatter_response",
+                            sig,
+                            source=tname,
+                            target="mesh",
+                            correlation_id=tcid,
+                        )
                         f.set_result(sig)
 
                 return capture
 
-            capture = _make_capture(future, target_cid)
+            capture = _make_capture(future, target_cid, target.name)
             target._outbox.append(capture)  # noqa: SLF001
             capture_fns.append((target, capture))
 
         # Send signals to all targets
         for target in resolved:
             target_cid = f"{cid}:{target.name}"
-            await target.inbox.send(
-                signal.evolve(correlation_id=target_cid)
+            scatter_signal = signal.evolve(correlation_id=target_cid)
+            await self._record_event(
+                "scatter_sent",
+                scatter_signal,
+                source="mesh",
+                target=target.name,
+                correlation_id=target_cid,
             )
+            await target.inbox.send(scatter_signal)
 
         try:
             done, _ = await asyncio.wait(futures, timeout=timeout)
@@ -801,6 +925,13 @@ class Mesh:
                     step=i,
                     target=resolved.name,
                 )
+                await self._record_event(
+                    "workflow_step_start",
+                    current,
+                    source="mesh",
+                    target=resolved.name,
+                    step=i,
+                )
                 current = await self.request(resolved, current, timeout=step_timeout)
                 self.tracer.record(
                     trace_id=signal.trace_id,
@@ -810,6 +941,13 @@ class Mesh:
                     action="step_complete",
                     step=i,
                     target=resolved.name,
+                )
+                await self._record_event(
+                    "workflow_step_complete",
+                    current,
+                    source=resolved.name,
+                    target="mesh",
+                    step=i,
                 )
             return current
 
@@ -864,14 +1002,22 @@ class Mesh:
 
             def _make_capture(
                 f: asyncio.Future[Signal], tcid: str,
+                tname: str,
             ) -> Any:
                 async def capture(sig: Signal) -> None:
                     if sig.correlation_id == tcid and not f.done():
+                        await self._record_event(
+                            "race_response",
+                            sig,
+                            source=tname,
+                            target="mesh",
+                            correlation_id=tcid,
+                        )
                         f.set_result(sig)
 
                 return capture
 
-            capture = _make_capture(future, target_cid)
+            capture = _make_capture(future, target_cid, target.name)
             target._outbox.append(capture)
             capture_fns.append((target, capture))
 
@@ -886,7 +1032,15 @@ class Mesh:
                 action="sent",
                 target=target.name,
             )
-            await target.inbox.send(signal.evolve(correlation_id=target_cid))
+            race_signal = signal.evolve(correlation_id=target_cid)
+            await self._record_event(
+                "race_sent",
+                race_signal,
+                source="mesh",
+                target=target.name,
+                correlation_id=target_cid,
+            )
+            await target.inbox.send(race_signal)
 
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
@@ -896,6 +1050,12 @@ class Mesh:
                 agent="mesh",
                 gate="race",
                 action="winner",
+            )
+            await self._record_event(
+                "race_winner",
+                result,
+                source="mesh",
+                target="",
             )
             return result
         finally:
@@ -944,11 +1104,35 @@ class Mesh:
             tool_name=tool_name,
             arguments=arguments,
         )
+        await self._record_event(
+            "tool_call_start",
+            signal,
+            source="mesh",
+            target=resolved.name,
+            tool_name=tool_name,
+            argument_names=sorted(arguments),
+        )
         response = await self.request(resolved, signal, timeout=timeout)
         if isinstance(response, ToolResultSignal):
+            await self._record_event(
+                "tool_call_complete",
+                response,
+                source=resolved.name,
+                target="mesh",
+                tool_name=tool_name,
+                error=bool(response.error),
+            )
             if response.error:
                 raise AgentError(resolved.name, f"Tool '{tool_name}' failed: {response.error}")
             return response.result
+        await self._record_event(
+            "tool_call_complete",
+            response,
+            source=resolved.name,
+            target="mesh",
+            tool_name=tool_name,
+            error=False,
+        )
         return response
 
     def discover_tools(
@@ -1050,6 +1234,13 @@ class Mesh:
                 action="reduce_start",
                 mapper_count=len(responses),
             )
+            await self._record_event(
+                "map_reduce_reduce_start",
+                reduce_signal,
+                source="mesh",
+                target=self._resolve(reducer).name,
+                mapper_count=len(responses),
+            )
 
             # Reduce phase: send combined result to reducer
             result = await self.request(
@@ -1062,6 +1253,12 @@ class Mesh:
                 agent="mesh",
                 gate="map_reduce",
                 action="reduce_complete",
+            )
+            await self._record_event(
+                "map_reduce_reduce_complete",
+                result,
+                source=self._resolve(reducer).name,
+                target="mesh",
             )
             return result
 
@@ -1126,6 +1323,14 @@ class Mesh:
                 agent="mesh",
                 gate="branch_workflow",
                 action="branch_selected",
+                branch=branch_key,
+                steps=len(steps),
+            )
+            await self._record_event(
+                "branch_selected",
+                signal,
+                source="mesh",
+                target="",
                 branch=branch_key,
                 steps=len(steps),
             )

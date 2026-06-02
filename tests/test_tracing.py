@@ -1,6 +1,8 @@
 """Tests for signal tracing and observability."""
 
-from signal_gating import Tracer
+import time
+
+from signal_gating import OpenTelemetrySpanExporter, Span, SpanSink, Tracer
 
 
 def test_record_span():
@@ -9,6 +11,31 @@ def test_record_span():
     assert span.trace_id == "trace-1"
     assert span.action == "passed"
     assert tracer.span_count == 1
+    assert span.timestamp <= time.time()
+
+
+def test_span_to_dict():
+    span = Span(
+        trace_id="t",
+        signal_id="s",
+        agent="a",
+        gate="g",
+        action="passed",
+        timestamp=123.0,
+        duration_ms=4.5,
+        metadata={"target": "b"},
+    )
+
+    assert span.to_dict() == {
+        "trace_id": "t",
+        "signal_id": "s",
+        "agent": "a",
+        "gate": "g",
+        "action": "passed",
+        "timestamp": 123.0,
+        "duration_ms": 4.5,
+        "metadata": {"target": "b"},
+    }
 
 
 def test_get_trace():
@@ -80,3 +107,136 @@ def test_summary_no_latency_when_zero_durations():
     tracer.record("t1", "s1", "a", "g", "passed")  # duration_ms=0
     s = tracer.summary()
     assert "latency_ms" not in s
+
+
+def test_record_streams_to_sinks():
+    received: list[Span] = []
+    tracer = Tracer(sinks=[received.append])
+
+    span = tracer.record("t1", "s1", "a", "g", "passed")
+
+    assert received == [span]
+
+
+def test_add_remove_sink():
+    received: list[Span] = []
+    tracer = Tracer()
+
+    sink = received.append
+    assert tracer.remove_sink(sink) is False
+    tracer.add_sink(sink)
+    assert tracer.remove_sink(sink) is True
+    tracer.record("t1", "s1", "a", "g", "passed")
+    assert received == []
+
+
+def test_sink_failure_does_not_block_recording():
+    def broken_sink(_span: Span) -> None:
+        raise RuntimeError("collector offline")
+
+    tracer = Tracer(sinks=[broken_sink])
+    span = tracer.record("t1", "s1", "a", "g", "passed")
+
+    assert span.trace_id == "t1"
+    assert tracer.span_count == 1
+    assert tracer.sink_errors == 1
+
+
+def test_export_replays_retained_spans():
+    tracer = Tracer()
+    first = tracer.record("t1", "s1", "a", "g", "passed")
+    second = tracer.record("t2", "s2", "b", "g", "rejected")
+    received: list[Span] = []
+
+    assert tracer.export(received.append) == 2
+    assert received == [first, second]
+
+
+def test_span_to_otel_attributes_encodes_complex_metadata():
+    span = Span(
+        trace_id="t",
+        signal_id="s",
+        agent="agent",
+        gate="route",
+        action="routed",
+        duration_ms=1.25,
+        metadata={"target": "worker", "payload": {"symbol": "SPY"}},
+    )
+
+    attrs = span.to_otel_attributes()
+
+    assert attrs["sgp.trace_id"] == "t"
+    assert attrs["sgp.signal_id"] == "s"
+    assert attrs["sgp.agent"] == "agent"
+    assert attrs["sgp.gate"] == "route"
+    assert attrs["sgp.action"] == "routed"
+    assert attrs["sgp.duration_ms"] == 1.25
+    assert attrs["sgp.target"] == "worker"
+    assert attrs["sgp.payload"] == '{"symbol": "SPY"}'
+
+
+def test_opentelemetry_exporter_uses_span_times_and_attributes():
+    class FakeOtelSpan:
+        def __init__(self) -> None:
+            self.end_time: int | None = None
+
+        def end(self, *, end_time: int | None = None) -> None:
+            self.end_time = end_time
+
+    class FakeTracer:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.last_span = FakeOtelSpan()
+
+        def start_span(
+            self,
+            name: str,
+            *,
+            start_time: int,
+            attributes: dict[str, object],
+        ) -> FakeOtelSpan:
+            self.calls.append(
+                {"name": name, "start_time": start_time, "attributes": attributes}
+            )
+            return self.last_span
+
+    fake = FakeTracer()
+    exporter = OpenTelemetrySpanExporter(
+        tracer=fake,
+        attributes_namespace="sgp",
+        span_name=lambda span: f"custom.{span.action}",
+    )
+    span = Span(
+        trace_id="t",
+        signal_id="s",
+        agent="agent",
+        gate="route",
+        action="routed",
+        timestamp=10.0,
+        duration_ms=25.5,
+        metadata={"target": "worker"},
+    )
+
+    exporter(span)
+
+    assert fake.calls == [
+        {
+            "name": "custom.routed",
+            "start_time": 10_000_000_000,
+            "attributes": {
+                "sgp.trace_id": "t",
+                "sgp.signal_id": "s",
+                "sgp.agent": "agent",
+                "sgp.gate": "route",
+                "sgp.action": "routed",
+                "sgp.duration_ms": 25.5,
+                "sgp.target": "worker",
+            },
+        }
+    ]
+    assert fake.last_span.end_time == 10_025_500_000
+
+
+def test_exports():
+    assert OpenTelemetrySpanExporter is not None
+    assert SpanSink is not None

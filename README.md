@@ -16,6 +16,12 @@ For LLM-backed agents (the optional `openai` client):
 pip install "signal-gating[llm]"
 ```
 
+For OpenTelemetry export:
+
+```bash
+pip install "signal-gating[otel]"
+```
+
 Or from source:
 
 ```bash
@@ -315,6 +321,10 @@ schema = analyst.tools_schema()
 # [{"name": "analyze", "description": "...", "parameters": {...}}]
 ```
 
+`MeshToolProvider` converts these tools into OpenAI-compatible function-tool
+schemas. It is not an MCP adapter; direct `mesh.call_tool()` calls route through
+the mesh request path and are captured by `mesh.record(...)`.
+
 ### Pipeline
 
 Ordered gate chains:
@@ -345,14 +355,27 @@ channel = PriorityChannel(Signal, buffer_size=1000)
 
 ### Tracing
 
-Signal flow observability:
+Signal flow observability, in memory by default and exportable when you need to
+plug SGP into production telemetry:
 
 ```python
-tracer = Tracer()
+from signal_gating import OpenTelemetrySpanExporter, Tracer
+
+tracer = Tracer(sinks=[OpenTelemetrySpanExporter()])
 tracer.record(trace_id, signal_id, "agent-a", "priority_gate", "passed")
 trace = tracer.get_trace(trace_id)
 print(tracer.summary())
 ```
+
+Sinks are best-effort observers, so a collector outage does not stop the agent
+mesh. You can also export retained spans after a run:
+
+```python
+exported = tracer.export(OpenTelemetrySpanExporter())
+```
+
+Tracing is lightweight observability. Trajectories are the durable audit/replay
+log for signal-carrying mesh events.
 
 ### LLM-backed agents (Hermes)
 
@@ -414,15 +437,16 @@ The loop is bounded by `max_tool_rounds` (default 4).
 
 ### Trajectories
 
-Capture a verifiable, structured record of every signal that crosses the mesh,
-exportable as JSONL for audit, learning, or training. Attach a recorder with one
-line; it is a pure observer (never blocks):
+Capture a verifiable, structured record of signal-carrying mesh events,
+exportable as JSONL for audit, learning, or training. The production hook records
+connected routes plus direct orchestration paths such as `inject`, `request`,
+`workflow`, `scatter`, `race`, `publish`, and `call_tool`:
 
 ```python
 from signal_gating import TrajectoryRecorder
 
 recorder = TrajectoryRecorder()
-mesh.intercept(recorder)
+mesh.record(recorder)
 
 async with mesh:
     await mesh.inject(planner, Topic(text="..."))
@@ -431,19 +455,41 @@ recorder.trajectories()              # {trace_id: [Receipt, ...]}, grouped per r
 recorder.export_jsonl("runs.jsonl")  # one Receipt per line
 ```
 
-Each `Receipt` carries the signal's lineage (`trace_id` / `parent_id`), routing
-(`source` -> `target`), typed domain `payload`, and a `digest` (sha256) so the
-record is tamper-evident: `receipt.verify()`.
+Each `Receipt` carries `event_kind`, `action`, the signal's lineage
+(`trace_id` / `parent_id`), routing (`source` -> `target`), typed domain
+`payload`, event `metadata`, and a `digest` (sha256) so the record is
+tamper-evident: `receipt.verify()`.
 
-A trajectory isn't just readable, it's **replayable**. Each receipt also stores
-the full wire envelope, so a run persisted to disk reloads as the exact typed
-signals that produced it — to re-run, audit, or learn from after a restart:
+A trajectory is more than readable: its signal-carrying receipts are
+**reconstructable**. Each receipt stores the full signal wire envelope, so a run
+persisted to disk reloads as verifiable receipts and exact typed signals.
 
 ```python
 reloaded = TrajectoryRecorder()
 reloaded.load_jsonl("runs.jsonl")    # verifiable Receipts, after a restart
 signals = reloaded.replay()          # -> [TaskSignal, ...], original types and ids
 ```
+
+`TrajectoryRecorder.replay()` reconstructs signals for inspection, audit, or
+training. To deliver recorded entry events through a mesh again, use
+`TrajectoryReplayRunner.replay_into(mesh)`.
+
+`TrajectoryReplayRunner` re-delivers entry events such as `inject`,
+`request_sent`, `scatter_sent`, `race_sent`, and `published` into the current
+mesh. The mesh must already contain matching target agents and handlers. It
+skips audit/control events and does not recreate pending request futures,
+workflow loops, LLM memory, filesystem state, or Claude Agent SDK sessions:
+
+```python
+from signal_gating import TrajectoryReplayRunner
+
+runner = TrajectoryReplayRunner.from_jsonl("runs.jsonl")
+result = await runner.replay_into(mesh)
+print(result.delivered, result.skipped)
+```
+
+For legacy edge-hop-only capture, `mesh.intercept(recorder)` still works, but it
+does not see direct orchestration paths.
 
 ### Wire format & durability
 

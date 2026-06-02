@@ -55,7 +55,7 @@ from signal_gating.errors import (
 )
 from signal_gating.gate import Gate
 from signal_gating.llm import LLMAgent, MeshToolProvider, Message, ToolProvider
-from signal_gating.mesh import Edge, Mesh
+from signal_gating.mesh import Edge, Mesh, MeshEvent, MeshEventSink
 from signal_gating.pipeline import Pipeline
 from signal_gating.pool import AgentPool
 from signal_gating.registry import (
@@ -67,8 +67,14 @@ from signal_gating.registry import (
     to_wire,
 )
 from signal_gating.signal import Signal
-from signal_gating.tracing import Span, Tracer
-from signal_gating.trajectory import Receipt, TrajectoryRecorder
+from signal_gating.tracing import OpenTelemetrySpanExporter, Span, SpanSink, Tracer
+from signal_gating.trajectory import (
+    Receipt,
+    ReplayDelivery,
+    ReplayResult,
+    TrajectoryRecorder,
+    TrajectoryReplayRunner,
+)
 
 __all__ = [
     "WIRE_VERSION",
@@ -87,23 +93,30 @@ __all__ = [
     "GateRejected",
     "LLMAgent",
     "Mesh",
+    "MeshEvent",
+    "MeshEventSink",
     "MeshError",
     "MeshToolProvider",
     "Message",
+    "OpenTelemetrySpanExporter",
     "Pipeline",
     "PriorityChannel",
     "Receipt",
+    "ReplayDelivery",
+    "ReplayResult",
     "Signal",
     "SignalGatingError",
     "SignalSerializationError",
     "SignalValidationError",
     "Span",
+    "SpanSink",
     "ToolCallSignal",
     "ToolProvider",
     "ToolResultSignal",
     "ToolSpec",
     "Tracer",
     "TrajectoryRecorder",
+    "TrajectoryReplayRunner",
     "UnknownSignalType",
     "from_wire",
     "lookup_signal",

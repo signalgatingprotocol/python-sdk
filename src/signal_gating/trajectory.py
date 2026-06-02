@@ -1,16 +1,21 @@
-"""Trajectory capture: a verifiable, structured record of every signal hop."""
+"""Trajectory capture: verifiable structured records of mesh execution."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass, field
+from inspect import isawaitable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from signal_gating.errors import SignalSerializationError
+from signal_gating.errors import MeshError, SignalSerializationError
 from signal_gating.signal import Signal
+
+if TYPE_CHECKING:
+    from signal_gating.mesh import Mesh
 
 # Base Signal envelope fields -- excluded from a Receipt's domain payload because
 # they are already represented as typed Receipt fields.
@@ -37,14 +42,22 @@ def _digest(core: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _receipt_mismatch_error(receipt: Receipt) -> SignalSerializationError:
+    return SignalSerializationError(
+        "trajectory receipt digest mismatch for "
+        f"{receipt.signal_type} {receipt.signal_id!r} "
+        f"on trace {receipt.trace_id!r}"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Receipt:
-    """A verifiable, structured record of one signal crossing the mesh.
+    """A verifiable, structured record of one mesh execution event.
 
     A Receipt serves two purposes that used to pull in different directions:
 
-    * **Audit** — ``signal_type`` and ``payload`` are a human-readable projection
-      (domain fields only; the envelope is denormalized into the typed fields).
+    * **Audit** — ``event_kind``/``action`` plus ``signal_type`` and ``payload``
+      are a human-readable projection of what happened.
     * **Replay** — ``wire`` is the full, self-describing wire envelope, so
       ``to_signal()`` reconstructs the *exact* original typed signal. Without it
       a trajectory could be read but never re-run; with it a persisted
@@ -66,9 +79,22 @@ class Receipt:
     payload: dict[str, Any]
     wire: dict[str, Any]
     digest: str
+    event_kind: str = "signal"
+    action: str = "hop"
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_signal(cls, signal: Signal, source: str, target: str) -> Receipt:
+    def from_signal(
+        cls,
+        signal: Signal,
+        source: str,
+        target: str,
+        *,
+        event_kind: str = "signal",
+        action: str = "hop",
+        metadata: dict[str, Any] | None = None,
+        timestamp: float | None = None,
+    ) -> Receipt:
         core: dict[str, Any] = {
             "trace_id": signal.trace_id,
             "signal_id": signal.id,
@@ -77,9 +103,12 @@ class Receipt:
             "source": source,
             "target": target,
             "priority": signal.priority,
-            "timestamp": time.time(),
+            "timestamp": time.time() if timestamp is None else timestamp,
             "payload": _domain_payload(signal),
             "wire": signal.to_wire(),
+            "event_kind": event_kind,
+            "action": action,
+            "metadata": metadata or {},
         }
         return cls(
             trace_id=core["trace_id"],
@@ -93,6 +122,27 @@ class Receipt:
             payload=core["payload"],
             wire=core["wire"],
             digest=_digest(core),
+            event_kind=core["event_kind"],
+            action=core["action"],
+            metadata=core["metadata"],
+        )
+
+    @classmethod
+    def from_event(cls, event: Any) -> Receipt:
+        """Build a Receipt from a mesh event object.
+
+        ``MeshEvent`` lives in ``mesh.py`` to avoid making mesh depend on
+        trajectory capture. This method accepts any object with the same
+        attributes, which keeps recorder sinks lightweight and testable.
+        """
+        return cls.from_signal(
+            event.signal,
+            source=event.source,
+            target=event.target,
+            event_kind=event.event_kind,
+            action=event.action,
+            metadata=dict(event.metadata),
+            timestamp=event.timestamp,
         )
 
     @classmethod
@@ -116,20 +166,29 @@ class Receipt:
 
     def verify(self) -> bool:
         core = {k: v for k, v in asdict(self).items() if k != "digest"}
-        return _digest(core) == self.digest
+        if _digest(core) == self.digest:
+            return True
+        if self.event_kind == "signal" and self.action == "hop" and not self.metadata:
+            legacy_core = {
+                k: v for k, v in core.items()
+                if k not in {"event_kind", "action", "metadata"}
+            }
+            return _digest(legacy_core) == self.digest
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class TrajectoryRecorder:
-    """A mesh interceptor that records a Receipt for every signal hop.
+    """Records verifiable Receipts for mesh events and signal hops.
 
-    Attach with ``mesh.intercept(recorder)``. It is a pure observer: it returns
-    every signal unchanged and never blocks delivery.
+    Attach with ``mesh.record(recorder)`` to capture direct orchestration events
+    and connected routes. ``mesh.intercept(recorder)`` remains supported for the
+    old edge-hop-only observer path.
 
         recorder = TrajectoryRecorder()
-        mesh.intercept(recorder)
+        mesh.record(recorder)
         ...
         recorder.export_jsonl("runs.jsonl")
     """
@@ -140,6 +199,10 @@ class TrajectoryRecorder:
     def __call__(self, signal: Signal, source: str, target: str) -> Signal:
         self._receipts.append(Receipt.from_signal(signal, source, target))
         return signal
+
+    def record_event(self, event: Any) -> None:
+        """Record a structured mesh event emitted by ``Mesh.record()``."""
+        self._receipts.append(Receipt.from_event(event))
 
     @property
     def receipts(self) -> list[Receipt]:
@@ -181,11 +244,7 @@ class TrajectoryRecorder:
                     continue
                 receipt = Receipt.from_dict(json.loads(line))
                 if verify and not receipt.verify():
-                    raise SignalSerializationError(
-                        "trajectory receipt digest mismatch for "
-                        f"{receipt.signal_type} {receipt.signal_id!r} "
-                        f"on trace {receipt.trace_id!r}"
-                    )
+                    raise _receipt_mismatch_error(receipt)
                 receipts.append(receipt)
         self._receipts.extend(receipts)
         return len(receipts)
@@ -204,12 +263,236 @@ class TrajectoryRecorder:
         if verify:
             for receipt in self._receipts:
                 if not receipt.verify():
-                    raise SignalSerializationError(
-                        "trajectory receipt digest mismatch for "
-                        f"{receipt.signal_type} {receipt.signal_id!r} "
-                        f"on trace {receipt.trace_id!r}"
-                    )
+                    raise _receipt_mismatch_error(receipt)
         return [r.to_signal(strict=strict) for r in self._receipts]
+
+    async def replay_into(
+        self,
+        mesh: Mesh,
+        *,
+        actions: Iterable[str] | None = None,
+        strict: bool = True,
+        verify: bool = True,
+        strict_targets: bool = True,
+    ) -> ReplayResult:
+        """Replay retained delivery entries into a mesh."""
+        return await TrajectoryReplayRunner.from_recorder(self).replay_into(
+            mesh,
+            actions=actions,
+            strict=strict,
+            verify=verify,
+            strict_targets=strict_targets,
+        )
 
     def clear(self) -> None:
         self._receipts.clear()
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayDelivery:
+    """Per-receipt replay disposition."""
+
+    receipt_index: int
+    action: str
+    trace_id: str
+    signal_id: str
+    signal_type: str
+    target: str
+    status: Literal["delivered", "skipped", "failed"]
+    reason: str = ""
+
+
+@dataclass(slots=True)
+class ReplayResult:
+    """Summary of a delivery replay into a mesh."""
+
+    attempted: int = 0
+    delivered: int = 0
+    skipped: int = 0
+    failed: int = 0
+    missing_targets: list[str] = field(default_factory=list)
+    receipts: list[Receipt] = field(default_factory=list)
+    deliveries: list[ReplayDelivery] = field(default_factory=list)
+
+    @property
+    def actions(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for delivery in self.deliveries:
+            counts[delivery.action] = counts.get(delivery.action, 0) + 1
+        return counts
+
+    @property
+    def trace_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(delivery.trace_id for delivery in self.deliveries))
+
+
+class TrajectoryReplayRunner:
+    """Replay recorded mesh delivery entries into a fresh mesh.
+
+    This is execution replay's first honest layer: it re-delivers recorded entry
+    signals (`inject`, `request_sent`, fan-out sends, race sends, and pub/sub
+    deliveries) so handlers run again. It does not recreate pending request
+    futures, workflow control flow, or external LLM sessions.
+    """
+
+    replayable_actions = frozenset(
+        {
+            "inject",
+            "request_sent",
+            "scatter_sent",
+            "race_sent",
+            "published",
+        }
+    )
+
+    def __init__(self, receipts: Sequence[Receipt]) -> None:
+        self._receipts = list(receipts)
+
+    @classmethod
+    def from_recorder(cls, recorder: TrajectoryRecorder) -> TrajectoryReplayRunner:
+        """Build a runner from a recorder's retained receipts."""
+        return cls(recorder.receipts)
+
+    @classmethod
+    def from_jsonl(
+        cls,
+        path: str | Path,
+        *,
+        verify: bool = True,
+    ) -> TrajectoryReplayRunner:
+        """Load receipts from JSONL and build a replay runner."""
+        recorder = TrajectoryRecorder()
+        recorder.load_jsonl(path, verify=verify)
+        return cls.from_recorder(recorder)
+
+    @property
+    def receipts(self) -> list[Receipt]:
+        return list(self._receipts)
+
+    def replayable_receipts(
+        self,
+        *,
+        actions: Iterable[str] | None = None,
+    ) -> list[Receipt]:
+        """Return receipts this runner can deliver into a mesh."""
+        allowed = set(actions or self.replayable_actions)
+        return [receipt for receipt in self._receipts if receipt.action in allowed]
+
+    async def replay_into(
+        self,
+        mesh: Mesh,
+        *,
+        actions: Iterable[str] | None = None,
+        strict: bool = True,
+        verify: bool = True,
+        strict_targets: bool = True,
+    ) -> ReplayResult:
+        """Deliver replayable receipt signals into ``mesh``.
+
+        Args:
+            mesh: The mesh with agents already registered and running.
+            actions: Optional subset of replayable actions to deliver.
+            strict: Passed to :meth:`Receipt.to_signal`.
+            verify: Verify all retained receipts before any delivery.
+            strict_targets: Raise ``MeshError`` for missing targets. With
+                ``False``, missing targets are recorded in the result and skipped.
+        """
+        if verify:
+            for receipt in self._receipts:
+                if not receipt.verify():
+                    raise _receipt_mismatch_error(receipt)
+
+        allowed_actions = set(actions or self.replayable_actions)
+        result = ReplayResult()
+        for index, receipt in enumerate(self._receipts):
+            if receipt.action not in allowed_actions:
+                result.skipped += 1
+                result.deliveries.append(
+                    ReplayDelivery(
+                        receipt_index=index,
+                        action=receipt.action,
+                        trace_id=receipt.trace_id,
+                        signal_id=receipt.signal_id,
+                        signal_type=receipt.signal_type,
+                        target=receipt.target,
+                        status="skipped",
+                        reason="action_not_replayable",
+                    )
+                )
+                continue
+
+            result.attempted += 1
+            if not receipt.target:
+                if strict_targets:
+                    raise MeshError(
+                        f"Cannot replay {receipt.action!r}: receipt has no target"
+                    )
+                result.missing_targets.append("")
+                result.skipped += 1
+                result.failed += 1
+                result.deliveries.append(
+                    ReplayDelivery(
+                        receipt_index=index,
+                        action=receipt.action,
+                        trace_id=receipt.trace_id,
+                        signal_id=receipt.signal_id,
+                        signal_type=receipt.signal_type,
+                        target=receipt.target,
+                        status="failed",
+                        reason="missing_target",
+                    )
+                )
+                continue
+
+            try:
+                target = mesh.get(receipt.target)
+            except MeshError:
+                if strict_targets:
+                    raise
+                result.missing_targets.append(receipt.target)
+                result.skipped += 1
+                result.failed += 1
+                result.deliveries.append(
+                    ReplayDelivery(
+                        receipt_index=index,
+                        action=receipt.action,
+                        trace_id=receipt.trace_id,
+                        signal_id=receipt.signal_id,
+                        signal_type=receipt.signal_type,
+                        target=receipt.target,
+                        status="failed",
+                        reason="missing_target",
+                    )
+                )
+                continue
+
+            signal = receipt.to_signal(strict=strict)
+            record_event = getattr(mesh, "_record_event", None)
+            if record_event is not None:
+                replay_event = record_event(
+                    "replay_delivered",
+                    signal,
+                    source="mesh",
+                    target=receipt.target,
+                    original_action=receipt.action,
+                    original_source=receipt.source,
+                    original_signal_id=receipt.signal_id,
+                )
+                if isawaitable(replay_event):
+                    await replay_event
+            await target.inbox.send(signal)
+            result.delivered += 1
+            result.receipts.append(receipt)
+            result.deliveries.append(
+                ReplayDelivery(
+                    receipt_index=index,
+                    action=receipt.action,
+                    trace_id=receipt.trace_id,
+                    signal_id=receipt.signal_id,
+                    signal_type=receipt.signal_type,
+                    target=receipt.target,
+                    status="delivered",
+                )
+            )
+
+        return result
