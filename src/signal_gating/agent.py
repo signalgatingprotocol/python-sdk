@@ -177,7 +177,7 @@ class DeadLetterQueue:
     ) -> None:
         entry: dict[str, Any] = {
             "signal_id": signal.id,
-            "signal_type": type(signal).__name__,
+            "signal_type": signal.wire_type(),
             "trace_id": signal.trace_id,
             "agent": agent,
             "reason": reason,
@@ -520,7 +520,8 @@ class Agent:
         """Reply to a request signal with a correlated response.
 
         The response signal inherits the correlation ID from the original,
-        enabling the requesting agent to match it.
+        enabling the requesting agent to match it. Correlated replies also keep
+        the original trace lineage and record the request as their parent.
 
             @worker.on(TaskSignal)
             async def handle(signal: TaskSignal):
@@ -528,7 +529,11 @@ class Agent:
                 await worker.reply(signal, ResultSignal(result=result))
         """
         if original.correlation_id:
-            reply_signal = response.evolve(correlation_id=original.correlation_id)
+            reply_signal = response.evolve(
+                correlation_id=original.correlation_id,
+                trace_id=original.trace_id,
+                parent_id=original.id,
+            )
             await self.emit(reply_signal)
         else:
             await self.emit(response)

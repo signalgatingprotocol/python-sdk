@@ -1,12 +1,19 @@
 import asyncio
 import json
 
+import pytest
+
 import signal_gating
-from signal_gating import Agent, Mesh, Signal
+from signal_gating import Agent, Mesh, Signal, SignalSerializationError
 from signal_gating.trajectory import Receipt, TrajectoryRecorder
 
 
 class Ping(Signal):
+    n: int = 0
+
+
+class StablePing(Signal):
+    __signal_type__ = "tests.stable_ping"
     n: int = 0
 
 
@@ -26,6 +33,13 @@ def test_from_signal_extracts_envelope_and_domain_payload():
     assert r.priority == 3
     assert r.payload == {"n": 7}            # domain fields only; no envelope keys
     assert "trace_id" not in r.payload and "source" not in r.payload
+
+
+def test_from_signal_uses_stable_wire_type_for_audit_projection():
+    sig = StablePing(n=9)
+    r = Receipt.from_signal(sig, source="a", target="b")
+    assert r.signal_type == "tests.stable_ping"
+    assert r.wire["type"] == "tests.stable_ping"
 
 
 def test_digest_verifies_and_detects_tampering():
@@ -210,6 +224,42 @@ async def test_export_then_load_replays_typed_signals(tmp_path) -> None:
     assert [s.n for s in signals] == [1, 2]             # type: ignore[attr-defined]
     # Reconstructed signals match the originally captured ones, identity and all.
     assert signals == [r.to_signal() for r in recorder.receipts]
+
+
+async def test_load_jsonl_rejects_tampered_receipt_by_default(tmp_path) -> None:
+    recorder = TrajectoryRecorder()
+    recorder._receipts.append(Receipt.from_signal(Ping(n=1), "a", "b"))  # type: ignore[attr-defined]
+    out = tmp_path / "runs.jsonl"
+    recorder.export_jsonl(out)
+
+    line = json.loads(out.read_text(encoding="utf-8"))
+    line["wire"]["data"]["n"] = 999
+    out.write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    reloaded = TrajectoryRecorder()
+    with pytest.raises(SignalSerializationError, match="receipt digest mismatch"):
+        reloaded.load_jsonl(out)
+    assert reloaded.receipts == []
+
+
+async def test_replay_rejects_tampered_receipts_by_default(tmp_path) -> None:
+    recorder = TrajectoryRecorder()
+    recorder._receipts.append(Receipt.from_signal(Ping(n=1), "a", "b"))  # type: ignore[attr-defined]
+    out = tmp_path / "runs.jsonl"
+    recorder.export_jsonl(out)
+
+    line = json.loads(out.read_text(encoding="utf-8"))
+    line["payload"]["n"] = 999
+    out.write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    reloaded = TrajectoryRecorder()
+    assert reloaded.load_jsonl(out, verify=False) == 1
+    with pytest.raises(SignalSerializationError, match="receipt digest mismatch"):
+        reloaded.replay()
+    signals = reloaded.replay(verify=False)
+    assert len(signals) == 1
+    assert isinstance(signals[0], Ping)
+    assert signals[0].n == 1
 
 
 def test_replay_unknown_type_strict_then_lenient():

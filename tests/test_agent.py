@@ -354,19 +354,26 @@ async def test_agent_request_response():
 
     requester = Agent("requester")
     responder = Agent("responder")
+    seen_request: TaskSignal | None = None
 
     @responder.on(TaskSignal)
     async def handle(signal: TaskSignal):
+        nonlocal seen_request
+        seen_request = signal
         await responder.reply(signal, ResultSignal(result=f"done:{signal.task}"))
 
     mesh = Mesh([requester, responder])
     mesh.connect(requester, responder)
     mesh.connect(responder, requester)  # Return path
+    request = TaskSignal(task="analyze")
 
     async with mesh:
-        response = await requester.request(TaskSignal(task="analyze"), timeout=2.0)
+        response = await requester.request(request, timeout=2.0)
         assert isinstance(response, ResultSignal)
         assert response.result == "done:analyze"
+        assert response.trace_id == request.trace_id
+        assert seen_request is not None
+        assert response.parent_id == seen_request.id
 
 
 async def test_agent_request_timeout():
