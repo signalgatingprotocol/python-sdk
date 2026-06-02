@@ -7,7 +7,7 @@ import heapq
 from collections.abc import AsyncIterator
 from typing import Generic, TypeVar
 
-from signal_gating.errors import ChannelClosed, ChannelFull
+from signal_gating.errors import ChannelClosed, ChannelFull, SignalValidationError
 from signal_gating.signal import Signal
 
 T = TypeVar("T", bound=Signal)
@@ -52,6 +52,7 @@ class Channel(Generic[T]):
         """Send a signal into the channel. Raises ChannelFull if buffer is full."""
         if self._closed:
             raise ChannelClosed()
+        self._validate_type(signal)
         try:
             self._queue.put_nowait(signal)
         except asyncio.QueueFull:
@@ -65,6 +66,7 @@ class Channel(Generic[T]):
         """
         if self._closed:
             raise ChannelClosed()
+        self._validate_type(signal)
         if timeout is not None:
             await asyncio.wait_for(self._queue.put(signal), timeout=timeout)
         else:
@@ -139,6 +141,12 @@ class Channel(Generic[T]):
                 signals.append(self._queue.get_nowait())
             except asyncio.QueueEmpty:
                 return signals
+
+    def _validate_type(self, signal: T) -> None:
+        if self.signal_type is not None and not isinstance(signal, self.signal_type):
+            raise SignalValidationError(
+                f"Channel expected {self.signal_type.__name__}, got {type(signal).__name__}"
+            )
 
     @staticmethod
     async def merge(*channels: Channel[T]) -> AsyncIterator[T]:
@@ -218,6 +226,7 @@ class PriorityChannel(Generic[T]):
         """Send a signal into the priority channel."""
         if self._closed:
             raise ChannelClosed()
+        self._validate_type(signal)
         async with self._lock:
             if self._max_size and len(self._heap) >= self._max_size:
                 raise ChannelFull()
@@ -252,6 +261,7 @@ class PriorityChannel(Generic[T]):
         """
         if self._closed:
             raise ChannelClosed()
+        self._validate_type(signal)
 
         async def _wait_and_send() -> None:
             while True:
@@ -312,3 +322,10 @@ class PriorityChannel(Generic[T]):
             self._has_items.clear()
             self._has_space.set()
             return signals
+
+    def _validate_type(self, signal: T) -> None:
+        if self.signal_type is not None and not isinstance(signal, self.signal_type):
+            raise SignalValidationError(
+                f"PriorityChannel expected {self.signal_type.__name__}, "
+                f"got {type(signal).__name__}"
+            )

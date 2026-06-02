@@ -23,9 +23,21 @@ class GateRejected(SignalGatingError):
 class ChannelClosed(SignalGatingError):
     """Attempted to send/receive on a closed channel."""
 
+    def __init__(self, message: str = ""):
+        super().__init__(
+            message
+            or "Channel is closed; create a new channel or check channel.closed before sending."
+        )
+
 
 class ChannelFull(SignalGatingError):
     """Channel buffer is full and would block."""
+
+    def __init__(self, message: str = ""):
+        super().__init__(
+            message
+            or "Channel buffer is full; use send_wait() or increase buffer_size."
+        )
 
 
 class AgentError(SignalGatingError):

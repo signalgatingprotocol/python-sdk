@@ -72,6 +72,43 @@ class ToolSpec:
     parameters: dict[str, Any] = field(default_factory=dict)
     fn: ToolFn | None = field(default=None, repr=False)
 
+
+def _matches_tool_type(value: Any, type_name: str) -> bool:
+    if type_name in ("str", "string"):
+        return isinstance(value, str)
+    if type_name in ("int", "integer"):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if type_name in ("float", "number"):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if type_name in ("bool", "boolean"):
+        return isinstance(value, bool)
+    if type_name in ("dict", "object"):
+        return isinstance(value, dict)
+    if type_name in ("list", "array"):
+        return isinstance(value, list)
+    return True
+
+
+def _validate_tool_arguments(spec: ToolSpec, arguments: dict[str, Any]) -> str:
+    for name in arguments:
+        if name not in spec.parameters:
+            return f"unexpected argument {name!r}"
+
+    for name, meta in spec.parameters.items():
+        if meta.get("required") and name not in arguments:
+            return f"missing required argument {name!r}"
+        if name not in arguments:
+            continue
+        raw_type = meta.get("type")
+        if not isinstance(raw_type, str):
+            continue
+        if not _matches_tool_type(arguments[name], raw_type):
+            got = type(arguments[name]).__name__
+            return f"argument {name!r} expected {raw_type}, got {got}"
+
+    return ""
+
+
 logger = logging.getLogger("signal_gating.agent")
 
 
@@ -854,6 +891,13 @@ class Agent:
                             error=f"Unknown tool: {signal.tool_name}",
                         ))
                         return
+                    validation_error = _validate_tool_arguments(tool, signal.arguments)
+                    if validation_error:
+                        await ctx.reply(ToolResultSignal(
+                            tool_name=signal.tool_name,
+                            error=f"Invalid arguments: {validation_error}",
+                        ))
+                        return
                     try:
                         result = tool.fn(**signal.arguments)
                         if isawaitable(result):
@@ -891,15 +935,14 @@ class Agent:
         return self._tools.get(name)
 
     def tools_schema(self) -> list[dict[str, Any]]:
-        """Export all tools as a JSON-serializable schema.
+        """Export all tools as an SGP-native JSON-serializable schema.
 
-        This is designed to be directly usable as the ``tools`` parameter
-        in LLM API calls. Each tool's parameter types and descriptions
-        are extracted from the function signature and docstring.
+        Each tool's parameter types and descriptions are extracted from the
+        function signature and docstring. For OpenAI-compatible function-tool
+        schemas, use ``MeshToolProvider(mesh).tool_schemas()``.
 
-            # Feed directly to an LLM
+            # Inspect tools exposed by this agent
             schema = agent.tools_schema()
-            response = await llm.complete(messages, tools=schema)
         """
         return [
             {

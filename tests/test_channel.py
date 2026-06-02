@@ -4,8 +4,16 @@ import asyncio
 
 import pytest
 
-from signal_gating import Channel, ChannelClosed, ChannelFull, Signal
+from signal_gating import Channel, ChannelClosed, ChannelFull, Signal, SignalValidationError
 from signal_gating.channel import PriorityChannel
+
+
+class Ping(Signal):
+    n: int = 0
+
+
+class Pong(Signal):
+    n: int = 0
 
 
 async def test_send_receive():
@@ -33,15 +41,27 @@ async def test_bounded_channel():
     ch: Channel[Signal] = Channel(Signal, buffer_size=2)
     await ch.send(Signal())
     await ch.send(Signal())
-    with pytest.raises(ChannelFull):
+    with pytest.raises(ChannelFull, match="send_wait"):
         await ch.send(Signal())
 
 
 async def test_closed_channel_send():
     ch: Channel[Signal] = Channel(Signal)
     ch.close()
-    with pytest.raises(ChannelClosed):
+    with pytest.raises(ChannelClosed, match="closed"):
         await ch.send(Signal())
+
+
+async def test_channel_enforces_signal_type():
+    ch: Channel[Ping] = Channel(Ping)
+    with pytest.raises(SignalValidationError, match="expected Ping, got Pong"):
+        await ch.send(Pong())  # type: ignore[arg-type]
+
+
+async def test_channel_send_wait_enforces_signal_type():
+    ch: Channel[Ping] = Channel(Ping)
+    with pytest.raises(SignalValidationError, match="expected Ping, got Pong"):
+        await ch.send_wait(Pong())  # type: ignore[arg-type]
 
 
 async def test_try_receive_empty():
@@ -130,15 +150,27 @@ async def test_priority_channel_bounded():
     ch: PriorityChannel[Signal] = PriorityChannel(Signal, buffer_size=2)
     await ch.send(Signal())
     await ch.send(Signal())
-    with pytest.raises(ChannelFull):
+    with pytest.raises(ChannelFull, match="send_wait"):
         await ch.send(Signal())
 
 
 async def test_priority_channel_closed():
     ch: PriorityChannel[Signal] = PriorityChannel(Signal)
     ch.close()
-    with pytest.raises(ChannelClosed):
+    with pytest.raises(ChannelClosed, match="closed"):
         await ch.send(Signal())
+
+
+async def test_priority_channel_enforces_signal_type():
+    ch: PriorityChannel[Ping] = PriorityChannel(Ping)
+    with pytest.raises(SignalValidationError, match="expected Ping, got Pong"):
+        await ch.send(Pong())  # type: ignore[arg-type]
+
+
+async def test_priority_channel_send_wait_enforces_signal_type():
+    ch: PriorityChannel[Ping] = PriorityChannel(Ping)
+    with pytest.raises(SignalValidationError, match="expected Ping, got Pong"):
+        await ch.send_wait(Pong())  # type: ignore[arg-type]
 
 
 async def test_priority_channel_iteration():
