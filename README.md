@@ -22,6 +22,12 @@ For OpenTelemetry export:
 pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
+For Claude Agent SDK integrations:
+
+```bash
+pip install "signal-gating[claude] @ git+https://github.com/signalgatingprotocol/python-sdk"
+```
+
 For local development from a checkout:
 
 ```bash
@@ -342,7 +348,7 @@ result = await pipeline.process(signal)
 
 Finance-like agent meshes need controls that generic task examples do not
 stress: event-time freshness, sequence monotonicity, quote sanity, edge after
-slippage, and notional limits. The SDK keeps those as domain helpers in
+slippage, per-order notional limits, and cumulative exposure budgets. The SDK keeps those as domain helpers in
 `signal_gating.finance` so they compose with ordinary gates without expanding
 the generic protocol surface:
 
@@ -368,8 +374,9 @@ tick = MarketTick(
 
 `MarketDecision` and `MarketGate.decision_edge()` add a second control layer for
 execution-facing signals: only decisions with enough net edge after expected
-slippage and enough confidence pass. `MarketGate.notional_limit()` bounds the
-capital exposed by an execution path. See
+slippage and enough confidence pass. `MarketGate.notional_limit()` bounds a
+single order, while `MarketGate.exposure_limit()` bounds cumulative gross or net
+exposure for a symbol/venue key, optionally over a rolling window. See
 `examples/financial_physics_mesh.py` for an offline, deterministic market-signal
 mesh with trajectory receipts.
 
@@ -476,6 +483,37 @@ mesh.add(planner)
 ```
 
 The loop is bounded by `max_tool_rounds` (default 4).
+
+### Claude Agent SDK integration
+
+`ClaudeAgent` delegates a mesh agent's work to the Claude Agent SDK while keeping
+the SGP boundary typed and replay-aware:
+
+```python
+from signal_gating import ClaudeAgent, ClaudeAgentRunSignal, Mesh
+
+claude = ClaudeAgent(
+    "claude_worker",
+    allowed_tools=["Read", "Glob", "Grep"],
+    permission_mode="acceptEdits",
+)
+
+mesh = Mesh([claude, sink])
+mesh.connect(claude, sink)
+
+async with mesh:
+    await mesh.inject(claude, ClaudeAgentRunSignal(prompt="Review this module"))
+```
+
+Claude handles its own agent loop features such as built-in tools, MCP servers,
+permissions, hooks, subagents, and session transcripts. SGP handles typed signal
+routing, gates, mesh coordination, tracing, and trajectory receipts around those
+runs. `ClaudeAgentSDKRunner` is also available when you want audit-only receipts
+for a direct SDK query rather than a long-running mesh agent.
+
+This is not full Claude session replay. SGP receipts can correlate a run to the
+Claude `session_id`, but resuming the Claude transcript belongs to the Claude
+Agent SDK `resume` / `continue_conversation` / `session_store` mechanisms.
 
 ### Trajectories
 

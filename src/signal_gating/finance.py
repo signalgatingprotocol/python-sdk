@@ -9,6 +9,7 @@ limits.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import Callable
 from typing import Literal
@@ -19,6 +20,7 @@ from signal_gating.gate import Gate
 from signal_gating.signal import Signal
 
 MarketAction = Literal["buy", "sell", "hold", "cancel"]
+ExposureMode = Literal["gross", "net"]
 MarketKeyFn = Callable[[Signal], object]
 ClockFn = Callable[[], float]
 
@@ -55,15 +57,21 @@ class MarketTick(Signal):
     @field_validator("bid", "ask", "bid_size", "ask_size", "last", "last_size")
     @classmethod
     def _non_negative_float(cls, value: float | None) -> float | None:
-        if value is not None and value < 0:
-            raise ValueError("market values must be non-negative")
+        if value is not None:
+            if not math.isfinite(value):
+                raise ValueError("market values must be finite")
+            if value < 0:
+                raise ValueError("market values must be non-negative")
         return value
 
     @field_validator("event_ts")
     @classmethod
     def _event_ts_positive(cls, value: float | None) -> float | None:
-        if value is not None and value <= 0:
-            raise ValueError("event_ts must be positive")
+        if value is not None:
+            if not math.isfinite(value):
+                raise ValueError("event_ts must be finite")
+            if value <= 0:
+                raise ValueError("event_ts must be positive")
         return value
 
     @field_validator("sequence")
@@ -98,13 +106,22 @@ class MarketDecision(Signal):
     @field_validator("confidence")
     @classmethod
     def _confidence_range(cls, value: float) -> float:
-        if not 0 <= value <= 1:
+        if not math.isfinite(value) or not 0 <= value <= 1:
             raise ValueError("confidence must be between 0 and 1")
+        return value
+
+    @field_validator("expected_edge_bps")
+    @classmethod
+    def _finite_edge(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("expected_edge_bps must be finite")
         return value
 
     @field_validator("max_slippage_bps", "notional")
     @classmethod
     def _non_negative(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("value must be finite")
         if value < 0:
             raise ValueError("value must be non-negative")
         return value
@@ -266,6 +283,86 @@ class MarketGate:
 
         return Gate(fn, name=name)
 
+    @classmethod
+    def exposure_limit(
+        cls,
+        max_exposure: float,
+        *,
+        window_seconds: float | None = None,
+        mode: ExposureMode = "gross",
+        key: MarketKeyFn | None = None,
+        clock: ClockFn = time.monotonic,
+        notional_attr: str = "notional",
+        action_attr: str = "action",
+        name: str = "market_exposure_limit",
+    ) -> Gate:
+        """Drop decisions that would breach cumulative exposure for a key.
+
+        ``notional_limit`` bounds a single decision. Real execution paths also
+        need a budget over the stream: gross turnover over a window, or net
+        exposure that can be offset by sells. ``hold`` and ``cancel`` pass
+        without consuming exposure.
+        """
+        if max_exposure < 0:
+            raise ValueError("max_exposure must be >= 0")
+        if window_seconds is not None and window_seconds <= 0:
+            raise ValueError("window_seconds must be > 0")
+        if mode not in ("gross", "net"):
+            raise ValueError("mode must be 'gross' or 'net'")
+
+        key_fn = key or _market_key
+        lifetime_state: dict[object, float] = {}
+        window_state: dict[object, list[tuple[float, float]]] = {}
+        lock = asyncio.Lock()
+
+        async def fn(signal: Signal) -> Signal | None:
+            notional = _required_float_attr(signal, notional_attr)
+            if notional < 0:
+                return None
+            action = getattr(signal, action_attr, "")
+            signed_delta = _signed_notional(notional, action)
+            contribution = abs(signed_delta) if mode == "gross" else signed_delta
+            signal_key = key_fn(signal)
+
+            async with lock:
+                if window_seconds is None:
+                    current = lifetime_state.get(signal_key, 0.0)
+                    projected = current + contribution
+                    used = projected if mode == "gross" else abs(projected)
+                    if used > max_exposure:
+                        return None
+                    if contribution:
+                        lifetime_state[signal_key] = projected
+                else:
+                    now = clock()
+                    entries = window_state.setdefault(signal_key, [])
+                    cutoff = now - window_seconds
+                    entries[:] = [(t, value) for t, value in entries if t >= cutoff]
+                    current = sum(value for _, value in entries)
+                    projected = current + contribution
+                    used = projected if mode == "gross" else abs(projected)
+                    if used > max_exposure:
+                        return None
+                    if contribution:
+                        entries.append((now, contribution))
+
+            metadata: dict[str, object] = {
+                "market_exposure_key": str(signal_key),
+                "market_exposure_limit": max_exposure,
+                "market_exposure_mode": mode,
+                "market_exposure_delta": round(
+                    contribution if mode == "gross" else signed_delta,
+                    6,
+                ),
+                "market_exposure_used": round(used, 6),
+                "market_exposure_remaining": round(max_exposure - used, 6),
+            }
+            if window_seconds is not None:
+                metadata["market_exposure_window_seconds"] = window_seconds
+            return signal.with_metadata(**metadata)
+
+        return Gate(fn, name=name)
+
 
 def _market_key(signal: Signal) -> tuple[str, str, str]:
     symbol = str(getattr(signal, "symbol", type(signal).__name__))
@@ -279,17 +376,32 @@ def _optional_float_attr(signal: Signal, attr: str) -> float | None:
         return None
     if not isinstance(value, int | float):
         raise TypeError(f"{attr} must be numeric")
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{attr} must be finite")
+    return result
 
 
 def _required_float_attr(signal: Signal, attr: str) -> float:
     value = getattr(signal, attr, None)
     if not isinstance(value, int | float):
         raise TypeError(f"{attr} must be numeric")
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{attr} must be finite")
+    return result
+
+
+def _signed_notional(notional: float, action: object) -> float:
+    if action == "sell":
+        return -notional
+    if action in {"hold", "cancel"}:
+        return 0.0
+    return notional
 
 
 __all__ = [
+    "ExposureMode",
     "MarketAction",
     "MarketDecision",
     "MarketGate",

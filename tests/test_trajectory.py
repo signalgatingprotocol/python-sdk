@@ -170,6 +170,105 @@ async def test_mesh_record_captures_connected_route_without_interceptor():
     assert receipt.payload == {"n": 3}
 
 
+async def test_mesh_record_captures_content_routes_and_default_routes():
+    recorder = TrajectoryRecorder()
+    router, exact, fallback = Agent("router"), Agent("exact"), Agent("fallback")
+    seen: list[tuple[str, int]] = []
+    done = asyncio.Event()
+
+    @exact.on(Ping)
+    async def exact_sink(sig: Ping) -> None:
+        seen.append(("exact", sig.n))
+        if len(seen) == 2:
+            done.set()
+
+    @fallback.on(Ping)
+    async def fallback_sink(sig: Ping) -> None:
+        seen.append(("fallback", sig.n))
+        if len(seen) == 2:
+            done.set()
+
+    mesh = Mesh([router, exact, fallback])
+    mesh.record(recorder)
+    mesh.route(router, [(lambda s: isinstance(s, Ping) and s.n == 1, exact)], default=fallback)
+
+    async with mesh:
+        await router.emit(Ping(n=1))
+        await router.emit(Ping(n=2))
+        await asyncio.wait_for(done.wait(), timeout=3.0)
+
+    assert seen == [("exact", 1), ("fallback", 2)]
+    actions = [r.action for r in recorder.receipts]
+    assert actions == ["routed", "default_routed"]
+    assert [r.target for r in recorder.receipts] == ["exact", "fallback"]
+    assert recorder.receipts[0].metadata["route"] == "content"
+    assert recorder.receipts[0].metadata["route_index"] == 0
+    assert recorder.receipts[1].metadata["route_index"] == "default"
+
+
+async def test_mesh_record_captures_content_route_drops():
+    recorder = TrajectoryRecorder()
+    router, target = Agent("router"), Agent("target")
+
+    @target.on(Ping)
+    async def target_sink(_sig: Ping) -> None:
+        raise AssertionError("unmatched content route should not deliver")
+
+    mesh = Mesh([router, target])
+    mesh.record(recorder)
+    mesh.route(router, [(lambda _s: False, target)])
+
+    async with mesh:
+        await router.emit(Ping(n=9))
+        await asyncio.sleep(0.05)
+
+    assert len(recorder.receipts) == 1
+    receipt = recorder.receipts[0]
+    assert receipt.action == "route_dropped"
+    assert receipt.source == "router"
+    assert receipt.target == ""
+    assert receipt.metadata["route"] == "content"
+
+
+async def test_mesh_record_captures_load_balance_routes_and_gate_rejections():
+    recorder = TrajectoryRecorder()
+    dispatcher, w1, w2 = Agent("dispatcher"), Agent("w1"), Agent("w2")
+    seen: list[tuple[str, int]] = []
+    done = asyncio.Event()
+
+    @w1.on(Ping)
+    async def w1_sink(sig: Ping) -> None:
+        seen.append(("w1", sig.n))
+        if len(seen) == 2:
+            done.set()
+
+    @w2.on(Ping)
+    async def w2_sink(sig: Ping) -> None:
+        seen.append(("w2", sig.n))
+        if len(seen) == 2:
+            done.set()
+
+    mesh = Mesh([dispatcher, w1, w2])
+    mesh.record(recorder)
+    mesh.load_balance(dispatcher, [w1, w2], gate=signal_gating.Gate.by_priority(5))
+
+    async with mesh:
+        await dispatcher.emit(Ping(n=0, priority=1))
+        await dispatcher.emit(Ping(n=1, priority=5))
+        await dispatcher.emit(Ping(n=2, priority=5))
+        await asyncio.wait_for(done.wait(), timeout=3.0)
+
+    assert seen == [("w1", 1), ("w2", 2)]
+    rejected = [r for r in recorder.receipts if r.action == "edge_rejected"]
+    routed = [r for r in recorder.receipts if r.action == "routed"]
+    assert len(rejected) == 1
+    assert rejected[0].metadata["route"] == "load_balance"
+    assert rejected[0].metadata["gate"] == "priority_filter"
+    assert [r.target for r in routed] == ["w1", "w2"]
+    assert [r.metadata["route_index"] for r in routed] == [0, 1]
+    assert all(r.metadata["route"] == "load_balance" for r in routed)
+
+
 async def test_workflow_without_connect_records_mesh_requests_and_replies():
     recorder = TrajectoryRecorder()
     first, second = Agent("first"), Agent("second")

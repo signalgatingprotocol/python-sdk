@@ -250,7 +250,7 @@ class Mesh:
         tracer = self.tracer
 
         async def content_route(signal: Signal) -> None:
-            for predicate, target in resolved:
+            for route_index, (predicate, target) in enumerate(resolved):
                 if predicate(signal):
                     tracer.record(
                         trace_id=signal.trace_id,
@@ -259,6 +259,15 @@ class Mesh:
                         gate="content_route",
                         action="routed",
                         target=target.name,
+                    )
+                    await self._record_event(
+                        "routed",
+                        signal,
+                        source=src.name,
+                        target=target.name,
+                        event_kind="signal",
+                        route="content",
+                        route_index=route_index,
                     )
                     await target.inbox.send(signal)
                     return
@@ -271,7 +280,24 @@ class Mesh:
                     action="default_routed",
                     target=resolved_default.name,
                 )
+                await self._record_event(
+                    "default_routed",
+                    signal,
+                    source=src.name,
+                    target=resolved_default.name,
+                    event_kind="signal",
+                    route="content",
+                    route_index="default",
+                )
                 await resolved_default.inbox.send(signal)
+                return
+            await self._record_event(
+                "route_dropped",
+                signal,
+                source=src.name,
+                event_kind="signal",
+                route="content",
+            )
 
         src._add_output(RouteFn(fn=content_route, source=src.name, tag="content_route"))
 
@@ -299,9 +325,26 @@ class Mesh:
             if gate is not None:
                 result = await gate.process(signal)
                 if result is None:
+                    await self._record_event(
+                        "edge_rejected",
+                        signal,
+                        source=src.name,
+                        event_kind="signal",
+                        route="load_balance",
+                        gate=gate.name,
+                    )
+                    tracer.record(
+                        trace_id=signal.trace_id,
+                        signal_id=signal.id,
+                        agent=src.name,
+                        gate=gate.name,
+                        action="edge_rejected",
+                        route="load_balance",
+                    )
                     return
                 signal = result
-            target = resolved[next(index) % len(resolved)]
+            route_index = next(index) % len(resolved)
+            target = resolved[route_index]
             tracer.record(
                 trace_id=signal.trace_id,
                 signal_id=signal.id,
@@ -309,6 +352,16 @@ class Mesh:
                 gate="load_balance",
                 action="routed",
                 target=target.name,
+            )
+            await self._record_event(
+                "routed",
+                signal,
+                source=src.name,
+                target=target.name,
+                event_kind="signal",
+                route="load_balance",
+                route_index=route_index,
+                target_count=len(resolved),
             )
             await target.inbox.send(signal)
 

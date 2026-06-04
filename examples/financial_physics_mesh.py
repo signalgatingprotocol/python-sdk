@@ -8,7 +8,8 @@ shape of a market-signal control loop:
    is allowed to see.
 3. The analyst converts order-book imbalance into a decision with estimated
    edge after slippage.
-4. Risk gates admit only decisions with enough net edge and bounded notional.
+4. Risk gates admit only decisions with enough net edge, bounded notional, and
+   bounded cumulative exposure.
 5. A TrajectoryRecorder produces tamper-evident receipts for audit/replay.
 
 Run:
@@ -26,10 +27,14 @@ from signal_gating import Agent, MarketDecision, MarketGate, MarketTick, Mesh, T
 
 def priority_from_spread(tick: MarketTick) -> MarketTick:
     """Escalate tight, liquid quotes; keep wide/noisy updates low priority."""
+    if tick.bid is None or tick.ask is None:
+        return tick.evolve(priority=0)
     bid_size = tick.bid_size or 0.0
     ask_size = tick.ask_size or 0.0
-    mid = ((tick.bid or 0.0) + (tick.ask or 0.0)) / 2.0
-    spread_bps = (((tick.ask or 0.0) - (tick.bid or 0.0)) / mid) * 10_000.0
+    mid = (tick.bid + tick.ask) / 2.0
+    if mid <= 0:
+        return tick.evolve(priority=0)
+    spread_bps = ((tick.ask - tick.bid) / mid) * 10_000.0
     priority = 8 if spread_bps < 8 and bid_size + ask_size >= 1_000 else 3
     return tick.evolve(priority=priority)
 
@@ -150,7 +155,11 @@ async def main() -> None:
         risk,
         gate=MarketGate.decision_edge(min_net_edge_bps=3.0, min_confidence=0.75),
     )
-    mesh.connect(risk, executor, gate=MarketGate.notional_limit(50_000.0))
+    mesh.connect(
+        risk,
+        executor,
+        gate=MarketGate.notional_limit(50_000.0) >> MarketGate.exposure_limit(50_000.0),
+    )
 
     async with mesh:
         for tick in ticks:
