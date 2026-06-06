@@ -9,13 +9,17 @@ from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from inspect import isawaitable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 from signal_gating.errors import MeshError, SignalSerializationError
 from signal_gating.signal import Signal
 
 if TYPE_CHECKING:
     from signal_gating.mesh import Mesh
+
+ReceiptFilter: TypeAlias = str | Iterable[str] | None
+SignalTypeSelector: TypeAlias = str | type[Signal]
+SignalTypeFilter: TypeAlias = SignalTypeSelector | Iterable[SignalTypeSelector] | None
 
 # Base Signal envelope fields -- excluded from a Receipt's domain payload because
 # they are already represented as typed Receipt fields.
@@ -47,6 +51,46 @@ def _receipt_mismatch_error(receipt: Receipt) -> SignalSerializationError:
         "trajectory receipt digest mismatch for "
         f"{receipt.signal_type} {receipt.signal_id!r} "
         f"on trace {receipt.trace_id!r}"
+    )
+
+
+def _filter_values(values: ReceiptFilter) -> set[str] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        return {values}
+    return set(values)
+
+
+def _signal_type_value(value: SignalTypeSelector) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, type) and issubclass(value, Signal):
+        return value.wire_type()
+    raise TypeError("signal type filters must be strings or Signal subclasses")
+
+
+def _signal_type_filter_values(values: SignalTypeFilter) -> set[str] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        return {values}
+    if isinstance(values, type) and issubclass(values, Signal):
+        return {values.wire_type()}
+    return {_signal_type_value(value) for value in values}
+
+
+def _receipt_matches(
+    receipt: Receipt,
+    *,
+    event_kind_filter: set[str] | None = None,
+    action_filter: set[str] | None = None,
+    signal_type_filter: set[str] | None = None,
+) -> bool:
+    return (
+        (event_kind_filter is None or receipt.event_kind in event_kind_filter)
+        and (action_filter is None or receipt.action in action_filter)
+        and (signal_type_filter is None or receipt.signal_type in signal_type_filter)
     )
 
 
@@ -208,6 +252,39 @@ class TrajectoryRecorder:
     def receipts(self) -> list[Receipt]:
         return list(self._receipts)
 
+    def filter_receipts(
+        self,
+        *,
+        event_kinds: ReceiptFilter = None,
+        actions: ReceiptFilter = None,
+        signal_types: SignalTypeFilter = None,
+        verify: bool = False,
+    ) -> list[Receipt]:
+        """Return retained receipts matching all supplied audit filters.
+
+        Each filter accepts either one string or an iterable of strings. With
+        ``verify=True``, matched receipts are digest-checked before they are
+        returned.
+        """
+        event_kind_filter = _filter_values(event_kinds)
+        action_filter = _filter_values(actions)
+        signal_type_filter = _signal_type_filter_values(signal_types)
+        receipts = [
+            receipt
+            for receipt in self._receipts
+            if _receipt_matches(
+                receipt,
+                event_kind_filter=event_kind_filter,
+                action_filter=action_filter,
+                signal_type_filter=signal_type_filter,
+            )
+        ]
+        if verify:
+            for receipt in receipts:
+                if not receipt.verify():
+                    raise _receipt_mismatch_error(receipt)
+        return receipts
+
     def trajectories(self) -> dict[str, list[Receipt]]:
         """Receipts grouped by trace_id, preserving capture order within each run."""
         grouped: dict[str, list[Receipt]] = {}
@@ -215,17 +292,33 @@ class TrajectoryRecorder:
             grouped.setdefault(r.trace_id, []).append(r)
         return grouped
 
-    def export_jsonl(self, path: str | Path) -> int:
+    def export_jsonl(
+        self,
+        path: str | Path,
+        *,
+        event_kinds: ReceiptFilter = None,
+        actions: ReceiptFilter = None,
+        signal_types: SignalTypeFilter = None,
+        verify: bool = False,
+    ) -> int:
         """Write all receipts as JSON Lines. Returns the number written.
 
         Each line carries the full wire envelope, so :meth:`load_jsonl` reloads a
         verifiable trajectory and :meth:`replay` reconstructs the typed signals.
+        Optional filters export only matching receipts. With ``verify=True``,
+        selected receipts are digest-checked before the output file is opened.
         """
+        receipts = self.filter_receipts(
+            event_kinds=event_kinds,
+            actions=actions,
+            signal_types=signal_types,
+            verify=verify,
+        )
+        lines = [json.dumps(r.to_dict(), default=str) + "\n" for r in receipts]
         out = Path(path)
         with out.open("w", encoding="utf-8") as f:
-            for r in self._receipts:
-                f.write(json.dumps(r.to_dict(), default=str) + "\n")
-        return len(self._receipts)
+            f.writelines(lines)
+        return len(lines)
 
     def load_jsonl(self, path: str | Path, *, verify: bool = True) -> int:
         """Load receipts from a file written by :meth:`export_jsonl`, appending.
@@ -249,28 +342,41 @@ class TrajectoryRecorder:
         self._receipts.extend(receipts)
         return len(receipts)
 
-    def replay(self, *, strict: bool = True, verify: bool = True) -> list[Signal]:
-        """Reconstruct every captured signal as its original type, in capture order.
+    def replay(
+        self,
+        *,
+        strict: bool = True,
+        verify: bool = True,
+        event_kinds: ReceiptFilter = None,
+        actions: ReceiptFilter = None,
+        signal_types: SignalTypeFilter = None,
+    ) -> list[Signal]:
+        """Reconstruct retained signals as their original types, in capture order.
 
         The faithful counterpart to :meth:`export_jsonl`: a trajectory read off
         disk comes back as the exact typed signals that produced it, ready to
         re-run, audit, or learn from. Import the modules defining your signal
         types first so they are registered (see :meth:`Signal.from_wire`); with
         ``strict=False`` an unknown type degrades to a base ``Signal`` rather
-        than raising. By default, every receipt digest is verified before any
-        signal is reconstructed.
+        than raising. Optional filters restrict reconstruction to matching
+        receipts. By default, every selected receipt digest is verified before
+        any signal is reconstructed.
         """
-        if verify:
-            for receipt in self._receipts:
-                if not receipt.verify():
-                    raise _receipt_mismatch_error(receipt)
-        return [r.to_signal(strict=strict) for r in self._receipts]
+        receipts = self.filter_receipts(
+            event_kinds=event_kinds,
+            actions=actions,
+            signal_types=signal_types,
+            verify=verify,
+        )
+        return [r.to_signal(strict=strict) for r in receipts]
 
     async def replay_into(
         self,
         mesh: Mesh,
         *,
-        actions: Iterable[str] | None = None,
+        actions: ReceiptFilter = None,
+        event_kinds: ReceiptFilter = None,
+        signal_types: SignalTypeFilter = None,
         strict: bool = True,
         verify: bool = True,
         strict_targets: bool = True,
@@ -279,6 +385,8 @@ class TrajectoryRecorder:
         return await TrajectoryReplayRunner.from_recorder(self).replay_into(
             mesh,
             actions=actions,
+            event_kinds=event_kinds,
+            signal_types=signal_types,
             strict=strict,
             verify=verify,
             strict_targets=strict_targets,
@@ -372,17 +480,33 @@ class TrajectoryReplayRunner:
     def replayable_receipts(
         self,
         *,
-        actions: Iterable[str] | None = None,
+        actions: ReceiptFilter = None,
+        event_kinds: ReceiptFilter = None,
+        signal_types: SignalTypeFilter = None,
     ) -> list[Receipt]:
         """Return receipts this runner can deliver into a mesh."""
-        allowed = set(actions or self.replayable_actions)
-        return [receipt for receipt in self._receipts if receipt.action in allowed]
+        action_filter = _filter_values(actions)
+        allowed = set(self.replayable_actions) if action_filter is None else action_filter
+        event_kind_filter = _filter_values(event_kinds)
+        signal_type_filter = _signal_type_filter_values(signal_types)
+        return [
+            receipt
+            for receipt in self._receipts
+            if receipt.action in allowed
+            and _receipt_matches(
+                receipt,
+                event_kind_filter=event_kind_filter,
+                signal_type_filter=signal_type_filter,
+            )
+        ]
 
     async def replay_into(
         self,
         mesh: Mesh,
         *,
-        actions: Iterable[str] | None = None,
+        actions: ReceiptFilter = None,
+        event_kinds: ReceiptFilter = None,
+        signal_types: SignalTypeFilter = None,
         strict: bool = True,
         verify: bool = True,
         strict_targets: bool = True,
@@ -392,6 +516,8 @@ class TrajectoryReplayRunner:
         Args:
             mesh: The mesh with agents already registered and running.
             actions: Optional subset of replayable actions to deliver.
+            event_kinds: Optional event namespaces to include.
+            signal_types: Optional stable signal wire types to include.
             strict: Passed to :meth:`Receipt.to_signal`.
             verify: Verify all retained receipts before any delivery.
             strict_targets: Raise ``MeshError`` for missing targets. With
@@ -402,9 +528,33 @@ class TrajectoryReplayRunner:
                 if not receipt.verify():
                     raise _receipt_mismatch_error(receipt)
 
-        allowed_actions = set(actions or self.replayable_actions)
+        action_filter = _filter_values(actions)
+        allowed_actions = (
+            set(self.replayable_actions) if action_filter is None else action_filter
+        )
+        event_kind_filter = _filter_values(event_kinds)
+        signal_type_filter = _signal_type_filter_values(signal_types)
         result = ReplayResult()
         for index, receipt in enumerate(self._receipts):
+            if not _receipt_matches(
+                receipt,
+                event_kind_filter=event_kind_filter,
+                signal_type_filter=signal_type_filter,
+            ):
+                result.skipped += 1
+                result.deliveries.append(
+                    ReplayDelivery(
+                        receipt_index=index,
+                        action=receipt.action,
+                        trace_id=receipt.trace_id,
+                        signal_id=receipt.signal_id,
+                        signal_type=receipt.signal_type,
+                        target=receipt.target,
+                        status="skipped",
+                        reason="filtered",
+                    )
+                )
+                continue
             if receipt.action not in allowed_actions:
                 result.skipped += 1
                 result.deliveries.append(

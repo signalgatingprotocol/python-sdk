@@ -8,8 +8,8 @@ shape of a market-signal control loop:
    is allowed to see.
 3. The analyst converts order-book imbalance into a decision with estimated
    edge after slippage.
-4. Risk gates admit only decisions with enough net edge, bounded notional, and
-   bounded cumulative exposure.
+4. Risk gates admit only decisions with enough net edge, bounded notional,
+   bounded liquidity participation, and bounded cumulative exposure.
 5. A TrajectoryRecorder produces tamper-evident receipts for audit/replay.
 
 Run:
@@ -108,6 +108,11 @@ async def main() -> None:
         imbalance = (bid_size - ask_size) / max(bid_size + ask_size, 1.0)
         expected_edge_bps = imbalance * 10.0
         action = "buy" if expected_edge_bps > 0 else "hold"
+        liquidity_notional = 0.0
+        if action == "buy" and tick.ask is not None:
+            liquidity_notional = tick.ask * ask_size
+        elif action == "sell" and tick.bid is not None:
+            liquidity_notional = tick.bid * bid_size
         decision = MarketDecision(
             symbol=tick.symbol,
             action=action,
@@ -115,6 +120,7 @@ async def main() -> None:
             expected_edge_bps=expected_edge_bps,
             max_slippage_bps=2.0,
             notional=25_000.0,
+            liquidity_notional=liquidity_notional,
             reason=f"book_imbalance={imbalance:.3f}",
             priority=tick.priority,
             parent_id=tick.id,
@@ -133,6 +139,7 @@ async def main() -> None:
             "ACCEPTED "
             f"{decision.action.upper()} {decision.symbol} "
             f"net_edge={decision.metadata['market_net_edge_bps']:.2f}bps "
+            f"participation={decision.metadata['market_participation_rate']:.2%} "
             f"notional=${decision.notional:,.0f}"
         )
         if len(accepted) >= 2:
@@ -158,7 +165,11 @@ async def main() -> None:
     mesh.connect(
         risk,
         executor,
-        gate=MarketGate.notional_limit(50_000.0) >> MarketGate.exposure_limit(50_000.0),
+        gate=(
+            MarketGate.notional_limit(50_000.0)
+            >> MarketGate.participation_limit(0.40)
+            >> MarketGate.exposure_limit(50_000.0)
+        ),
     )
 
     async with mesh:

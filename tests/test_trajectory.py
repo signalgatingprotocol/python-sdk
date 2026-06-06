@@ -127,6 +127,111 @@ async def test_all_receipts_verify():
     assert all(r.verify() for r in recorder.receipts)
 
 
+def test_recorder_filters_receipts_by_audit_fields() -> None:
+    mesh_receipt = Receipt.from_signal(
+        Ping(n=1),
+        source="mesh",
+        target="worker",
+        event_kind="mesh",
+        action="inject",
+    )
+    auth_allowed = Receipt.from_signal(
+        StablePing(n=2),
+        source="claude_mcp_http",
+        target="",
+        event_kind="claude_mcp_http",
+        action="claude_mcp_http_auth_allowed",
+    )
+    auth_denied = Receipt.from_signal(
+        Ping(n=3),
+        source="claude_mcp_http",
+        target="",
+        event_kind="claude_mcp_http",
+        action="claude_mcp_http_auth_denied",
+    )
+    recorder = TrajectoryRecorder()
+    recorder._receipts.extend([mesh_receipt, auth_allowed, auth_denied])
+
+    assert recorder.filter_receipts() == [mesh_receipt, auth_allowed, auth_denied]
+    assert recorder.filter_receipts(event_kinds="claude_mcp_http") == [
+        auth_allowed,
+        auth_denied,
+    ]
+    assert recorder.filter_receipts(
+        event_kinds=("claude_mcp_http",),
+        actions={"claude_mcp_http_auth_denied"},
+    ) == [auth_denied]
+    assert recorder.filter_receipts(
+        event_kinds=(value for value in ["claude_mcp_http"]),
+        actions=(value for value in ["claude_mcp_http_auth_allowed"]),
+        signal_types=(value for value in [StablePing]),
+    ) == [auth_allowed]
+    assert recorder.filter_receipts(signal_types=StablePing) == [auth_allowed]
+    assert recorder.filter_receipts(event_kinds=()) == []
+
+
+def test_recorder_filter_verify_checks_selected_receipts_only() -> None:
+    mesh_receipt = Receipt.from_signal(
+        Ping(n=1),
+        source="mesh",
+        target="worker",
+        event_kind="mesh",
+        action="inject",
+    )
+    auth_receipt = Receipt.from_signal(
+        Ping(n=2),
+        source="claude_mcp_http",
+        target="",
+        event_kind="claude_mcp_http",
+        action="claude_mcp_http_auth_denied",
+    )
+    tampered_auth = Receipt(
+        **{**auth_receipt.to_dict(), "payload": {"n": 999}}
+    )
+    recorder = TrajectoryRecorder()
+    recorder._receipts.extend([mesh_receipt, tampered_auth])
+
+    assert recorder.filter_receipts(event_kinds="mesh", verify=True) == [mesh_receipt]
+    with pytest.raises(SignalSerializationError, match="receipt digest mismatch"):
+        recorder.filter_receipts(event_kinds="claude_mcp_http", verify=True)
+
+
+def test_recorder_replay_filters_selected_receipts() -> None:
+    mesh_receipt = Receipt.from_signal(
+        Ping(n=1),
+        source="mesh",
+        target="worker",
+        event_kind="mesh",
+        action="inject",
+    )
+    auth_allowed = Receipt.from_signal(
+        StablePing(n=2),
+        source="claude_mcp_http",
+        target="",
+        event_kind="claude_mcp_http",
+        action="claude_mcp_http_auth_allowed",
+    )
+    auth_denied = Receipt.from_signal(
+        Ping(n=3),
+        source="claude_mcp_http",
+        target="",
+        event_kind="claude_mcp_http",
+        action="claude_mcp_http_auth_denied",
+    )
+    recorder = TrajectoryRecorder()
+    recorder._receipts.extend([mesh_receipt, auth_allowed, auth_denied])
+
+    signals = recorder.replay(
+        event_kinds="claude_mcp_http",
+        actions="claude_mcp_http_auth_allowed",
+        signal_types=StablePing,
+    )
+
+    assert len(signals) == 1
+    assert isinstance(signals[0], StablePing)
+    assert signals[0].n == 2
+
+
 async def test_export_jsonl_round_trips(tmp_path) -> None:
     recorder = TrajectoryRecorder()
     await _run_relay_mesh(recorder)
@@ -136,6 +241,65 @@ async def test_export_jsonl_round_trips(tmp_path) -> None:
     assert n == len(lines) == 2
     first = json.loads(lines[0])
     assert first["source"] == "a" and first["payload"] == {"n": 1}
+
+
+def test_export_jsonl_filters_and_verifies_before_writing(tmp_path) -> None:
+    mesh_receipt = Receipt.from_signal(
+        Ping(n=1),
+        source="mesh",
+        target="worker",
+        event_kind="mesh",
+        action="inject",
+    )
+    auth_allowed = Receipt.from_signal(
+        StablePing(n=2),
+        source="claude_mcp_http",
+        target="",
+        event_kind="claude_mcp_http",
+        action="claude_mcp_http_auth_allowed",
+    )
+    auth_denied = Receipt.from_signal(
+        Ping(n=3),
+        source="claude_mcp_http",
+        target="",
+        event_kind="claude_mcp_http",
+        action="claude_mcp_http_auth_denied",
+    )
+    tampered_denied = Receipt(
+        **{**auth_denied.to_dict(), "payload": {"n": 999}}
+    )
+    recorder = TrajectoryRecorder()
+    recorder._receipts.extend([mesh_receipt, auth_allowed, tampered_denied])
+    out = tmp_path / "filtered.jsonl"
+
+    count = recorder.export_jsonl(
+        out,
+        event_kinds=(value for value in ["claude_mcp_http"]),
+        actions=(value for value in ["claude_mcp_http_auth_allowed"]),
+        signal_types=(value for value in [StablePing]),
+        verify=True,
+    )
+
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    assert count == len(lines) == 1
+    exported = json.loads(lines[0])
+    assert exported["action"] == "claude_mcp_http_auth_allowed"
+    assert exported["signal_type"] == "tests.stable_ping"
+    assert exported["event_kind"] == "claude_mcp_http"
+    assert exported["source"] == "claude_mcp_http"
+    assert exported["target"] == ""
+    assert exported["payload"] == {"n": 2}
+    assert Receipt.from_dict(exported).verify() is True
+    assert "claude_mcp_http_auth_denied" not in out.read_text(encoding="utf-8")
+    tampered_out = tmp_path / "tampered.jsonl"
+    tampered_out.write_text("keep me\n", encoding="utf-8")
+    with pytest.raises(SignalSerializationError, match="receipt digest mismatch"):
+        recorder.export_jsonl(
+            tampered_out,
+            event_kinds="claude_mcp_http",
+            verify=True,
+        )
+    assert tampered_out.read_text(encoding="utf-8") == "keep me\n"
 
 
 async def test_recorder_is_pure_observer():
@@ -638,6 +802,53 @@ async def test_replay_runner_skips_non_entry_events() -> None:
     )
 
     assert [r.action for r in runner.replayable_receipts()] == ["inject"]
+
+
+async def test_replay_runner_filters_delivery_by_event_kind_and_signal_type() -> None:
+    delivered = Receipt.from_signal(
+        Ping(n=1),
+        source="mesh",
+        target="worker",
+        event_kind="mesh",
+        action="inject",
+    )
+    filtered = Receipt.from_signal(
+        StablePing(n=2),
+        source="mesh",
+        target="worker",
+        event_kind="audit",
+        action="inject",
+    )
+    runner = TrajectoryReplayRunner([delivered, filtered])
+    worker = Agent("worker")
+    seen: list[int] = []
+
+    @worker.on(Ping)
+    async def handle(sig: Ping) -> None:
+        seen.append(sig.n)
+
+    mesh = Mesh([worker])
+
+    assert runner.replayable_receipts(
+        actions="inject",
+        event_kinds="mesh",
+        signal_types=Ping,
+    ) == [delivered]
+    async with mesh:
+        result = await runner.replay_into(
+            mesh,
+            event_kinds="mesh",
+            signal_types=Ping,
+        )
+        await asyncio.sleep(0.05)
+
+    assert result.attempted == 1
+    assert result.delivered == 1
+    assert result.skipped == 1
+    assert result.failed == 0
+    assert result.receipts == [delivered]
+    assert [delivery.reason for delivery in result.deliveries] == ["", "filtered"]
+    assert seen == [1]
 
 
 async def test_replay_runner_verifies_before_delivery() -> None:

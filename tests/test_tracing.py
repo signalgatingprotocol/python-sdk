@@ -1,8 +1,19 @@
 """Tests for signal tracing and observability."""
 
 import time
+from typing import Any
 
-from signal_gating import MeshEvent, OpenTelemetrySpanExporter, Signal, Span, SpanSink, Tracer
+import pytest
+
+from signal_gating import (
+    MeshEvent,
+    OpenTelemetryReceiptMetricsExporter,
+    OpenTelemetrySpanExporter,
+    Signal,
+    Span,
+    SpanSink,
+    Tracer,
+)
 
 
 def test_record_span():
@@ -276,6 +287,366 @@ def test_opentelemetry_exporter_uses_span_times_and_attributes():
     assert fake.last_span.end_time == 10_025_500_000
 
 
+def test_opentelemetry_receipt_metrics_exporter_uses_aggregate_metrics_only():
+    class FakeInstrument:
+        def __init__(self) -> None:
+            self.add_calls: list[tuple[int | float, dict[str, Any]]] = []
+            self.record_calls: list[tuple[int | float, dict[str, Any]]] = []
+
+        def add(self, amount: int | float, *, attributes: dict[str, Any]) -> None:
+            self.add_calls.append((amount, attributes))
+
+        def record(self, amount: int | float, *, attributes: dict[str, Any]) -> None:
+            self.record_calls.append((amount, attributes))
+
+    class FakeMeter:
+        def __init__(self) -> None:
+            self.counters: dict[str, FakeInstrument] = {}
+            self.histograms: dict[str, FakeInstrument] = {}
+
+        def create_counter(
+            self,
+            name: str,
+            *,
+            unit: str,
+            description: str,
+        ) -> FakeInstrument:
+            instrument = FakeInstrument()
+            self.counters[name] = instrument
+            assert unit
+            assert description
+            return instrument
+
+        def create_histogram(
+            self,
+            name: str,
+            *,
+            unit: str,
+            description: str,
+        ) -> FakeInstrument:
+            instrument = FakeInstrument()
+            self.histograms[name] = instrument
+            assert unit
+            assert description
+            return instrument
+
+    fake = FakeMeter()
+    exporter = OpenTelemetryReceiptMetricsExporter(meter=fake)
+    metrics = {
+        "schema": "signal-gating.receipt_metrics.v1",
+        "path": "/tmp/ordinary-trajectory-secret.jsonl",
+        "loaded_receipts": 3,
+        "matched_receipts": 2,
+        "trace_count": 1,
+        "duration_seconds": 2.5,
+        "verified": True,
+        "filters": {
+            "event_kinds": ["claude_mcp_http"],
+            "actions": ["claude_mcp_http_auth_denied"],
+            "signal_types": ["sgp.integrations.claude.mcp_http_authorization.v1"],
+        },
+        "counts": {
+            "actions": {"claude_mcp_http_auth_denied": 1},
+            "outcomes": {"denied": 1},
+            "status_codes": {"403": 1},
+            "paths": {"/mcp/ordinary-trajectory-secret": 1},
+        },
+        "presence": {
+            "bearer_token_present": 2,
+            "principal_present": 1,
+        },
+    }
+
+    exporter(metrics)
+
+    loaded_amount, loaded_attrs = fake.counters["sgp.receipts.loaded"].add_calls[0]
+    assert loaded_amount == 3
+    assert loaded_attrs["sgp.schema"] == "signal-gating.receipt_metrics.v1"
+    assert loaded_attrs["sgp.verified"] is True
+    assert loaded_attrs["sgp.filter.event_kinds"] == ("claude_mcp_http",)
+    assert fake.counters["sgp.receipts.matched"].add_calls[0][0] == 2
+    assert fake.counters["sgp.receipts.traces"].add_calls[0][0] == 1
+    assert fake.histograms["sgp.receipts.duration"].record_calls[0][0] == 2.5
+
+    count_calls = fake.counters["sgp.receipts.count"].add_calls
+    assert (
+        1,
+        {
+            **loaded_attrs,
+            "sgp.dimension": "actions",
+            "sgp.value": "claude_mcp_http_auth_denied",
+        },
+    ) in count_calls
+    assert (
+        1,
+        {
+            **loaded_attrs,
+            "sgp.dimension": "outcomes",
+            "sgp.value": "denied",
+        },
+    ) in count_calls
+    assert fake.counters["sgp.receipts.presence"].add_calls == [
+        (2, {**loaded_attrs, "sgp.presence": "bearer_token_present"}),
+        (1, {**loaded_attrs, "sgp.presence": "principal_present"}),
+    ]
+    exported = repr({
+        name: instrument.add_calls for name, instrument in fake.counters.items()
+    }) + repr({
+        name: instrument.record_calls for name, instrument in fake.histograms.items()
+    })
+    assert "ordinary-trajectory-secret" not in exported
+    assert "paths" not in exported
+
+
+def test_opentelemetry_receipt_metrics_exporter_can_include_paths_explicitly():
+    class FakeInstrument:
+        def __init__(self) -> None:
+            self.add_calls: list[tuple[int | float, dict[str, Any]]] = []
+
+        def add(self, amount: int | float, *, attributes: dict[str, Any]) -> None:
+            self.add_calls.append((amount, attributes))
+
+    class FakeMeter:
+        def __init__(self) -> None:
+            self.counters: dict[str, FakeInstrument] = {}
+
+        def create_counter(
+            self,
+            name: str,
+            *,
+            unit: str,
+            description: str,
+        ) -> FakeInstrument:
+            instrument = FakeInstrument()
+            self.counters[name] = instrument
+            return instrument
+
+        def create_histogram(
+            self,
+            name: str,
+            *,
+            unit: str,
+            description: str,
+        ) -> FakeInstrument:
+            return FakeInstrument()
+
+    fake = FakeMeter()
+    exporter = OpenTelemetryReceiptMetricsExporter(
+        meter=fake,
+        include_path_values=True,
+    )
+
+    exporter({
+        "schema": "signal-gating.receipt_metrics.v1",
+        "loaded_receipts": 1,
+        "matched_receipts": 1,
+        "trace_count": 1,
+        "verified": True,
+        "filters": {},
+        "counts": {"paths": {"/mcp": 1}},
+        "presence": {},
+    })
+
+    assert (
+        1,
+        {
+            "sgp.schema": "signal-gating.receipt_metrics.v1",
+            "sgp.verified": True,
+            "sgp.dimension": "paths",
+            "sgp.value": "/mcp",
+        },
+    ) in fake.counters["sgp.receipts.count"].add_calls
+
+
+def test_opentelemetry_receipt_metrics_exporter_caps_path_values():
+    class FakeInstrument:
+        def __init__(self) -> None:
+            self.add_calls: list[tuple[int | float, dict[str, Any]]] = []
+
+        def add(self, amount: int | float, *, attributes: dict[str, Any]) -> None:
+            self.add_calls.append((amount, attributes))
+
+    class FakeMeter:
+        def __init__(self) -> None:
+            self.counters: dict[str, FakeInstrument] = {}
+
+        def create_counter(
+            self,
+            name: str,
+            *,
+            unit: str,
+            description: str,
+        ) -> FakeInstrument:
+            instrument = FakeInstrument()
+            self.counters[name] = instrument
+            return instrument
+
+        def create_histogram(
+            self,
+            name: str,
+            *,
+            unit: str,
+            description: str,
+        ) -> FakeInstrument:
+            return FakeInstrument()
+
+    fake = FakeMeter()
+    exporter = OpenTelemetryReceiptMetricsExporter(
+        meter=fake,
+        include_path_values=True,
+        max_path_values=2,
+    )
+
+    exporter({
+        "schema": "signal-gating.receipt_metrics.v1",
+        "loaded_receipts": 7,
+        "matched_receipts": 7,
+        "trace_count": 1,
+        "verified": True,
+        "filters": {},
+        "counts": {
+            "paths": {
+                "/alpha": 3,
+                "/beta": 2,
+                "/delta": 1,
+                "/gamma": 1,
+            }
+        },
+        "presence": {},
+    })
+
+    count_calls = fake.counters["sgp.receipts.count"].add_calls
+    assert (
+        3,
+        {
+            "sgp.schema": "signal-gating.receipt_metrics.v1",
+            "sgp.verified": True,
+            "sgp.dimension": "paths",
+            "sgp.value": "/alpha",
+        },
+    ) in count_calls
+    assert (
+        2,
+        {
+            "sgp.schema": "signal-gating.receipt_metrics.v1",
+            "sgp.verified": True,
+            "sgp.dimension": "paths",
+            "sgp.value": "/beta",
+        },
+    ) in count_calls
+    assert (
+        2,
+        {
+            "sgp.schema": "signal-gating.receipt_metrics.v1",
+            "sgp.verified": True,
+            "sgp.dimension": "paths",
+            "sgp.value": "__other__",
+        },
+    ) in count_calls
+
+
+def test_opentelemetry_receipt_metrics_exporter_rejects_negative_path_cap():
+    class FakeMeter:
+        def create_counter(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("instrument creation should not run")
+
+        def create_histogram(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("instrument creation should not run")
+
+    with pytest.raises(ValueError, match="max_path_values"):
+        OpenTelemetryReceiptMetricsExporter(meter=FakeMeter(), max_path_values=-1)
+
+
+def test_opentelemetry_receipt_metrics_exporter_records_with_sdk_reader():
+    pytest.importorskip("opentelemetry.sdk.metrics")
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    meter = provider.get_meter("test_signal_gating")
+    exporter = OpenTelemetryReceiptMetricsExporter(meter=meter)
+
+    exporter({
+        "schema": "signal-gating.receipt_metrics.v1",
+        "loaded_receipts": 3,
+        "matched_receipts": 2,
+        "trace_count": 1,
+        "duration_seconds": 2.5,
+        "verified": True,
+        "filters": {
+            "event_kinds": ["claude_mcp_http"],
+            "actions": ["claude_mcp_http_auth_denied"],
+            "signal_types": ["sgp.integrations.claude.mcp_http_authorization.v1"],
+        },
+        "counts": {
+            "actions": {"claude_mcp_http_auth_denied": 1},
+            "outcomes": {"denied": 1},
+            "paths": {"/secret": 1},
+        },
+        "presence": {"bearer_token_present": 2},
+    })
+
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+    metrics = {
+        metric.name: metric
+        for resource_metrics in metrics_data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+    }
+
+    assert set(metrics) == {
+        "sgp.receipts.loaded",
+        "sgp.receipts.matched",
+        "sgp.receipts.traces",
+        "sgp.receipts.count",
+        "sgp.receipts.presence",
+        "sgp.receipts.duration",
+    }
+    loaded_dp = metrics["sgp.receipts.loaded"].data.data_points[0]
+    loaded_attrs = dict(loaded_dp.attributes)
+    assert loaded_dp.value == 3
+    assert loaded_attrs["sgp.schema"] == "signal-gating.receipt_metrics.v1"
+    assert loaded_attrs["sgp.verified"] is True
+    assert loaded_attrs["sgp.filter.event_kinds"] == ("claude_mcp_http",)
+    assert loaded_attrs["sgp.filter.actions"] == ("claude_mcp_http_auth_denied",)
+
+    count_points = [
+        (data_point.value, dict(data_point.attributes))
+        for data_point in metrics["sgp.receipts.count"].data.data_points
+    ]
+    assert (
+        1,
+        {
+            **loaded_attrs,
+            "sgp.dimension": "actions",
+            "sgp.value": "claude_mcp_http_auth_denied",
+        },
+    ) in count_points
+    assert (
+        1,
+        {
+            **loaded_attrs,
+            "sgp.dimension": "outcomes",
+            "sgp.value": "denied",
+        },
+    ) in count_points
+    assert all(attrs.get("sgp.dimension") != "paths" for _, attrs in count_points)
+
+    presence_dp = metrics["sgp.receipts.presence"].data.data_points[0]
+    assert presence_dp.value == 2
+    assert dict(presence_dp.attributes) == {
+        **loaded_attrs,
+        "sgp.presence": "bearer_token_present",
+    }
+    duration_dp = metrics["sgp.receipts.duration"].data.data_points[0]
+    assert duration_dp.count == 1
+    assert duration_dp.sum == 2.5
+    assert dict(duration_dp.attributes) == loaded_attrs
+
+
 def test_exports():
     assert OpenTelemetrySpanExporter is not None
+    assert OpenTelemetryReceiptMetricsExporter is not None
     assert SpanSink is not None

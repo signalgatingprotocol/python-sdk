@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from importlib import import_module
 from typing import Any
@@ -15,6 +15,21 @@ logger = logging.getLogger("signal_gating.tracing")
 SpanSink = Callable[["Span"], None]
 _EVENT_METADATA_BLOCKLIST = frozenset({"arguments", "payload", "result", "responses", "wire"})
 _SPAN_FIELD_NAMES = frozenset({"trace_id", "signal_id", "agent", "gate", "action", "duration_ms"})
+_DEFAULT_RECEIPT_COUNT_DIMENSIONS = frozenset(
+    {
+        "event_kinds",
+        "actions",
+        "signal_types",
+        "outcomes",
+        "status_codes",
+        "reasons",
+        "methods",
+        "jsonrpc_methods",
+        "identity_binding_kinds",
+        "scope_counts",
+    }
+)
+_PATH_OVERFLOW_LABEL = "__other__"
 
 
 def _otel_attribute_value(value: Any) -> Any:
@@ -134,6 +149,177 @@ class OpenTelemetrySpanExporter:
     @staticmethod
     def _default_span_name(span: Span) -> str:
         return f"signal_gating.{span.gate}.{span.action}"
+
+
+class OpenTelemetryReceiptMetricsExporter:
+    """Export aggregate receipt metrics as OpenTelemetry metric instruments.
+
+    The exporter accepts the aggregate dictionary returned by
+    ``signal_gating.receipts_cli.build_receipt_metrics``. It intentionally does
+    not accept raw ``Receipt`` objects, because receipts carry payload, wire, and
+    metadata fields that are not safe telemetry units.
+    """
+
+    def __init__(
+        self,
+        *,
+        meter: Any | None = None,
+        meter_name: str = "signal_gating",
+        metric_namespace: str = "sgp.receipts",
+        attributes_namespace: str = "sgp",
+        included_count_dimensions: Iterable[str] | None = None,
+        include_path_values: bool = False,
+        max_path_values: int | None = 100,
+    ) -> None:
+        if max_path_values is not None and max_path_values < 0:
+            raise ValueError("max_path_values must be non-negative or None")
+        if meter is None:
+            try:
+                otel_metrics = import_module("opentelemetry.metrics")
+            except ImportError as e:  # pragma: no cover - depends on optional extra
+                raise ImportError(
+                    "OpenTelemetryReceiptMetricsExporter requires opentelemetry-api. "
+                    "Install it with: pip install 'signal-gating[otel]'"
+                ) from e
+            meter = otel_metrics.get_meter(meter_name)
+        namespace = metric_namespace.rstrip(".")
+        self._attributes_namespace = attributes_namespace.rstrip(".")
+        dimensions = set(included_count_dimensions or _DEFAULT_RECEIPT_COUNT_DIMENSIONS)
+        if include_path_values:
+            dimensions.add("paths")
+        self._included_count_dimensions = frozenset(dimensions)
+        self._max_path_values = max_path_values
+        self._loaded = meter.create_counter(
+            f"{namespace}.loaded",
+            unit="{receipt}",
+            description="Receipts loaded from an SGP trajectory metrics batch.",
+        )
+        self._matched = meter.create_counter(
+            f"{namespace}.matched",
+            unit="{receipt}",
+            description="Receipts matched by an SGP trajectory metrics batch.",
+        )
+        self._traces = meter.create_counter(
+            f"{namespace}.traces",
+            unit="{trace}",
+            description="Distinct traces represented in an SGP receipt metrics batch.",
+        )
+        self._count = meter.create_counter(
+            f"{namespace}.count",
+            unit="{receipt}",
+            description="Categorical aggregate receipt counts by approved dimension.",
+        )
+        self._presence = meter.create_counter(
+            f"{namespace}.presence",
+            unit="{receipt}",
+            description="Aggregate receipt presence-boolean totals.",
+        )
+        self._duration = meter.create_histogram(
+            f"{namespace}.duration",
+            unit="s",
+            description="Timestamp span covered by matched receipts in a metrics batch.",
+        )
+
+    def __call__(self, metrics: Mapping[str, Any]) -> None:
+        """Record one aggregate receipt metrics batch into the configured meter."""
+        attrs = self._base_attributes(metrics)
+        self._loaded.add(_metrics_int(metrics, "loaded_receipts", "loaded"), attributes=attrs)
+        self._matched.add(
+            _metrics_int(metrics, "matched_receipts", "matched"),
+            attributes=attrs,
+        )
+        self._traces.add(_metrics_int(metrics, "trace_count"), attributes=attrs)
+        duration = metrics.get("duration_seconds")
+        if isinstance(duration, int | float):
+            self._duration.record(float(duration), attributes=attrs)
+
+        counts = _metrics_mapping(metrics.get("counts"))
+        for dimension, dimension_counts in counts.items():
+            if dimension not in self._included_count_dimensions:
+                continue
+            count_map = _bounded_dimension_counts(
+                dimension,
+                _metrics_mapping(dimension_counts),
+                max_values=self._max_path_values,
+            )
+            for value, amount in count_map.items():
+                count_attrs = {
+                    **attrs,
+                    f"{self._attributes_namespace}.dimension": str(dimension),
+                    f"{self._attributes_namespace}.value": str(value),
+                }
+                self._count.add(_metrics_number(amount), attributes=count_attrs)
+
+        presence = _metrics_mapping(metrics.get("presence"))
+        for presence_field, amount in presence.items():
+            presence_attrs = {
+                **attrs,
+                f"{self._attributes_namespace}.presence": str(presence_field),
+            }
+            self._presence.add(_metrics_number(amount), attributes=presence_attrs)
+
+    def _base_attributes(self, metrics: Mapping[str, Any]) -> dict[str, Any]:
+        prefix = self._attributes_namespace
+        attrs: dict[str, Any] = {
+            f"{prefix}.schema": str(metrics.get("schema", "")),
+            f"{prefix}.verified": bool(metrics.get("verified", False)),
+        }
+        filters = _metrics_mapping(metrics.get("filters"))
+        for key in ("event_kinds", "actions", "signal_types"):
+            values = filters.get(key)
+            if isinstance(values, Iterable) and not isinstance(values, str | bytes):
+                normalized = [str(value) for value in values]
+                if normalized:
+                    attrs[f"{prefix}.filter.{key}"] = tuple(normalized)
+        return attrs
+
+
+def _metrics_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    return {}
+
+
+def _bounded_dimension_counts(
+    dimension: str,
+    counts: Mapping[str, Any],
+    *,
+    max_values: int | None,
+) -> dict[str, int | float]:
+    if dimension != "paths" or max_values is None or len(counts) <= max_values:
+        return {str(value): _metrics_number(amount) for value, amount in counts.items()}
+    ordered = sorted(
+        ((str(value), _metrics_number(amount)) for value, amount in counts.items()),
+        key=lambda item: (-item[1], item[0]),
+    )
+    retained = dict(ordered[:max_values])
+    overflow = sum(amount for _, amount in ordered[max_values:])
+    if overflow:
+        retained[_PATH_OVERFLOW_LABEL] = overflow
+    return retained
+
+
+def _metrics_number(value: Any) -> int | float:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int | float):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                return 0
+    return 0
+
+
+def _metrics_int(metrics: Mapping[str, Any], *keys: str) -> int:
+    for key in keys:
+        if key in metrics and metrics[key] is not None:
+            return int(_metrics_number(metrics[key]))
+    return 0
 
 
 class Tracer:

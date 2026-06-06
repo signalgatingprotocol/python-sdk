@@ -25,7 +25,14 @@ The recorder captures signal-carrying mesh events as tamper-evident `Receipt` ob
 ## Non-goals
 
 - No full workflow/session replay engine. `TrajectoryReplayRunner.replay_into(mesh)` re-delivers selected recorded entry signals into a configured mesh; it does not recreate futures, workflow loops, agent state, filesystem state, LLM context, or Claude Agent SDK sessions.
-- No MCP adapter yet. SGP tools are native mesh tools and OpenAI-compatible function schemas through `MeshToolProvider`.
+- No bundled HTTP server, SSE stream, or resumable HTTP event store yet. SGP
+  tools are native mesh tools, OpenAI-compatible function schemas through
+  `MeshToolProvider`, MCP-shaped Claude tool payloads through
+  `ClaudeMeshMCPAdapter`, newline-delimited stdio serving through
+  `ClaudeMeshMCPStdioServer` / `signal-gating-mcp`, and non-SSE Streamable HTTP
+  JSON responses through the dependency-free ASGI `ClaudeMeshMCPHTTPApp`,
+  including optional bearer authorization and OAuth Protected Resource Metadata
+  discovery. SSE streams and resumable HTTP event storage remain future work.
 - No change to signal wire format: signals still serialize as `{"sgp": 1, "type": ..., "data": ...}`.
 - No storage dependency. JSONL remains the durable boundary.
 
@@ -57,6 +64,17 @@ class MeshEvent:
 - `wire`: the full signal wire envelope for reconstructing the typed signal.
 
 The digest covers the event fields, payload projection, and wire envelope. Legacy hop receipts without event fields still verify when they carry the default `event_kind="signal"`, `action="hop"`, and empty metadata.
+
+Receipts are filterable by `event_kind`, `action`, and stable `signal_type`
+through `TrajectoryRecorder.filter_receipts(...)`, filtered
+`TrajectoryRecorder.export_jsonl(...)`, and filtered `TrajectoryRecorder.replay(...)`;
+`signal_type` filters may use the stable wire-type string or the `Signal`
+subclass. Audit and metrics consumers should filter on those fields plus
+sanitized payload values. Delivery replay remains separate:
+`TrajectoryReplayRunner` only re-delivers replayable entry actions and skips
+audit/control receipts. Export filtering is namespace selection, not payload
+redaction; consumers should only persist narrowed streams whose receipt payloads
+are already safe for the destination.
 
 ## Recorded Actions
 

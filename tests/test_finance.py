@@ -22,6 +22,13 @@ def test_market_decision_validates_confidence() -> None:
         MarketDecision(symbol="AAPL", action="buy", confidence=1.2)
 
 
+def test_market_decision_validates_liquidity_notional() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        MarketDecision(symbol="AAPL", action="buy", liquidity_notional=float("nan"))
+    with pytest.raises(ValueError, match="non-negative"):
+        MarketDecision(symbol="AAPL", action="buy", liquidity_notional=-1.0)
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
 def test_market_tick_rejects_non_finite_market_values(value: float) -> None:
     with pytest.raises(ValueError, match="finite"):
@@ -159,6 +166,93 @@ async def test_market_notional_limit_rejects_budget_breaches() -> None:
     assert small_result is not None
     assert small_result.metadata["market_notional_limit"] == 50_000.0
     assert await gate.process(large) is None
+
+
+async def test_market_participation_limit_enriches_and_rejects_illiquid_orders() -> None:
+    gate = MarketGate.participation_limit(0.40)
+
+    liquid = MarketDecision(
+        symbol="AAPL",
+        action="buy",
+        notional=25_000.0,
+        liquidity_notional=80_000.0,
+    )
+    illiquid = MarketDecision(
+        symbol="AAPL",
+        action="buy",
+        notional=40_001.0,
+        liquidity_notional=100_000.0,
+    )
+
+    result = await gate.process(liquid)
+
+    assert result is not None
+    assert result.metadata["market_liquidity_notional"] == 80_000.0
+    assert result.metadata["market_participation_limit"] == 0.40
+    assert result.metadata["market_participation_rate"] == 0.3125
+    assert result.metadata["market_participation_remaining"] == 0.0875
+    assert await gate.process(illiquid) is None
+
+
+async def test_market_participation_limit_passes_control_actions_without_liquidity() -> None:
+    gate = MarketGate.participation_limit(0.01)
+
+    hold = MarketDecision(symbol="AAPL", action="hold")
+    cancel = MarketDecision(symbol="AAPL", action="cancel")
+
+    assert await gate.process(hold) is hold
+    assert await gate.process(cancel) is cancel
+
+
+async def test_market_participation_limit_can_read_liquidity_from_metadata_or_callable() -> None:
+    class RawDecision(Signal):
+        action: str
+        notional: float
+        displayed_depth: float = 0.0
+
+    metadata_gate = MarketGate.participation_limit(0.50)
+    callable_gate = MarketGate.participation_limit(
+        0.50,
+        liquidity=lambda signal: signal.displayed_depth,
+    )
+    metadata_signal = Signal(metadata={
+        "action": "buy",
+        "notional": 20_000.0,
+        "liquidity_notional": 50_000.0,
+    })
+    callable_signal = RawDecision(
+        action="sell",
+        notional=10_000.0,
+        displayed_depth=25_000.0,
+    )
+
+    metadata_result = await metadata_gate.process(metadata_signal)
+    callable_result = await callable_gate.process(callable_signal)
+
+    assert metadata_result is not None
+    assert metadata_result.metadata["market_participation_rate"] == 0.4
+    assert callable_result is not None
+    assert callable_result.metadata["market_liquidity_notional"] == 25_000.0
+    assert callable_result.metadata["market_participation_rate"] == 0.4
+
+
+async def test_market_participation_limit_rejects_zero_and_non_finite_liquidity() -> None:
+    gate = MarketGate.participation_limit(0.40)
+
+    zero = MarketDecision(
+        symbol="AAPL",
+        action="buy",
+        notional=1.0,
+        liquidity_notional=0.0,
+    )
+
+    assert await gate.process(zero) is None
+    with pytest.raises(ValueError, match="liquidity_notional must be finite"):
+        await gate.process(Signal(metadata={
+            "action": "buy",
+            "notional": 1.0,
+            "liquidity_notional": float("inf"),
+        }))
 
 
 async def test_market_exposure_limit_tracks_cumulative_gross_exposure_by_key() -> None:

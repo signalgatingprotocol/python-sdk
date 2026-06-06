@@ -22,6 +22,7 @@ from signal_gating.signal import Signal
 MarketAction = Literal["buy", "sell", "hold", "cancel"]
 ExposureMode = Literal["gross", "net"]
 MarketKeyFn = Callable[[Signal], object]
+MarketLiquidityFn = Callable[[Signal], float]
 ClockFn = Callable[[], float]
 
 
@@ -93,6 +94,7 @@ class MarketDecision(Signal):
     expected_edge_bps: float = 0.0
     max_slippage_bps: float = 0.0
     notional: float = 0.0
+    liquidity_notional: float | None = None
     reason: str = ""
 
     @field_validator("symbol")
@@ -120,6 +122,17 @@ class MarketDecision(Signal):
     @field_validator("max_slippage_bps", "notional")
     @classmethod
     def _non_negative(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("value must be finite")
+        if value < 0:
+            raise ValueError("value must be non-negative")
+        return value
+
+    @field_validator("liquidity_notional")
+    @classmethod
+    def _optional_non_negative(cls, value: float | None) -> float | None:
+        if value is None:
+            return value
         if not math.isfinite(value):
             raise ValueError("value must be finite")
         if value < 0:
@@ -284,6 +297,64 @@ class MarketGate:
         return Gate(fn, name=name)
 
     @classmethod
+    def participation_limit(
+        cls,
+        max_participation: float,
+        *,
+        liquidity: MarketLiquidityFn | None = None,
+        liquidity_attr: str = "liquidity_notional",
+        notional_attr: str = "notional",
+        action_attr: str = "action",
+        name: str = "market_participation_limit",
+    ) -> Gate:
+        """Drop orders that are too large for available liquidity.
+
+        A notional cap says how much capital this path may spend. A
+        participation cap says whether the order is plausible relative to the
+        visible or estimated executable liquidity. ``hold`` and ``cancel`` are
+        control actions and pass without requiring a liquidity estimate.
+        """
+        if not math.isfinite(max_participation):
+            raise ValueError("max_participation must be finite")
+        if max_participation < 0:
+            raise ValueError("max_participation must be >= 0")
+
+        def fn(signal: Signal) -> Signal | None:
+            action = getattr(signal, action_attr, "")
+            if action in {"hold", "cancel"}:
+                return signal
+
+            notional = _required_float_attr(signal, notional_attr)
+            if notional < 0:
+                return None
+            if liquidity is None:
+                liquidity_notional = _required_float_attr(signal, liquidity_attr)
+            else:
+                raw_liquidity = liquidity(signal)
+                if not isinstance(raw_liquidity, int | float):
+                    raise TypeError("liquidity must be numeric")
+                liquidity_notional = float(raw_liquidity)
+                if not math.isfinite(liquidity_notional):
+                    raise ValueError("liquidity must be finite")
+
+            if liquidity_notional <= 0:
+                return None
+            participation = notional / liquidity_notional
+            if participation > max_participation:
+                return None
+            return signal.with_metadata(
+                market_liquidity_notional=round(liquidity_notional, 6),
+                market_participation_limit=max_participation,
+                market_participation_rate=round(participation, 6),
+                market_participation_remaining=round(
+                    max_participation - participation,
+                    6,
+                ),
+            )
+
+        return Gate(fn, name=name)
+
+    @classmethod
     def exposure_limit(
         cls,
         max_exposure: float,
@@ -384,6 +455,8 @@ def _optional_float_attr(signal: Signal, attr: str) -> float | None:
 
 def _required_float_attr(signal: Signal, attr: str) -> float:
     value = getattr(signal, attr, None)
+    if value is None:
+        value = signal.metadata.get(attr)
     if not isinstance(value, int | float):
         raise TypeError(f"{attr} must be numeric")
     result = float(value)
@@ -406,5 +479,6 @@ __all__ = [
     "MarketDecision",
     "MarketGate",
     "MarketKeyFn",
+    "MarketLiquidityFn",
     "MarketTick",
 ]

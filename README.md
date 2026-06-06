@@ -328,8 +328,10 @@ schema = analyst.tools_schema()
 ```
 
 `MeshToolProvider` converts these tools into OpenAI-compatible function-tool
-schemas. It is not an MCP adapter; direct `mesh.call_tool()` calls route through
-the mesh request path and are captured by `mesh.record(...)`.
+schemas. `ClaudeMeshMCPAdapter` exposes the same registry through MCP-shaped
+`tools/list` and `tools/call` payloads for Claude integration. Direct
+`mesh.call_tool()` calls route through the mesh request path and are captured by
+`mesh.record(...)`.
 
 ### Pipeline
 
@@ -348,9 +350,10 @@ result = await pipeline.process(signal)
 
 Finance-like agent meshes need controls that generic task examples do not
 stress: event-time freshness, sequence monotonicity, quote sanity, edge after
-slippage, per-order notional limits, and cumulative exposure budgets. The SDK keeps those as domain helpers in
-`signal_gating.finance` so they compose with ordinary gates without expanding
-the generic protocol surface:
+slippage, per-order notional limits, liquidity participation, and cumulative
+exposure budgets. The SDK keeps those as domain helpers in `signal_gating.finance`
+so they compose with ordinary gates without expanding the generic protocol
+surface:
 
 ```python
 from signal_gating import MarketGate, MarketTick
@@ -375,8 +378,10 @@ tick = MarketTick(
 `MarketDecision` and `MarketGate.decision_edge()` add a second control layer for
 execution-facing signals: only decisions with enough net edge after expected
 slippage and enough confidence pass. `MarketGate.notional_limit()` bounds a
-single order, while `MarketGate.exposure_limit()` bounds cumulative gross or net
-exposure for a symbol/venue key, optionally over a rolling window. See
+single order, `MarketGate.participation_limit()` bounds the order relative to
+visible or estimated liquidity, and `MarketGate.exposure_limit()` bounds
+cumulative gross or net exposure for a symbol/venue key, optionally over a
+rolling window. See
 `examples/financial_physics_mesh.py` for an offline, deterministic market-signal
 mesh with trajectory receipts.
 
@@ -415,6 +420,43 @@ mesh. You can also export retained spans after a run:
 ```python
 exported = tracer.export(OpenTelemetrySpanExporter())
 ```
+
+Receipt metrics can use the same optional `signal-gating[otel]` extra without
+turning raw receipts into telemetry events:
+
+```python
+from signal_gating import OpenTelemetryReceiptMetricsExporter
+from signal_gating.receipts_cli import build_receipt_metrics
+
+metrics = build_receipt_metrics("runs.jsonl", event_kinds=["claude_mcp_http"])
+OpenTelemetryReceiptMetricsExporter()(metrics)
+```
+
+The same aggregate batch is available from the receipt CLI:
+
+```bash
+signal-gating-receipts auth runs.jsonl --otel
+```
+
+`--otel` is additive: on success it exports the verified aggregate metrics
+through OpenTelemetry and still prints the same aggregate JSON summary to
+stdout.
+
+Path labels are explicit opt-in. By default, `--otel` omits raw receipt
+`payload.path` values from OpenTelemetry dimensions to avoid high-cardinality
+labels and accidental disclosure of route, tenant, file, or object identifiers.
+Use `--otel-include-paths` only for approved internal telemetry pipelines:
+
+```bash
+signal-gating-receipts auth runs.jsonl --otel --otel-include-paths --otel-max-paths 25
+```
+
+When path labels are enabled, only the top path values are exported; remaining
+path counts are folded into `sgp.value="__other__"`. The default cap is 100.
+
+The receipt metrics exporter consumes aggregate counters only. It does not read
+or export receipt `payload`, `wire`, or `metadata`, and it skips raw path values
+by default to avoid high-cardinality labels.
 
 Tracing is lightweight observability. Trajectories are the durable audit/replay
 log for signal-carrying mesh events.
@@ -490,11 +532,11 @@ The loop is bounded by `max_tool_rounds` (default 4).
 the SGP boundary typed and replay-aware:
 
 ```python
-from signal_gating import ClaudeAgent, ClaudeAgentRunSignal, Mesh
+from signal_gating import ClaudeAgent, ClaudeAgentRunSignal, ClaudeToolPolicy, Mesh
 
 claude = ClaudeAgent(
     "claude_worker",
-    allowed_tools=["Read", "Glob", "Grep"],
+    tool_policy=ClaudeToolPolicy.read_only(),
     permission_mode="acceptEdits",
 )
 
@@ -508,8 +550,196 @@ async with mesh:
 Claude handles its own agent loop features such as built-in tools, MCP servers,
 permissions, hooks, subagents, and session transcripts. SGP handles typed signal
 routing, gates, mesh coordination, tracing, and trajectory receipts around those
-runs. `ClaudeAgentSDKRunner` is also available when you want audit-only receipts
-for a direct SDK query rather than a long-running mesh agent.
+runs. `ClaudeAgentSDKRunner` records audit-only receipts for a direct one-shot
+SDK `query()`. `ClaudeAgentSDKClientSession` wraps `ClaudeSDKClient` for
+multi-turn sessions that need explicit connect/disconnect, permission-mode
+changes, model changes, MCP status/reconnect/toggle, interrupts, task stops, and
+file rewind receipts.
+
+`ClaudeToolPolicy` compiles SGP controls into Claude options: `allowed_tools`,
+`disallowed_tools`, and a `can_use_tool` callback backed by an ordinary `Gate`.
+The callback receives a `ClaudeToolRequestSignal` containing only the tool name,
+MCP server name, input key names, and safe SDK context labels/reasons, so
+permission receipts can prove policy decisions without storing raw tool inputs.
+
+`ClaudeMeshMCPAdapter` maps `mesh.discover_tools()` and `mesh.call_tool()` to
+MCP-style `initialize`, `tools/list`, and `tools/call` JSON-RPC handlers.
+`ClaudeMeshMCPStdioServer` serves that adapter over newline-delimited stdio
+JSON-RPC, writing only MCP messages to stdout.
+`ClaudeMeshMCPHTTPApp` exposes the same adapter as a dependency-free ASGI app
+for MCP Streamable HTTP POST requests that return `application/json`.
+
+For local MCP clients, install the package and point the stdio command at a
+factory in `module:attribute` form:
+
+```bash
+signal-gating-mcp my_app.mesh:build_mesh --server-name sgp
+```
+
+If the factory returns a `Mesh`, the command starts it before serving and stops
+it on EOF. If the factory returns a `ClaudeMeshMCPAdapter`, the adapter is served
+as supplied; use that form when the factory owns any custom lifecycle itself.
+Factory, mesh lifecycle, and tool stdout are redirected to stderr so stdout stays
+valid MCP JSON-RPC.
+
+For HTTP-capable MCP clients, mount the ASGI app at a single endpoint such as
+`/mcp`:
+
+```python
+from signal_gating import ClaudeMeshMCPAdapter, ClaudeMeshMCPHTTPApp, Mesh
+
+mesh = Mesh([...])
+mcp_app = ClaudeMeshMCPHTTPApp(ClaudeMeshMCPAdapter(mesh), path="/mcp")
+```
+
+`ClaudeMeshMCPHTTPApp` creates a secure `Mcp-Session-Id` on `initialize` and
+requires that header on later POST, GET, and DELETE requests. It validates
+present `Origin` headers, requires POST clients to accept both `application/json`
+and `text/event-stream`, accepts notifications with `202 Accepted`, returns
+`405` for unsupported GET SSE streams, and supports `DELETE` session
+termination with `204 No Content`. It does not add a web server dependency; mount
+it in the ASGI stack you already use. Claude Agent SDK should configure it as an
+HTTP MCP server and allow its tools explicitly:
+
+```python
+mcp_servers = {
+    "sgp": {"type": "http", "url": "https://example.com/mcp"},
+}
+allowed_tools = ["mcp__sgp__*"]
+```
+
+For protected HTTP MCP servers, pass `authorize_http` and
+`protected_resource_metadata`. The metadata helper emits the RFC 9728 JSON
+document at the well-known path derived from the MCP resource URL, for example
+`https://example.com/.well-known/oauth-protected-resource/mcp` for
+`https://example.com/mcp`, and the app advertises that URL through
+`WWW-Authenticate` on `401` responses and on explicit bearer-error challenges
+returned by the authorization hook.
+
+```python
+from signal_gating import ClaudeMCPProtectedResourceMetadata
+
+mcp_app = ClaudeMeshMCPHTTPApp(
+    ClaudeMeshMCPAdapter(mesh),
+    authorize_http=validate_access_token,
+    protected_resource_metadata=ClaudeMCPProtectedResourceMetadata(
+        resource="https://example.com/mcp",
+        authorization_servers=("https://auth.example.com",),
+        scopes_supported=("tools.call",),
+    ),
+)
+```
+
+The hook receives a `ClaudeMCPHTTPAuthorizationContext` containing the bearer
+token, origin, session id, method, path, and safe header names. It may return
+`True`, a principal string, or `ClaudeMCPHTTPAuthorizationResult`. When the hook
+is set, the app requires `Authorization: Bearer ...` on every HTTP request,
+returns `401` / `403` authorization failures, and binds each `Mcp-Session-Id` to
+the returned principal plus canonical audience, resource, and normalized scope
+set. If no principal is returned, it falls back to a SHA-256 token fingerprint
+without storing the raw token. Tokens sent through URI query strings are
+rejected. The hook is the resource-server validation point: deployments should
+validate issuer, expiry, audience/resource, and scopes.
+
+When the backing mesh has `mesh.record(...)`, HTTP auth decisions are emitted as
+`ClaudeMCPHTTPAuthorizationSignal` receipts with `event_kind="claude_mcp_http"`.
+Actions distinguish `claude_mcp_http_auth_allowed`,
+`claude_mcp_http_auth_challenged`, `claude_mcp_http_auth_denied`,
+`claude_mcp_http_auth_session_mismatch`, and
+`claude_mcp_http_auth_query_token_rejected`. The receipt payload includes
+outcome, status, method, path, reason, bearer-token presence, principal/session
+SHA-256 hashes, audience/resource presence, scope count, identity binding kind,
+and whether protected-resource metadata was advertised. It does not include raw
+bearer tokens, `Authorization` header values, raw principals, full
+`Mcp-Session-Id` values, request bodies, or tool arguments.
+
+To turn those receipts into auth metrics, filter by the Claude MCP auth event
+kind and aggregate only sanitized fields:
+
+```python
+from collections import Counter
+
+auth_receipts = recorder.filter_receipts(
+    event_kinds="claude_mcp_http",
+    signal_types="sgp.integrations.claude.mcp_http_authorization.v1",
+    verify=True,
+)
+recorder.export_jsonl(
+    "auth-receipts.jsonl",
+    event_kinds="claude_mcp_http",
+    signal_types="sgp.integrations.claude.mcp_http_authorization.v1",
+    verify=True,
+)
+
+auth_metrics = {
+    "actions": Counter(receipt.action for receipt in auth_receipts),
+    "outcomes": Counter(receipt.payload["outcome"] for receipt in auth_receipts),
+    "status_codes": Counter(receipt.payload["status_code"] for receipt in auth_receipts),
+    "reasons": Counter(receipt.payload["reason"] for receipt in auth_receipts),
+    "identity_bindings": Counter(
+        receipt.payload["identity_binding_kind"] for receipt in auth_receipts
+    ),
+    "session_bound_requests": sum(
+        1 for receipt in auth_receipts if receipt.payload["mcp_session_present"]
+    ),
+}
+```
+
+These counters are safe to export because they use statuses, reasons, counts,
+booleans, and low-cardinality categories. Use principal/session hashes for
+internal cardinality or mismatch analysis, not as public dashboard labels.
+Filtering is namespace selection, not payload redaction: export only receipt
+namespaces whose payloads are already safe for the target sink.
+
+The same aggregate view is available from the CLI:
+
+```bash
+signal-gating-receipts auth runs.jsonl --pretty
+signal-gating-receipts auth runs.jsonl --action claude_mcp_http_auth_denied --pretty
+signal-gating-receipts auth runs.jsonl --otel --pretty
+```
+
+`auth` verifies receipt digests by default and pre-filters to
+`event_kind="claude_mcp_http"` plus
+`sgp.integrations.claude.mcp_http_authorization.v1`. It emits aggregate JSON
+only: counts, presence totals, loaded/matched totals, and active filters. It
+does not print raw receipts, raw payloads, bearer tokens, principals, session
+IDs, request bodies, or tool arguments. Use `--no-verify` only for
+known-tampered forensic inspection.
+
+With `--otel`, `auth` sends only this aggregate metrics batch to
+`OpenTelemetryReceiptMetricsExporter`. It does not convert raw receipts, receipt
+`payload`, `wire`, or `metadata` into telemetry. Raw path values are omitted as
+metric dimensions unless `--otel-include-paths` is explicitly supplied; when
+enabled, `--otel-max-paths` caps the number of path labels and sends overflow to
+`__other__`.
+
+`ClaudeMCPBearerTokenValidator` is a ready-to-mount helper for that validation
+boundary. It accepts a sync or async decoder for already-verified token claims,
+checks issuer, expiry, not-before, audience, MCP resource, principal, and
+required scopes, and returns MCP-compatible `401 invalid_token` or
+`403 insufficient_scope` decisions without echoing token material. The
+`ClaudeMCPJWTBearerAuthorizer` alias exposes the same class, and
+`ClaudeMCPBearerTokenValidator.pyjwt(...)` lazy-loads `PyJWT` / JWKS support from
+the optional `signal-gating[auth]` extra, enforcing JWT access-token `typ`
+headers of `at+jwt` or `application/at+jwt` by default. For MCP deployments,
+set `audience` and `resource` to the canonical MCP resource identifier; the
+PyJWT helper uses `resource` as the default audience when `audience` is omitted.
+
+```python
+from signal_gating import ClaudeMCPBearerTokenValidator
+
+authorize_http = ClaudeMCPBearerTokenValidator.pyjwt(
+    jwks_url="https://auth.example.com/.well-known/jwks.json",
+    issuer="https://auth.example.com",
+    audience="https://example.com/mcp",
+    resource="https://example.com/mcp",
+    required_scopes=("tools.call",),
+)
+```
+
+See `examples/claude_agent_sdk_mesh.py` for an offline, deterministic Claude
+mesh example with fake SDK bindings and verifiable receipts.
 
 This is not full Claude session replay. SGP receipts can correlate a run to the
 Claude `session_id`, but resuming the Claude transcript belongs to the Claude
@@ -549,6 +779,34 @@ reloaded = TrajectoryRecorder()
 reloaded.load_jsonl("runs.jsonl")    # verifiable Receipts, after a restart
 signals = reloaded.replay()          # -> [TaskSignal, ...], original types and ids
 ```
+
+Use `filter_receipts(...)` or filtered `replay(...)` when a mixed trajectory file
+contains audit namespaces you want to inspect separately. `signal_types` accepts
+stable wire-type strings or `Signal` subclasses:
+
+```python
+auth_receipts = reloaded.filter_receipts(event_kinds="claude_mcp_http", verify=True)
+reloaded.export_jsonl("auth-receipts.jsonl", event_kinds="claude_mcp_http", verify=True)
+auth_signals = reloaded.replay(event_kinds="claude_mcp_http")
+denials = reloaded.filter_receipts(actions="claude_mcp_http_auth_denied")
+```
+
+With `verify=True`, filtered export checks the selected receipt digests before
+opening the output file.
+
+For command-line inspection of mixed JSONL exports, use `summary` with explicit
+filters:
+
+```bash
+signal-gating-receipts summary runs.jsonl \
+  --event-kind claude_mcp_http \
+  --signal-type sgp.integrations.claude.mcp_http_authorization.v1 \
+  --action claude_mcp_http_auth_session_mismatch \
+  --pretty
+```
+
+The CLI mirrors `filter_receipts(...)`: filters select receipt namespaces and
+actions; output stays aggregate-only.
 
 `TrajectoryRecorder.replay()` reconstructs signals for inspection, audit, or
 training. To deliver recorded entry events through a mesh again, use

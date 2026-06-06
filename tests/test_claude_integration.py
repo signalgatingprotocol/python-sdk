@@ -11,9 +11,14 @@ from signal_gating import (
     ClaudeAgent,
     ClaudeAgentResultSignal,
     ClaudeAgentRunSignal,
+    ClaudeAgentSDKClientSession,
     ClaudeAgentSDKRunner,
+    ClaudeAgentSDKSession,
     ClaudePermissionDecisionSignal,
     ClaudeToolEventSignal,
+    ClaudeToolPolicy,
+    ClaudeToolRequestSignal,
+    Gate,
     Mesh,
     Signal,
     TrajectoryRecorder,
@@ -68,6 +73,62 @@ def _query_with(messages: list[object], calls: list[dict[str, Any]]) -> Any:
 class _RunnerOptions:
     def __init__(self, **kwargs: Any) -> None:
         self.__dict__.update(kwargs)
+
+
+class _FakeClaudeClient:
+    def __init__(self, *, options: Any | None = None, responses: list[list[object]]) -> None:
+        self.options = options
+        self.responses = responses
+        self.connected = False
+        self.connect_prompts: list[str | None] = []
+        self.disconnect_count = 0
+        self.queries: list[tuple[str, str]] = []
+        self.permission_modes: list[str] = []
+        self.models: list[str] = []
+        self.interrupt_count = 0
+        self.reconnected_servers: list[str] = []
+        self.toggled_servers: list[tuple[str, bool]] = []
+        self.stopped_tasks: list[str] = []
+        self.rewound_messages: list[str] = []
+
+    async def connect(self, prompt: str | None = None) -> None:
+        self.connected = True
+        self.connect_prompts.append(prompt)
+
+    async def disconnect(self) -> None:
+        self.connected = False
+        self.disconnect_count += 1
+
+    async def query(self, prompt: str, *, session_id: str = "default") -> None:
+        self.queries.append((prompt, session_id))
+
+    async def receive_response(self) -> Any:
+        for message in self.responses.pop(0):
+            yield message
+
+    async def set_permission_mode(self, mode: str) -> None:
+        self.permission_modes.append(mode)
+
+    async def set_model(self, model: str) -> None:
+        self.models.append(model)
+
+    async def interrupt(self) -> None:
+        self.interrupt_count += 1
+
+    async def get_mcp_status(self) -> dict[str, Any]:
+        return {"filesystem": {"status": "connected", "env": {"TOKEN": "secret"}}}
+
+    async def reconnect_mcp_server(self, server_name: str) -> None:
+        self.reconnected_servers.append(server_name)
+
+    async def toggle_mcp_server(self, server_name: str, enabled: bool) -> None:
+        self.toggled_servers.append((server_name, enabled))
+
+    async def stop_task(self, task_id: str) -> None:
+        self.stopped_tasks.append(task_id)
+
+    async def rewind_files(self, user_message_id: str) -> None:
+        self.rewound_messages.append(user_message_id)
 
 
 def _capture(agent: ClaudeAgent) -> list[Signal]:
@@ -218,10 +279,87 @@ def test_claude_signals_are_stable_wire_types() -> None:
     )
     decision = ClaudePermissionDecisionSignal(tool_name="Bash", decision="denied")
     assert decision.wire_type() == "sgp.integrations.claude.permission_decision.v1"
+    request = ClaudeToolRequestSignal(tool_name="Read", tool_input_keys=["path"])
+    restored_request = Signal.from_wire(request.to_wire())
+    assert isinstance(restored_request, ClaudeToolRequestSignal)
+    assert restored_request == request
+    assert request.wire_type() == "sgp.integrations.claude.tool_request.v1"
 
 
 def test_mcp_tool_name_formats_claude_tool_names() -> None:
     assert mcp_tool_name("filesystem", "read_file") == "mcp__filesystem__read_file"
+
+
+async def test_claude_tool_policy_compiles_gate_to_can_use_tool_without_raw_inputs() -> None:
+    seen: list[ClaudeToolRequestSignal] = []
+
+    def has_path(signal: Signal) -> Signal | None:
+        assert isinstance(signal, ClaudeToolRequestSignal)
+        seen.append(signal)
+        return signal if "path" in signal.tool_input_keys else None
+
+    policy = ClaudeToolPolicy(
+        gate=Gate(has_path, name="has_path"),
+        deny_message="blocked by policy",
+    )
+    kwargs = policy.claude_kwargs()
+
+    allowed = await kwargs["can_use_tool"](
+        "mcp__filesystem__read_file",
+        {"path": "/tmp/secret.txt"},
+        object(),
+    )
+    denied = await kwargs["can_use_tool"](
+        "mcp__filesystem__write_file",
+        {"content": "raw secret"},
+        object(),
+    )
+
+    assert getattr(allowed, "behavior") == "allow"
+    assert getattr(denied, "behavior") == "deny"
+    assert getattr(denied, "message") == "blocked by policy"
+    assert seen[0].tool_name == "mcp__filesystem__read_file"
+    assert seen[0].mcp_server == "filesystem"
+    assert seen[0].tool_input_keys == ["path"]
+    assert seen[1].tool_input_keys == ["content"]
+    assert "/tmp/secret.txt" not in repr(seen)
+    assert "raw secret" not in repr(seen)
+
+
+async def test_claude_tool_policy_disallowed_rule_wins_over_default_allow() -> None:
+    policy = ClaudeToolPolicy(
+        allowed_tools=["Read"],
+        disallowed_tools=["Bash*"],
+        default="allowed",
+    )
+    kwargs = policy.claude_kwargs()
+
+    assert kwargs["allowed_tools"] == ["Read"]
+    assert kwargs["disallowed_tools"] == ["Bash*"]
+    denied = await kwargs["can_use_tool"]("Bash", {"command": "echo ok"}, object())
+    allowed = await kwargs["can_use_tool"]("Write", {"path": "/tmp/file"}, object())
+
+    assert getattr(denied, "behavior") == "deny"
+    assert getattr(allowed, "behavior") == "allow"
+
+
+async def test_claude_tool_policy_gate_can_reject_allowed_tool() -> None:
+    policy = ClaudeToolPolicy(
+        allowed_tools=["Read"],
+        gate=Gate.filter(
+            lambda signal: (
+                isinstance(signal, ClaudeToolRequestSignal)
+                and "path" in signal.tool_input_keys
+            ),
+            name="has_path",
+        ),
+    )
+
+    denied = await policy.can_use_tool("Read", {"content": "raw"}, object())
+    allowed = await policy.can_use_tool("Read", {"path": "/tmp/ok"}, object())
+
+    assert getattr(denied, "behavior") == "deny"
+    assert getattr(allowed, "behavior") == "allow"
 
 
 async def test_claude_runner_records_sanitized_audit_only_receipts(tmp_path: Path) -> None:
@@ -343,6 +481,245 @@ async def test_claude_runner_receipts_are_not_replayable(tmp_path: Path) -> None
     assert len(calls) == 1
 
 
+async def test_claude_sdk_session_reuses_client_and_records_query_receipts(
+    tmp_path: Path,
+) -> None:
+    clients: list[_FakeClaudeClient] = []
+    session_store = object()
+
+    def client_factory(*, options: Any | None = None) -> _FakeClaudeClient:
+        client = _FakeClaudeClient(
+            options=options,
+            responses=[
+                [
+                    _SystemMessage("sess-cont"),
+                    _AssistantMessage(),
+                    _ResultMessage("sess-cont", "first answer"),
+                ],
+                [_ResultMessage("sess-cont", "second answer")],
+            ],
+        )
+        clients.append(client)
+        return client
+
+    recorder = TrajectoryRecorder()
+    mesh = Mesh()
+    mesh.record(recorder)
+    session = ClaudeAgentSDKClientSession(
+        client_factory=client_factory,
+        options_factory=_RunnerOptions,
+        mesh=mesh,
+        allowed_tools=["Read"],
+        disallowed_tools=["Bash(rm *)"],
+        permission_mode="dontAsk",
+        mcp_servers={"filesystem": {"command": "npx", "env": {"TOKEN": "secret"}}},
+        cwd=tmp_path,
+        session_store=session_store,
+        strict_mcp_config=True,
+        max_turns=7,
+        model="claude-sonnet-4-5",
+        system_prompt="Act as a careful reviewer.",
+    )
+
+    async with mesh:
+        async with session:
+            first = await session.query("Inspect risk", mesh=mesh, session_id="main")
+            second = await session.query(
+                "Continue",
+                mesh=mesh,
+                session_id="main",
+                permission_mode="acceptEdits",
+                model="claude-opus-4-5",
+            )
+
+    assert first.session_id == "sess-cont"
+    assert first.result == "first answer"
+    assert first.message_count == 3
+    assert second.session_id == "sess-cont"
+    assert second.result == "second answer"
+    assert len(clients) == 1
+    client = clients[0]
+    assert client.connect_prompts == [None]
+    assert client.disconnect_count == 1
+    assert client.queries == [("Inspect risk", "main"), ("Continue", "main")]
+    assert client.permission_modes == ["acceptEdits"]
+    assert client.models == ["claude-opus-4-5"]
+
+    options = client.options
+    assert options is not None
+    assert options.allowed_tools == ["Read"]
+    assert options.disallowed_tools == ["Bash(rm *)"]
+    assert options.permission_mode == "dontAsk"
+    assert options.mcp_servers == {
+        "filesystem": {"command": "npx", "env": {"TOKEN": "secret"}}
+    }
+    assert options.cwd == tmp_path
+    assert options.session_store is session_store
+    assert options.strict_mcp_config is True
+    assert options.max_turns == 7
+    assert options.model == "claude-sonnet-4-5"
+    assert options.system_prompt == "Act as a careful reviewer."
+
+    actions = [receipt.action for receipt in recorder.receipts]
+    assert actions == [
+        "claude_client_connect",
+        "claude_client_query_start",
+        "claude_tool_use",
+        "claude_result",
+        "claude_permission_mode_changed",
+        "claude_model_set",
+        "claude_client_query_start",
+        "claude_result",
+        "claude_client_disconnect",
+    ]
+    assert all(receipt.event_kind == "claude_agent_sdk" for receipt in recorder.receipts)
+    assert all(receipt.verify() for receipt in recorder.receipts)
+    assert "secret" not in str([receipt.metadata for receipt in recorder.receipts])
+
+    first_start = recorder.receipts[1]
+    assert first_start.metadata["client_session_key"] == "main"
+    assert first_start.metadata["allowed_tools"] == ["Read"]
+    assert first_start.metadata["mcp_server_names"] == ["filesystem"]
+    assert recorder.receipts[2].metadata["tool_name"] == "mcp__docs__search"
+    assert recorder.receipts[3].metadata["claude_session_id"] == "sess-cont"
+    assert recorder.receipts[4].metadata["permission_mode"] == "acceptEdits"
+    assert recorder.receipts[5].metadata["model"] == "claude-opus-4-5"
+    assert recorder.receipts[6].metadata["permission_mode"] == "acceptEdits"
+
+
+async def test_claude_client_session_records_controls_and_permission_decisions() -> None:
+    class _Allow:
+        decision = "allow"
+        reason = "read-only"
+
+    clients: list[_FakeClaudeClient] = []
+
+    def client_factory(*, options: Any | None = None) -> _FakeClaudeClient:
+        client = _FakeClaudeClient(options=options, responses=[[_ResultMessage("sess-control")]])
+        clients.append(client)
+        return client
+
+    async def can_use_tool(tool_name: str, input_data: Any, context: Any) -> _Allow:
+        del tool_name, input_data, context
+        return _Allow()
+
+    recorder = TrajectoryRecorder()
+    mesh = Mesh()
+    mesh.record(recorder)
+    session = ClaudeAgentSDKClientSession(
+        client_factory=client_factory,
+        options_factory=_RunnerOptions,
+        mesh=mesh,
+        can_use_tool=can_use_tool,
+    )
+
+    async with mesh:
+        await session.connect()
+        options = clients[0].options
+        assert options is not None
+        permission_result = await options.can_use_tool(
+            "Read",
+            {"path": "/tmp/secret.txt"},
+            object(),
+        )
+        status = await session.get_mcp_status()
+        await session.reconnect_mcp_server("filesystem")
+        await session.toggle_mcp_server("filesystem", False)
+        await session.interrupt()
+        await session.stop_task("task-1")
+        await session.rewind_files("msg-1")
+        await session.disconnect()
+
+    assert isinstance(permission_result, _Allow)
+    assert status["filesystem"]["status"] == "connected"
+    client = clients[0]
+    assert client.reconnected_servers == ["filesystem"]
+    assert client.toggled_servers == [("filesystem", False)]
+    assert client.interrupt_count == 1
+    assert client.stopped_tasks == ["task-1"]
+    assert client.rewound_messages == ["msg-1"]
+
+    actions = [receipt.action for receipt in recorder.receipts]
+    assert actions == [
+        "claude_client_connect",
+        "claude_permission_decision",
+        "claude_mcp_status",
+        "claude_mcp_reconnect",
+        "claude_mcp_toggle",
+        "claude_interrupt",
+        "claude_task_stop",
+        "claude_rewind_files",
+        "claude_client_disconnect",
+    ]
+    permission = recorder.receipts[1]
+    assert permission.metadata["decision"] == "allowed"
+    assert permission.metadata["tool_input_keys"] == ["path"]
+    assert "/tmp/secret.txt" not in str(permission.metadata)
+    mcp_status = recorder.receipts[2]
+    assert mcp_status.metadata["status_summary"] == {
+        "filesystem": {"status": "connected"}
+    }
+    assert "secret" not in str([receipt.metadata for receipt in recorder.receipts])
+
+
+async def test_claude_client_session_uses_tool_policy_for_permission_receipts() -> None:
+    clients: list[_FakeClaudeClient] = []
+
+    def client_factory(*, options: Any | None = None) -> _FakeClaudeClient:
+        client = _FakeClaudeClient(options=options, responses=[[_ResultMessage("sess-policy")]])
+        clients.append(client)
+        return client
+
+    policy = ClaudeToolPolicy(
+        gate=Gate.filter(
+            lambda signal: (
+                isinstance(signal, ClaudeToolRequestSignal)
+                and "path" in signal.tool_input_keys
+            ),
+            name="has_path",
+        ),
+        disallowed_tools=["Bash*"],
+        deny_message="tool policy rejected the request",
+    )
+    recorder = TrajectoryRecorder()
+    mesh = Mesh()
+    mesh.record(recorder)
+    session = ClaudeAgentSDKClientSession(
+        client_factory=client_factory,
+        options_factory=_RunnerOptions,
+        mesh=mesh,
+        tool_policy=policy,
+    )
+
+    async with mesh:
+        await session.connect()
+        options = clients[0].options
+        assert options is not None
+        allowed = await options.can_use_tool("Write", {"path": "/tmp/raw.txt"}, object())
+        denied = await options.can_use_tool("Write", {"content": "raw value"}, object())
+        disallowed = await options.can_use_tool("Bash", {"command": "echo ok"}, object())
+        await session.disconnect()
+
+    assert getattr(allowed, "behavior") == "allow"
+    assert getattr(denied, "behavior") == "deny"
+    assert getattr(disallowed, "behavior") == "deny"
+    assert options.disallowed_tools == ["Bash*"]
+    actions = [receipt.action for receipt in recorder.receipts]
+    assert actions == [
+        "claude_client_connect",
+        "claude_permission_decision",
+        "claude_permission_decision",
+        "claude_permission_decision",
+        "claude_client_disconnect",
+    ]
+    decisions = [receipt.metadata["decision"] for receipt in recorder.receipts[1:4]]
+    assert decisions == ["allowed", "denied", "denied"]
+    assert recorder.receipts[1].metadata["tool_input_keys"] == ["path"]
+    assert recorder.receipts[2].metadata["tool_input_keys"] == ["content"]
+    assert "/tmp/raw.txt" not in str([receipt.metadata for receipt in recorder.receipts])
+    assert "raw value" not in str([receipt.metadata for receipt in recorder.receipts])
+
+
 def test_claude_agent_missing_dependency_error(monkeypatch: pytest.MonkeyPatch) -> None:
     import signal_gating.claude as claude_module
 
@@ -358,6 +735,23 @@ def test_claude_agent_missing_dependency_error(monkeypatch: pytest.MonkeyPatch) 
         agent._sdk_bindings()
 
 
+def test_claude_sdk_session_missing_dependency_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import signal_gating.claude as claude_module
+
+    def missing_import(name: str) -> object:
+        if name == "claude_agent_sdk":
+            raise ImportError("missing")
+        raise AssertionError(name)
+
+    monkeypatch.setattr(claude_module, "import_module", missing_import)
+
+    session = ClaudeAgentSDKClientSession()
+    with pytest.raises(ImportError, match=r"signal-gating\[claude\]"):
+        session._sdk_bindings()
+
+
 def test_import_does_not_pull_claude_agent_sdk() -> None:
     code = "import sys, signal_gating; assert 'claude_agent_sdk' not in sys.modules"
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -370,5 +764,18 @@ def test_exports_from_package_root_and_integration_module() -> None:
     from signal_gating.integrations import claude
 
     assert hasattr(signal_gating, "ClaudeAgent")
+    assert hasattr(signal_gating, "ClaudeAgentSDKClientSession")
+    assert hasattr(signal_gating, "ClaudeAgentSDKSession")
+    assert hasattr(signal_gating, "ClaudeToolPolicy")
+    assert hasattr(signal_gating, "ClaudeToolRequestSignal")
     assert hasattr(claude, "ClaudeAgent")
+    assert hasattr(claude, "ClaudeAgentSDKClientSession")
+    assert hasattr(claude, "ClaudeAgentSDKSession")
+    assert hasattr(claude, "ClaudeToolPolicy")
+    assert hasattr(claude, "ClaudeToolRequestSignal")
     assert "ClaudeAgent" in signal_gating.__all__
+    assert "ClaudeAgentSDKClientSession" in signal_gating.__all__
+    assert "ClaudeAgentSDKSession" in signal_gating.__all__
+    assert "ClaudeToolPolicy" in signal_gating.__all__
+    assert "ClaudeToolRequestSignal" in signal_gating.__all__
+    assert ClaudeAgentSDKSession is ClaudeAgentSDKClientSession

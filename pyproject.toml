@@ -45,10 +45,17 @@ otel = [
 claude = [
     "claude-agent-sdk>=0.1.60",
 ]
+auth = [
+    "pyjwt[crypto]>=2.10",
+]
 
 [project.urls]
 Repository = "https://github.com/signalgatingprotocol/python-sdk"
 Documentation = "https://signalgatingprotocol.github.io"
+
+[project.scripts]
+signal-gating-mcp = "signal_gating.cli:main"
+signal-gating-receipts = "signal_gating.receipts_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/signal_gating"]
