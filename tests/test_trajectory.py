@@ -584,7 +584,9 @@ async def test_replay_runner_missing_target_policy() -> None:
 
     assert result.attempted == 2
     assert result.delivered == 1
-    assert result.skipped == 1
+    # A missing target is an attempted failure, not a skip: each receipt
+    # lands in exactly one bucket and attempted == delivered + failed.
+    assert result.skipped == 0
     assert result.failed == 1
     assert result.missing_targets == ["missing"]
     assert seen == [2]
