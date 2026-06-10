@@ -90,6 +90,13 @@ class Channel(Generic[T]):
             done, _ = await asyncio.wait(
                 {get_task, close_task}, return_when=asyncio.FIRST_COMPLETED
             )
+        except asyncio.CancelledError:
+            # We were cancelled (e.g. wait_for timeout) after the getter may
+            # have already dequeued an item. Put it back so it isn't lost.
+            if get_task.done() and not get_task.cancelled():
+                self._requeue(get_task.result())
+            raise
+        else:
             if get_task in done:
                 return get_task.result()
             # Close fired. Drain anything that landed concurrently.
@@ -103,6 +110,21 @@ class Channel(Generic[T]):
             for t in (get_task, close_task):
                 if not t.done():
                     t.cancel()
+
+    def _requeue(self, item: T) -> None:
+        """Return an item dequeued by an interrupted receive() to the queue.
+
+        Best-effort: the item re-enters at the back of the queue, which can
+        perturb FIFO order in the (rare) cancellation window, but no signal
+        is ever dropped.
+        """
+        try:
+            self._queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # A full queue has no waiting getters, so it is safe to slot the
+            # item back at the front without a wakeup. Temporarily exceeding
+            # maxsize beats silently dropping a signal.
+            self._queue._queue.appendleft(item)  # type: ignore[attr-defined]
 
     def try_receive(self) -> T | None:
         """Non-blocking receive. Returns None if no signal is available.

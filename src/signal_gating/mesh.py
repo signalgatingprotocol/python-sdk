@@ -147,6 +147,10 @@ class Mesh:
         ]
         # Remove capabilities
         self._capabilities.pop(resolved.name, None)
+        # Remove topic subscriptions so publish() never targets the dead
+        # agent's closed inbox (and the agent object can be collected).
+        for topic, subscribers in self._topics.items():
+            self._topics[topic] = [a for a in subscribers if a.name != resolved.name]
         del self._agents[resolved.name]
 
     def disconnect(self, source: Agent | str, target: Agent | str) -> int:
@@ -682,8 +686,19 @@ class Mesh:
         """
         if topic not in self._topics:
             raise MeshError(f"Topic '{topic}' does not exist")
-        subscribers = self._topics[topic]
+        # Snapshot: subscribe/unsubscribe during the awaits below must not
+        # mutate the list we are iterating.
+        subscribers = list(self._topics[topic])
+        delivered = 0
         for subscriber in subscribers:
+            if subscriber.inbox.closed:
+                # A stopped subscriber must not abort the broadcast for the
+                # rest; deliver to everyone reachable and report the count.
+                logger.warning(
+                    "publish('%s'): skipping subscriber '%s' (inbox closed)",
+                    topic, subscriber.name,
+                )
+                continue
             await self._record_event(
                 "published",
                 signal,
@@ -700,7 +715,8 @@ class Mesh:
                 target=subscriber.name,
             )
             await subscriber.inbox.send(signal)
-        return len(subscribers)
+            delivered += 1
+        return delivered
 
     def list_topics(self) -> dict[str, list[str]]:
         """List all topics and their subscriber names."""
@@ -1357,7 +1373,12 @@ class Mesh:
             deadline = asyncio.get_running_loop().time() + drain_timeout
             interval = 0.01  # Start fast, back off
             while asyncio.get_running_loop().time() < deadline:
-                if all(a.inbox.pending == 0 for a in self._agents.values()):
+                # An empty inbox isn't enough: a handler may be mid-flight and
+                # about to emit. Wait until every agent is also idle.
+                if all(
+                    a.inbox.pending == 0 and not a.busy
+                    for a in self._agents.values()
+                ):
                     break
                 await asyncio.sleep(interval)
                 interval = min(interval * 1.5, 0.2)  # Adaptive: 10ms -> 200ms

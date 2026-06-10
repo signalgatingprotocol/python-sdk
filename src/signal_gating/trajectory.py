@@ -304,7 +304,13 @@ class ReplayDelivery:
 
 @dataclass(slots=True)
 class ReplayResult:
-    """Summary of a delivery replay into a mesh."""
+    """Summary of a delivery replay into a mesh.
+
+    Each receipt lands in exactly one bucket: ``skipped`` (never attempted,
+    e.g. non-replayable action), ``delivered``, or ``failed``. Invariants:
+    ``attempted == delivered + failed`` and the buckets sum to the number
+    of receipts processed.
+    """
 
     attempted: int = 0
     delivered: int = 0
@@ -428,7 +434,6 @@ class TrajectoryReplayRunner:
                         f"Cannot replay {receipt.action!r}: receipt has no target"
                     )
                 result.missing_targets.append("")
-                result.skipped += 1
                 result.failed += 1
                 result.deliveries.append(
                     ReplayDelivery(
@@ -450,7 +455,6 @@ class TrajectoryReplayRunner:
                 if strict_targets:
                     raise
                 result.missing_targets.append(receipt.target)
-                result.skipped += 1
                 result.failed += 1
                 result.deliveries.append(
                     ReplayDelivery(

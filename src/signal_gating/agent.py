@@ -317,6 +317,8 @@ class Agent:
         self._outbox: list[Callable[[Signal], Coroutine[Any, Any, None]]] = []
         self._task: asyncio.Task[None] | None = None
         self._running = False
+        self._starting = False
+        self._processing = False
         self._processed_count = 0
         self._rejected_count = 0
         self._error_count = 0
@@ -363,6 +365,13 @@ class Agent:
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def busy(self) -> bool:
+        """True while a signal is mid-processing (popped from the inbox but
+        not yet fully handled). Used by drain logic: an empty inbox does not
+        mean the agent is idle."""
+        return self._processing
 
     @property
     def healthy(self) -> bool:
@@ -436,12 +445,13 @@ class Agent:
             wants_ctx = self._detect_wants_context(fn)
 
             async def wrapper(*args: Any, **kwargs: Any) -> Any:
-                result = await fn(*args, **kwargs)
+                # Remove before invoking: "once" means at most once, even if
+                # the handler raises and the signal is dead-lettered.
                 handlers = self._handlers.get(signal_type, [])
                 if wrapper in handlers:
                     handlers.remove(wrapper)
                 self._handler_wants_ctx.pop(wrapper, None)
-                return result
+                return await fn(*args, **kwargs)
 
             wrapper.__wrapped__ = fn  # type: ignore[attr-defined]
             self._handlers.setdefault(signal_type, []).append(wrapper)
@@ -668,52 +678,58 @@ class Agent:
         self._running = True
         try:
             async for signal in self.inbox:
-                start = time.monotonic()
-                gated = await self._apply_gates(signal)
-                if gated is None:
-                    self._rejected_count += 1
-                    self.dead_letters.add(signal, "gate_rejected", self.name)
-                    continue
-
-                # Request/response: resolve pending futures for correlated responses
-                if gated.correlation_id:
-                    future = self._pending_requests.pop(gated.correlation_id, None)
-                    if future is not None and not future.done():
-                        future.set_result(gated)
-                        self._processed_count += 1
+                # The signal is out of the inbox but not yet handled; flag it
+                # so drain logic doesn't mistake an empty inbox for idleness.
+                self._processing = True
+                try:
+                    start = time.monotonic()
+                    gated = await self._apply_gates(signal)
+                    if gated is None:
+                        self._rejected_count += 1
+                        self.dead_letters.add(signal, "gate_rejected", self.name)
                         continue
 
-                self._processed_count += 1
-                try:
-                    await self._dispatch(gated)
-                except Exception as e:
-                    self._error_count += 1
-                    self.dead_letters.add(gated, "handler_error", self.name, e)
-                    logger.error(
-                        "Handler error in agent '%s': %s", self.name, e, exc_info=True
-                    )
-                    for hook in self._on_error_hooks:
-                        try:
-                            result = hook(gated, e)
-                            if isawaitable(result):
-                                await result
-                        except Exception as hook_err:
-                            logger.error(
-                                "Agent '%s' on_error hook failed: %s",
-                                self.name, hook_err, exc_info=True,
-                            )
-                    continue
+                    # Request/response: resolve pending futures for correlated responses
+                    if gated.correlation_id:
+                        future = self._pending_requests.pop(gated.correlation_id, None)
+                        if future is not None and not future.done():
+                            future.set_result(gated)
+                            self._processed_count += 1
+                            continue
 
-                if self._tracer is not None:
-                    elapsed_ms = (time.monotonic() - start) * 1000
-                    self._tracer.record(
-                        trace_id=signal.trace_id,
-                        signal_id=signal.id,
-                        agent=self.name,
-                        gate="dispatch",
-                        action="processed",
-                        duration_ms=elapsed_ms,
-                    )
+                    self._processed_count += 1
+                    try:
+                        await self._dispatch(gated)
+                    except Exception as e:
+                        self._error_count += 1
+                        self.dead_letters.add(gated, "handler_error", self.name, e)
+                        logger.error(
+                            "Handler error in agent '%s': %s", self.name, e, exc_info=True
+                        )
+                        for hook in self._on_error_hooks:
+                            try:
+                                result = hook(gated, e)
+                                if isawaitable(result):
+                                    await result
+                            except Exception as hook_err:
+                                logger.error(
+                                    "Agent '%s' on_error hook failed: %s",
+                                    self.name, hook_err, exc_info=True,
+                                )
+                        continue
+
+                    if self._tracer is not None:
+                        elapsed_ms = (time.monotonic() - start) * 1000
+                        self._tracer.record(
+                            trace_id=signal.trace_id,
+                            signal_id=signal.id,
+                            agent=self.name,
+                            gate="dispatch",
+                            action="processed",
+                            duration_ms=elapsed_ms,
+                        )
+                finally:
+                    self._processing = False
         except Exception as e:
             if self._running:
                 logger.error("Agent '%s' loop error: %s", self.name, e, exc_info=True)
@@ -729,8 +745,12 @@ class Agent:
         the task slot is cleared, the restart counter is reset, and a fresh
         inbox is created if the prior one was closed.
         """
-        # Already running.
+        # Already running, or another start() is mid-flight (async on_start
+        # hooks yield control; without the guard, concurrent starts would
+        # each spawn a loop task and double-consume the inbox).
         if self._task is not None and not self._task.done():
+            return
+        if self._starting:
             return
         # Previous run finished. Collect it before starting fresh so that
         # exceptions don't get silently buried in the task object.
@@ -739,19 +759,23 @@ class Agent:
         self._restart_count = 0
         if self.inbox.closed:
             self.inbox = self._make_inbox()
-        for hook in self._on_start_hooks:
-            try:
-                result = hook()
-                if isawaitable(result):
-                    await result
-            except Exception as e:
-                logger.error(
-                    "Agent '%s' on_start hook failed: %s", self.name, e, exc_info=True
-                )
-                raise AgentError(self.name, f"on_start hook failed: {e}") from e
-        self._task = asyncio.create_task(
-            self._supervised_loop(), name=f"agent:{self.name}"
-        )
+        self._starting = True
+        try:
+            for hook in self._on_start_hooks:
+                try:
+                    result = hook()
+                    if isawaitable(result):
+                        await result
+                except Exception as e:
+                    logger.error(
+                        "Agent '%s' on_start hook failed: %s", self.name, e, exc_info=True
+                    )
+                    raise AgentError(self.name, f"on_start hook failed: {e}") from e
+            self._task = asyncio.create_task(
+                self._supervised_loop(), name=f"agent:{self.name}"
+            )
+        finally:
+            self._starting = False
 
     async def _supervised_loop(self) -> None:
         """Run the processing loop with automatic restart on failure.

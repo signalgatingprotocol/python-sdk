@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol, cast
@@ -155,6 +156,7 @@ class LLMAgent(Agent):
         build: Build | None = None,
         tools: ToolProvider | None = None,
         max_tool_rounds: int = 4,
+        timeout: float | None = None,
         **agent_kwargs: Any,
     ) -> None:
         super().__init__(name, **agent_kwargs)
@@ -163,6 +165,9 @@ class LLMAgent(Agent):
         self._system = system
         self._emit_type: type[Any] = emit
         self._temperature = temperature
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be > 0")
+        self._timeout = timeout
         self._render: Render = render or _default_render
         if build is None and "text" not in emit.model_fields:
             raise ValueError(
@@ -191,9 +196,18 @@ class LLMAgent(Agent):
             call_kwargs = dict(extra)
             if schemas is not None:
                 call_kwargs["tools"] = schemas
-            resp = await self._client.chat.completions.create(
+            completion = self._client.chat.completions.create(
                 model=self._model, messages=messages, **call_kwargs
             )
+            if self._timeout is not None:
+                try:
+                    resp = await asyncio.wait_for(completion, timeout=self._timeout)
+                except asyncio.TimeoutError:
+                    raise AgentError(
+                        self.name, f"LLM request timed out after {self._timeout}s"
+                    ) from None
+            else:
+                resp = await completion
             msg = resp.choices[0].message
             tool_calls = msg.tool_calls if schemas is not None else None
 

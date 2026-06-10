@@ -226,10 +226,11 @@ class Gate:
             raise ValueError("failure_threshold must be >= 1")
         if recovery_timeout < 0:
             raise ValueError("recovery_timeout must be >= 0")
-        state: dict[str, float | int | str] = {
+        state: dict[str, float | int | str | bool] = {
             "failures": 0,
             "opened_at": 0.0,
             "status": "closed",  # closed | open | half_open
+            "probing": False,
         }
         lock = asyncio.Lock()
 
@@ -243,9 +244,25 @@ class Gate:
                     if elapsed < recovery_timeout:
                         return None
                     state["status"] = "half_open"
+                    status = "half_open"
 
+                if status == "half_open":
+                    # Exactly one probe tests recovery; reject the rest.
+                    if state["probing"]:
+                        return None
+                    state["probing"] = True
+
+            # Process outside the lock so a slow inner gate doesn't
+            # serialize every signal flowing through the breaker.
+            try:
                 result = await gate.process(signal)
+            except BaseException:
+                async with lock:
+                    state["probing"] = False
+                raise
 
+            async with lock:
+                state["probing"] = False
                 if result is not None:
                     state["failures"] = 0
                     state["status"] = "closed"
@@ -254,7 +271,7 @@ class Gate:
                 state["failures"] = int(state["failures"]) + 1
                 if int(state["failures"]) >= failure_threshold:
                     state["status"] = "open"
-                    state["opened_at"] = now
+                    state["opened_at"] = time.monotonic()
                 return None
 
         return cls(fn, name=name)
