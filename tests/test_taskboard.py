@@ -143,3 +143,21 @@ async def test_observers_are_advisory():
     unsubscribe()
     await board.open("y")
     assert len(seen) == 1
+
+
+def test_public_exports():
+    import signal_gating as sg
+
+    for name in (
+        "TaskBoard",
+        "Task",
+        "Team",
+        "Script",
+        "ScriptContext",
+        "CheckpointStore",
+        "TaskRejected",
+        "TeamError",
+        "BudgetExceeded",
+        "domain_payload",
+    ):
+        assert hasattr(sg, name), name
