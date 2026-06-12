@@ -33,8 +33,19 @@ _ENVELOPE_FIELDS = frozenset(
 )
 
 
-def _domain_payload(signal: Signal) -> dict[str, Any]:
+def domain_payload(signal: Signal) -> dict[str, Any]:
+    """Project a signal onto its domain fields, excluding the volatile envelope.
+
+    Drops the base ``Signal`` envelope fields — ``id``, ``source``,
+    ``timestamp``, ``priority``, ``trace_id``, ``correlation_id``,
+    ``parent_id``, ``metadata`` — leaving only the subclass-declared content.
+    A priority or metadata tweak deliberately does not change the projection.
+    """
     return {k: v for k, v in signal.model_dump().items() if k not in _ENVELOPE_FIELDS}
+
+
+# Alias for existing internal callers.
+_domain_payload = domain_payload
 
 
 def _digest(core: dict[str, Any]) -> str:
