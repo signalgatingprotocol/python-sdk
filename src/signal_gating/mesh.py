@@ -62,6 +62,9 @@ class RouteFn:
     source: str
     target: str | None = None
     tag: str = ""
+    # Called with a removed agent's name; mutates captured route state and
+    # returns True when the route has no remaining targets and must be dropped.
+    prune: Callable[[str], bool] | None = None
 
     async def __call__(self, signal: Signal) -> None:
         await self.fn(signal)
@@ -128,8 +131,14 @@ class Mesh:
     async def remove(self, agent: Agent | str) -> None:
         """Remove an agent from the mesh, stopping it and cleaning up edges.
 
-        This removes all edges, routing functions, and capabilities; the agent
-        is fully severed from the mesh.
+        This removes all edges, routing functions, pool memberships, and
+        capabilities; the agent is fully severed from the mesh. Routes built
+        by ``route()``/``load_balance()`` are pruned of the removed agent and
+        dropped entirely once they have no remaining targets.
+
+        In-flight request hazard: clearing the removed agent's ``_outbox``
+        drops any live ``mesh.request()`` capture functions, so a requester
+        awaiting a reply from that agent times out rather than erroring.
         """
         resolved = self._resolve(agent)
         if resolved.running:
@@ -138,6 +147,21 @@ class Mesh:
         for other in self._agents.values():
             if other.name != resolved.name:
                 other._remove_outputs(target=resolved.name)
+        # Prune target=None routing closures (route()/load_balance()) that
+        # hold a direct reference to this agent; drop routes left empty.
+        for other in self._agents.values():
+            other._outbox = [
+                fn
+                for fn in other._outbox
+                if not (
+                    isinstance(fn, RouteFn)
+                    and fn.prune is not None
+                    and fn.prune(resolved.name)
+                )
+            ]
+        # Purge pool membership so pools stop selecting the dead worker
+        for pool in self._pools.values():
+            pool.discard(resolved.name)
         # Clear the removed agent's own outbox
         resolved._outbox.clear()
         # Remove all edges involving this agent
@@ -250,7 +274,7 @@ class Mesh:
         resolved: list[tuple[Callable[[Signal], bool], Agent]] = [
             (pred, self._resolve(tgt)) for pred, tgt in routes
         ]
-        resolved_default = self._resolve(default) if default else None
+        default_box: list[Agent | None] = [self._resolve(default) if default else None]
         tracer = self.tracer
 
         async def content_route(signal: Signal) -> None:
@@ -266,7 +290,8 @@ class Mesh:
                     )
                     await target.inbox.send(signal)
                     return
-            if resolved_default:
+            resolved_default = default_box[0]
+            if resolved_default is not None:
                 tracer.record(
                     trace_id=signal.trace_id,
                     signal_id=signal.id,
@@ -277,7 +302,15 @@ class Mesh:
                 )
                 await resolved_default.inbox.send(signal)
 
-        src._add_output(RouteFn(fn=content_route, source=src.name, tag="content_route"))
+        def prune(name: str) -> bool:
+            resolved[:] = [(p, t) for p, t in resolved if t.name != name]
+            if default_box[0] is not None and default_box[0].name == name:
+                default_box[0] = None
+            return not resolved and default_box[0] is None
+
+        src._add_output(
+            RouteFn(fn=content_route, source=src.name, tag="content_route", prune=prune)
+        )
 
     def load_balance(
         self,
@@ -316,7 +349,13 @@ class Mesh:
             )
             await target.inbox.send(signal)
 
-        src._add_output(RouteFn(fn=balanced_route, source=src.name, tag="load_balance"))
+        def prune(name: str) -> bool:
+            resolved[:] = [t for t in resolved if t.name != name]
+            return not resolved
+
+        src._add_output(
+            RouteFn(fn=balanced_route, source=src.name, tag="load_balance", prune=prune)
+        )
 
     async def start(self) -> None:
         """Start all agents in the mesh."""
