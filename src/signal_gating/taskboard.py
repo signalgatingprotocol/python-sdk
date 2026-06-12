@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar
 from uuid import uuid4
 
-from pydantic import (  # type: ignore[import-not-found]
+from pydantic import (
     Field,
     field_serializer,
     field_validator,
@@ -35,12 +35,12 @@ class _PayloadSignal(Signal):
 
     payload: Mapping[str, Any] = Field(default_factory=dict, validate_default=True)
 
-    @field_validator("payload", mode="after")  # type: ignore[untyped-decorator]
+    @field_validator("payload", mode="after")
     @classmethod
     def _freeze_payload(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
         return _frozen(value)
 
-    @field_serializer("payload")  # type: ignore[untyped-decorator]
+    @field_serializer("payload")
     def _serialize_payload(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return dict(value)
 
@@ -50,12 +50,12 @@ class _ResultSignal(Signal):
 
     result: Mapping[str, Any] = Field(default_factory=dict, validate_default=True)
 
-    @field_validator("result", mode="after")  # type: ignore[untyped-decorator]
+    @field_validator("result", mode="after")
     @classmethod
     def _freeze_result(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
         return _frozen(value)
 
-    @field_serializer("result")  # type: ignore[untyped-decorator]
+    @field_serializer("result")
     def _serialize_result(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return dict(value)
 
