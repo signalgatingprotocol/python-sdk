@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from signal_gating import Agent, Gate, Mesh, MeshError, Signal, Tracer
+from signal_gating import Agent, AgentPool, Gate, Mesh, MeshError, Signal, Tracer
 
 
 class TaskSignal(Signal):
@@ -490,3 +490,45 @@ class TestDrainOnStop:
 
         await mesh.stop(drain=True)
         assert len(processed) == 3
+
+
+class TestRemoveHardening:
+    async def test_remove_purges_pool_membership(self):
+        pool = AgentPool("workers", size=3)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        victim = pool.workers[1]
+        await mesh.remove(victim)
+        assert victim.name not in pool.worker_names
+        assert pool.size == 2
+
+    async def test_remove_prunes_load_balance_target(self):
+        src, a, b = Agent("src"), Agent("a"), Agent("b")
+        got: list[str] = []
+        for agent in (a, b):
+            @agent.on(Signal)
+            async def handle(signal: Signal, _name=agent.name):
+                got.append(_name)
+        mesh = Mesh([src, a, b])
+        mesh.load_balance(src, [a, b])
+        async with mesh:
+            await mesh.remove(b)
+            for _ in range(4):
+                await src.emit(Signal())
+            await asyncio.sleep(0.05)
+        assert got == ["a", "a", "a", "a"]
+
+    async def test_remove_prunes_route_branch_falls_to_default(self):
+        src, hot, cold = Agent("src"), Agent("hot"), Agent("cold")
+        got: list[str] = []
+        for agent in (hot, cold):
+            @agent.on(Signal)
+            async def handle(signal: Signal, _name=agent.name):
+                got.append(_name)
+        mesh = Mesh([src, hot, cold])
+        mesh.route(src, [(lambda s: s.priority >= 5, hot)], default=cold)
+        async with mesh:
+            await mesh.remove(hot)
+            await src.emit(Signal(priority=9))
+            await asyncio.sleep(0.05)
+        assert got == ["cold"]

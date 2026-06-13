@@ -238,6 +238,16 @@ class AgentPool:
         await asyncio.gather(*(w.stop() for w in removed if w.running))
         return removed
 
+    def discard(self, name: str) -> bool:
+        """Remove a worker by name without stopping it (mesh.remove() stops it).
+
+        Returns True if a worker was removed. The pool does not backfill;
+        call scale_to() to restore capacity.
+        """
+        before = len(self._workers)
+        self._workers = [w for w in self._workers if w.name != name]
+        return len(self._workers) != before
+
     # --- Routing ---
 
     def select_worker(self, signal: Signal | None = None) -> Agent:

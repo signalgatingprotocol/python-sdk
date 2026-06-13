@@ -84,3 +84,29 @@ class UnknownSignalType(SignalSerializationError):
             f"Unknown signal type {type_name!r}: no class is registered under this "
             "wire name. Import or register the class, or use strict=False."
         )
+
+
+class TaskRejected(SignalGatingError):
+    """A TaskBoard gate refused a task transition.
+
+    Gate combinators collapse names, so gate_name is the outermost gate's
+    name — the algebra cannot know which leaf rejected.
+    """
+
+    def __init__(self, task_id: str, gate_name: str = "") -> None:
+        self.task_id = task_id
+        self.gate_name = gate_name
+        super().__init__(f"task {task_id!r} rejected by gate {gate_name!r}")
+
+
+class TeamError(SignalGatingError):
+    """Team protocol misuse (duplicate enrollment, bad assign, reuse after dissolve)."""
+
+
+class BudgetExceeded(SignalGatingError):
+    """A Script run exceeded its agent budget."""
+
+    def __init__(self, budget: int, key: str) -> None:
+        self.budget = budget
+        self.key = key
+        super().__init__(f"script budget of {budget} steps exceeded at step {key!r}")

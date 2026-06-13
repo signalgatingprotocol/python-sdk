@@ -529,6 +529,65 @@ agent.dead_letters.load_jsonl("dlq.jsonl") # reconstruct as original types
 await agent.dead_letters.replay(agent.inbox)
 ```
 
+### Teams
+
+A `Team` coordinates long-lived peer agents over a shared `TaskBoard` — a
+durable task ledger folded from signal events, with hash-chained JSONL
+persistence and transition policy expressed as ordinary `Gate`s. Members carry
+exactly one obligation: handle `TaskAssigned` and reply a `TaskResult`. The
+protocol (claiming, completion, release-on-failure, idle notification,
+shutdown) lives in team-owned steward coroutines, never inside your agents:
+
+```python
+from signal_gating import Agent, AgentContext, Mesh, TaskAssigned, TaskResult, Team
+
+writer = Agent("writer")
+
+@writer.on(TaskAssigned)
+async def work(signal: TaskAssigned, ctx: AgentContext):
+    await ctx.reply(TaskResult(task_id=signal.task_id, result={"done": True}))
+
+mesh = Mesh([writer])
+team = Team("docs", mesh)
+team.enroll(writer)
+
+async with mesh:
+    async with team:
+        tid = await team.open("rewrite channel docs", payload={"path": "channel.py"})
+        # stewards self-claim; or direct it: await team.assign(tid, "writer")
+```
+
+A crashed handler dead-letters as usual and its task is released back to
+pending for a peer to pick up. Tasks can depend on other tasks
+(`depends_on=...`); completing the last dependency unblocks dependents
+automatically. See `examples/agent_team.py`.
+
+### Scripted workflows
+
+A `Script` moves the plan into code: a coroutine you write owns the loop and
+the branching, and the runtime contributes bounded concurrency, an agent
+budget, and resume — every completed step is checkpointed under a
+content-addressed key, so an interrupted run reruns only unfinished work:
+
+```python
+from signal_gating import CheckpointStore, Script
+
+async def audit(ctx):
+    async with ctx.phase("scan"):
+        findings = await ctx.fan_out(["scan-a", "scan-b"], requests)
+    async with ctx.phase("verify"):
+        return [await ctx.run("verifier", f) for f in dedupe(findings)]
+
+script = Script("sweep", mesh, audit, max_concurrency=16,
+                store=CheckpointStore("sweep.jsonl"))
+report = await script.run(args={...})   # rerun after interruption -> resumes
+```
+
+`ctx.spawn(factory, signal)` runs ephemeral agents — added, started, asked one
+checkpointed request, then removed — so a script can use dozens of agents
+without preregistering them. Unrelated to `mesh.workflow()`, which is a
+one-shot step chain. See `examples/scripted_workflow.py`.
+
 ## Architecture
 
 ```

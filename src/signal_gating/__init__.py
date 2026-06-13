@@ -43,6 +43,7 @@ from signal_gating.agent import (
 from signal_gating.channel import Channel, PriorityChannel
 from signal_gating.errors import (
     AgentError,
+    BudgetExceeded,
     ChannelClosed,
     ChannelFull,
     CircuitOpenError,
@@ -51,6 +52,8 @@ from signal_gating.errors import (
     SignalGatingError,
     SignalSerializationError,
     SignalValidationError,
+    TaskRejected,
+    TeamError,
     UnknownSignalType,
 )
 from signal_gating.gate import Gate
@@ -66,7 +69,17 @@ from signal_gating.registry import (
     registered_signals,
     to_wire,
 )
+from signal_gating.script import CheckpointStore, Script, ScriptContext, step_key
 from signal_gating.signal import Signal
+from signal_gating.taskboard import (
+    Task,
+    TaskBoard,
+    TaskClaimed,
+    TaskCompleted,
+    TaskOpened,
+    TaskReleased,
+)
+from signal_gating.team import Mail, MemberIdle, TaskAssigned, TaskResult, Team
 from signal_gating.tracing import OpenTelemetrySpanExporter, Span, SpanSink, Tracer
 from signal_gating.trajectory import (
     Receipt,
@@ -74,6 +87,7 @@ from signal_gating.trajectory import (
     ReplayResult,
     TrajectoryRecorder,
     TrajectoryReplayRunner,
+    domain_payload,
 )
 
 __all__ = [
@@ -82,9 +96,11 @@ __all__ = [
     "AgentContext",
     "AgentError",
     "AgentPool",
+    "BudgetExceeded",
     "Channel",
     "ChannelClosed",
     "ChannelFull",
+    "CheckpointStore",
     "CircuitOpenError",
     "DeadLetterQueue",
     "Edge",
@@ -92,6 +108,8 @@ __all__ = [
     "Gate",
     "GateRejected",
     "LLMAgent",
+    "Mail",
+    "MemberIdle",
     "Mesh",
     "MeshEvent",
     "MeshEventSink",
@@ -104,12 +122,25 @@ __all__ = [
     "Receipt",
     "ReplayDelivery",
     "ReplayResult",
+    "Script",
+    "ScriptContext",
     "Signal",
     "SignalGatingError",
     "SignalSerializationError",
     "SignalValidationError",
     "Span",
     "SpanSink",
+    "Task",
+    "TaskAssigned",
+    "TaskBoard",
+    "TaskClaimed",
+    "TaskCompleted",
+    "TaskOpened",
+    "TaskRejected",
+    "TaskReleased",
+    "TaskResult",
+    "Team",
+    "TeamError",
     "ToolCallSignal",
     "ToolProvider",
     "ToolResultSignal",
@@ -118,10 +149,12 @@ __all__ = [
     "TrajectoryRecorder",
     "TrajectoryReplayRunner",
     "UnknownSignalType",
+    "domain_payload",
     "from_wire",
     "lookup_signal",
     "register_signal",
     "registered_signals",
+    "step_key",
     "to_wire",
 ]
 
