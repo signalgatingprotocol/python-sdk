@@ -60,11 +60,34 @@ class LLMClient(Protocol):
     def chat(self) -> _Chat: ...
 
 
-_JSON_TYPES = {"str": "string", "int": "integer", "float": "number", "bool": "boolean"}
+_JSON_TYPES = {
+    "str": "string",
+    "int": "integer",
+    "float": "number",
+    "bool": "boolean",
+    "list": "array",
+    "tuple": "array",
+    "set": "array",
+    "dict": "object",
+}
 
 
 def _json_type(t: Any) -> str:
     return _JSON_TYPES.get(str(t), "string")
+
+
+def _param_schema(t: Any) -> dict[str, Any]:
+    """A minimally-valid JSON-Schema fragment for a tool parameter type.
+
+    Container types must not collapse to ``"string"`` -- that tells the model
+    to pass a string where the tool wants an array/object, producing malformed
+    tool calls. Arrays also need an ``items`` schema for strict servers.
+    """
+    json_type = _json_type(t)
+    schema: dict[str, Any] = {"type": json_type}
+    if json_type == "array":
+        schema["items"] = {}
+    return schema
 
 
 class ToolProvider(Protocol):
@@ -106,7 +129,7 @@ class MeshToolProvider:
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                p: {"type": _json_type(meta.get("type"))}
+                                p: _param_schema(meta.get("type"))
                                 for p, meta in spec.parameters.items()
                             },
                             "required": [

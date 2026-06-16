@@ -248,7 +248,9 @@ class TaskBoard:
     async def complete(
         self, task_id: str, member: str, *, result: Mapping[str, Any] | None = None
     ) -> None:
-        opened = self._opened[task_id]
+        opened = self._opened.get(task_id)
+        if opened is None:
+            raise ValueError(f"unknown task {task_id!r}")
         event = TaskCompleted(
             task_id=task_id,
             member=member,
@@ -263,7 +265,9 @@ class TaskBoard:
             self._append(event)
 
     async def release(self, task_id: str, member: str, *, reason: str = "") -> None:
-        opened = self._opened[task_id]
+        opened = self._opened.get(task_id)
+        if opened is None:
+            raise ValueError(f"unknown task {task_id!r}")
         async with self._lock:
             self._require(task_id, member, "in_progress")
             self._append(
@@ -283,7 +287,9 @@ class TaskBoard:
             raise TaskRejected(getattr(event, "task_id", ""), gate.name)
 
     def _require(self, task_id: str, member: str, status: str) -> None:
-        task = self._tasks[task_id]
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise ValueError(f"unknown task {task_id!r}")
         if task.status != status or task.member != member:
             raise ValueError(
                 f"task {task_id!r} is {task.status!r}/{task.member!r}, "

@@ -75,8 +75,14 @@ class Receipt:
       trajectory replays as typed signals after a restart, the same way the
       dead-letter queue does.
 
-    The ``digest`` covers both, so a tampered payload *or* a tampered wire
-    envelope is detectable — reconstruction is as trustworthy as the audit view.
+    The ``digest`` is a SHA-256 *integrity checksum* over both the audit
+    projection and the wire envelope. It detects accidental corruption — a
+    truncated write, bit-rot, or an edit that forgets to recompute the digest —
+    so a reload (`verify()`) catches a damaged record before replay. It is
+    **not** a cryptographic signature: the hash is keyless, so anyone who can
+    edit the file can recompute a matching digest. For tamper-evidence against a
+    motivated actor, sign or HMAC the persisted file with a key the verifier
+    holds out of band.
     """
 
     trace_id: str
@@ -176,6 +182,12 @@ class Receipt:
         return Signal.from_wire(self.wire, strict=strict)
 
     def verify(self) -> bool:
+        """Recompute the integrity checksum and compare it to ``digest``.
+
+        Catches accidental corruption (truncated writes, bit-rot, an edit that
+        forgot to update the digest). The hash is keyless, so this is not proof
+        against a motivated editor — see the class docstring.
+        """
         core = {k: v for k, v in asdict(self).items() if k != "digest"}
         if _digest(core) == self.digest:
             return True
@@ -249,11 +261,20 @@ class TrajectoryRecorder:
         src = Path(path)
         receipts: list[Receipt] = []
         with src.open("r", encoding="utf-8") as f:
-            for line in f:
+            for lineno, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
-                receipt = Receipt.from_dict(json.loads(line))
+                # A single corrupted/partial line (truncated write, bit-rot) is
+                # exactly the durability scenario this exists for: name the file
+                # and line so the failure is diagnosable, not an opaque
+                # JSONDecodeError/TypeError from deep inside parsing.
+                try:
+                    receipt = Receipt.from_dict(json.loads(line))
+                except (json.JSONDecodeError, TypeError, ValueError, KeyError) as e:
+                    raise SignalSerializationError(
+                        f"Malformed receipt at {src}:{lineno}: {e}"
+                    ) from e
                 if verify and not receipt.verify():
                     raise _receipt_mismatch_error(receipt)
                 receipts.append(receipt)

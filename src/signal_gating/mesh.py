@@ -280,27 +280,37 @@ class Mesh:
         async def content_route(signal: Signal) -> None:
             for predicate, target in resolved:
                 if predicate(signal):
+                    delivered = await self._intercept_for_delivery(
+                        signal, src.name, target.name
+                    )
+                    if delivered is None:
+                        return
                     tracer.record(
-                        trace_id=signal.trace_id,
-                        signal_id=signal.id,
+                        trace_id=delivered.trace_id,
+                        signal_id=delivered.id,
                         agent=src.name,
                         gate="content_route",
                         action="routed",
                         target=target.name,
                     )
-                    await target.inbox.send(signal)
+                    await target.inbox.send(delivered)
                     return
             resolved_default = default_box[0]
             if resolved_default is not None:
+                delivered = await self._intercept_for_delivery(
+                    signal, src.name, resolved_default.name
+                )
+                if delivered is None:
+                    return
                 tracer.record(
-                    trace_id=signal.trace_id,
-                    signal_id=signal.id,
+                    trace_id=delivered.trace_id,
+                    signal_id=delivered.id,
                     agent=src.name,
                     gate="content_route",
                     action="default_routed",
                     target=resolved_default.name,
                 )
-                await resolved_default.inbox.send(signal)
+                await resolved_default.inbox.send(delivered)
 
         def prune(name: str) -> bool:
             resolved[:] = [(p, t) for p, t in resolved if t.name != name]
@@ -339,15 +349,20 @@ class Mesh:
                     return
                 signal = result
             target = resolved[next(index) % len(resolved)]
+            delivered = await self._intercept_for_delivery(
+                signal, src.name, target.name
+            )
+            if delivered is None:
+                return
             tracer.record(
-                trace_id=signal.trace_id,
-                signal_id=signal.id,
+                trace_id=delivered.trace_id,
+                signal_id=delivered.id,
                 agent=src.name,
                 gate="load_balance",
                 action="routed",
                 target=target.name,
             )
-            await target.inbox.send(signal)
+            await target.inbox.send(delivered)
 
         def prune(name: str) -> bool:
             resolved[:] = [t for t in resolved if t.name != name]
@@ -360,8 +375,15 @@ class Mesh:
     async def start(self) -> None:
         """Start all agents in the mesh."""
         self._running = True
-        for agent in self._agents.values():
-            await agent.start()
+        try:
+            for agent in self._agents.values():
+                await agent.start()
+        except BaseException:
+            # A failing on_start hook must not leave already-started agents
+            # running with no handle to stop them (and __aexit__ won't fire
+            # because __aenter__ raised). Tear down what we started.
+            await self.stop()
+            raise
         # Yield control so agent tasks can start running
         await asyncio.sleep(0)
         logger.info(
@@ -493,6 +515,27 @@ class Mesh:
             else:
                 current = result
         return current
+
+    async def _intercept_for_delivery(
+        self, signal: Signal, source: str, target: str
+    ) -> Signal | None:
+        """Run interceptors before a content-route/load-balance delivery.
+
+        Returns the (possibly transformed) signal, or None if an interceptor
+        blocked it. Interceptors are the documented hook for auth, rate
+        limiting, audit and metrics, so every edge -- connected, content-routed,
+        and load-balanced -- must pass through them.
+        """
+        intercepted = await self._apply_interceptors(signal, source, target)
+        if intercepted is None:
+            self.tracer.record(
+                trace_id=signal.trace_id,
+                signal_id=signal.id,
+                agent=f"{source}->{target}",
+                gate="interceptor",
+                action="intercepted",
+            )
+        return intercepted
 
     # --- Capability Discovery ---
 
@@ -853,6 +896,8 @@ class Mesh:
         Each target agent must `reply()` to the signal for gather to complete.
         Returns responses in the same order as targets.
         """
+        if not targets:
+            return []
         cid = uuid4().hex
         resolved = [self._resolve(t) for t in targets]
 

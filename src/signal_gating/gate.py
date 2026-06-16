@@ -29,6 +29,12 @@ class Gate:
     A gate receives a signal and either:
     - Returns the signal (possibly transformed) to pass it through
     - Returns None to reject it
+
+    Stateful gates (``rate_limit``, ``throttle``, ``debounce``, ``batch``,
+    ``window``, ``deduplicate``, ``circuit_breaker``) hold a single shared state
+    and are designed for one logical signal stream. Do not share one instance
+    across unrelated concurrent flows expecting per-flow isolation — give each
+    flow its own gate instance, or partition upstream.
     """
 
     def __init__(self, fn: GateFn, name: str = ""):
@@ -58,6 +64,8 @@ class Gate:
 
     def __or__(self, other: Gate) -> Gate:
         """Either gate: signal passes if either gate accepts."""
+        if not isinstance(other, Gate):
+            return NotImplemented
         left, right = self, other
 
         async def either(signal: Signal) -> Signal | None:
@@ -70,6 +78,8 @@ class Gate:
 
     def __and__(self, other: Gate) -> Gate:
         """Both gates: signal must pass both (uses result from second)."""
+        if not isinstance(other, Gate):
+            return NotImplemented
         left, right = self, other
 
         async def both(signal: Signal) -> Signal | None:
@@ -433,9 +443,11 @@ class Gate:
 
         With timeout > 0, the batch also flushes if ``timeout`` seconds have
         elapsed since the first signal in the current batch was received.
-        The timeout is checked on each incoming signal (not via background task),
-        so it prevents signals from sitting in the buffer indefinitely in
-        low-throughput scenarios.
+        The timeout is checked only when the *next* signal arrives (there is no
+        background flush task): a buffered batch is released on the first signal
+        after the timeout elapses, bundled with that signal. During a complete
+        lull in traffic the buffer is **not** flushed — if you need wall-clock
+        flushing under zero throughput, drive a periodic sentinel signal.
 
             gate = Gate.batch(10)             # flush every 10 signals
             gate = Gate.batch(10, timeout=5)  # flush every 10 signals or 5s
@@ -503,12 +515,18 @@ class Gate:
                     )
                     for t in pending:
                         t.cancel()
+                    # Await the cancelled losers so their cancellation actually
+                    # completes (cleanup runs, no "Task was destroyed but it is
+                    # pending" warnings) before we return the winner.
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
                     for t in done:
                         return t.result()
                     return None
-                except Exception:
+                except BaseException:
                     for t in tasks:
                         t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
                     raise
 
             results = await asyncio.gather(*(g.process(signal) for g in gate_list))

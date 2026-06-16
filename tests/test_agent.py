@@ -595,3 +595,54 @@ class TestOnceWithAgentContext:
             await asyncio.sleep(0.05)
 
         assert calls == ["worker"]
+
+    async def test_once_does_not_skip_sibling_handler(self):
+        """A once() handler that removes itself mid-dispatch must not cause the
+        handler registered after it (for the same type) to be skipped."""
+        agent = Agent("worker")
+        fired: list[str] = []
+
+        class S(Signal):
+            pass
+
+        @agent.once(S)
+        async def first(signal: S):
+            fired.append("once")
+
+        @agent.on(S)
+        async def second(signal: S):
+            fired.append("on")
+
+        mesh = Mesh([agent])
+        async with mesh:
+            await agent.inbox.send(S())
+            await asyncio.sleep(0.05)
+            await agent.inbox.send(S())
+            await asyncio.sleep(0.05)
+
+        # First signal: both fire. Second signal: only the persistent `on` fires.
+        assert fired == ["once", "on", "on"]
+
+    async def test_two_once_handlers_both_fire(self):
+        """Two once() handlers for the same type must both fire on the first
+        signal (neither silently skipped by mid-iteration self-removal)."""
+        agent = Agent("worker")
+        fired: list[str] = []
+
+        class S(Signal):
+            pass
+
+        @agent.once(S)
+        async def h1(signal: S):
+            fired.append("h1")
+
+        @agent.once(S)
+        async def h2(signal: S):
+            fired.append("h2")
+
+        mesh = Mesh([agent])
+        async with mesh:
+            await agent.inbox.send(S())
+            await asyncio.sleep(0.05)
+
+        assert sorted(fired) == ["h1", "h2"]
