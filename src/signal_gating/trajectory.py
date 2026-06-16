@@ -75,14 +75,11 @@ class Receipt:
       trajectory replays as typed signals after a restart, the same way the
       dead-letter queue does.
 
-    The ``digest`` is a SHA-256 *integrity checksum* over both the audit
-    projection and the wire envelope. It detects accidental corruption — a
-    truncated write, bit-rot, or an edit that forgets to recompute the digest —
-    so a reload (`verify()`) catches a damaged record before replay. It is
-    **not** a cryptographic signature: the hash is keyless, so anyone who can
-    edit the file can recompute a matching digest. For tamper-evidence against a
-    motivated actor, sign or HMAC the persisted file with a key the verifier
-    holds out of band.
+    The ``digest`` is a SHA-256 *integrity checksum* over the audit projection
+    and wire envelope, so ``verify()`` catches accidental corruption (truncated
+    writes, bit-rot) before replay. It is keyless — not a cryptographic
+    signature — so for tamper-evidence against a motivated actor, sign or HMAC
+    the persisted file with a key held out of band.
     """
 
     trace_id: str

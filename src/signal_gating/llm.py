@@ -72,22 +72,17 @@ _JSON_TYPES = {
 }
 
 
-def _json_type(t: Any) -> str:
-    return _JSON_TYPES.get(str(t), "string")
-
-
 def _param_schema(t: Any) -> dict[str, Any]:
-    """A minimally-valid JSON-Schema fragment for a tool parameter type.
+    """JSON-Schema fragment for a tool parameter type.
 
-    Container types must not collapse to ``"string"`` -- that tells the model
-    to pass a string where the tool wants an array/object, producing malformed
-    tool calls. Arrays also need an ``items`` schema for strict servers.
+    Containers must not collapse to ``"string"`` -- that tells the model to
+    pass a string where the tool wants an array/object. Arrays also need an
+    ``items`` schema for strict OpenAI-compatible servers.
     """
-    json_type = _json_type(t)
-    schema: dict[str, Any] = {"type": json_type}
+    json_type = _JSON_TYPES.get(str(t), "string")
     if json_type == "array":
-        schema["items"] = {}
-    return schema
+        return {"type": "array", "items": {}}
+    return {"type": json_type}
 
 
 class ToolProvider(Protocol):

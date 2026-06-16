@@ -49,12 +49,10 @@ class Signal(BaseModel):
         return dict(value)
 
     def __hash__(self) -> int:
-        # Pydantic's frozen-model hash would hash every field, including the
-        # ``metadata`` MappingProxyType, which is unhashable -- so the default
-        # raises TypeError for every Signal. Hash the immutable identity fields
-        # instead: equal signals share these (id is unique per event), so the
-        # hash stays consistent with equality while remaining computable.
-        return hash((self.id, self.trace_id, self.parent_id, self.correlation_id))
+        # The default frozen-model hash chokes on the unhashable MappingProxyType
+        # metadata. ``id`` is unique per event and determines equality, so it is
+        # a sufficient, consistent hash.
+        return hash(self.id)
 
     # Optional override for this class's wire type name. Define in a subclass
     # body to pin a stable name independent of refactors (see registry module).

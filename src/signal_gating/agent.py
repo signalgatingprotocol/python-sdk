@@ -607,10 +607,9 @@ class Agent:
     async def _dispatch(self, signal: Signal) -> None:
         """Dispatch a signal to matching handlers, with middleware."""
         dispatched = False
-        # Snapshot both the type map and each handler list: a `once` handler
-        # removes itself from its list while we iterate, and handlers may
-        # register/unregister handlers. Iterating live structures would skip
-        # the element shifted into a removed slot (or raise on dict mutation).
+        # Snapshot: a `once` handler removes itself mid-dispatch, and handlers
+        # may (un)register handlers. Iterating live structures would skip a
+        # handler or raise on mutation.
         for signal_type, handlers in list(self._handlers.items()):
             if isinstance(signal, signal_type):
                 for handler in tuple(handlers):

@@ -67,10 +67,8 @@ class Channel(Generic[T]):
         if self._closed:
             raise ChannelClosed()
         self._validate_type(signal)
-        # Race the put against close, so a producer blocked on a full buffer is
-        # woken (and raises ChannelClosed) when the channel closes, rather than
-        # hanging forever. close() never silently strands a waiter -- producer
-        # or receiver.
+        # Race the put against close so a producer blocked on a full buffer
+        # wakes (and raises ChannelClosed) instead of hanging when we close.
         put_task: asyncio.Task[None] = asyncio.ensure_future(self._queue.put(signal))
         close_task = asyncio.ensure_future(self._close_event.wait())
         try:
@@ -80,10 +78,7 @@ class Channel(Generic[T]):
                 timeout=timeout,
             )
             if put_task in done:
-                # Surface any error from the put itself (none expected).
-                put_task.result()
-                return
-            # Close won, or we timed out, before space opened up.
+                return put_task.result()
             if self._closed:
                 raise ChannelClosed()
             raise asyncio.TimeoutError()

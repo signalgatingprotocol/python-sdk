@@ -510,24 +510,17 @@ class Gate:
             if mode == "race":
                 tasks = [asyncio.create_task(g.process(signal)) for g in gate_list]
                 try:
-                    done, pending = await asyncio.wait(
+                    done, _ = await asyncio.wait(
                         tasks, return_when=asyncio.FIRST_COMPLETED
                     )
-                    for t in pending:
-                        t.cancel()
-                    # Await the cancelled losers so their cancellation actually
-                    # completes (cleanup runs, no "Task was destroyed but it is
-                    # pending" warnings) before we return the winner.
-                    if pending:
-                        await asyncio.gather(*pending, return_exceptions=True)
-                    for t in done:
-                        return t.result()
-                    return None
-                except BaseException:
+                    return next(iter(done)).result()
+                finally:
+                    # Cancel and await the losers so cancellation completes
+                    # (no leaked "pending" tasks). Cancelling a done task is a
+                    # no-op, so this is safe on the success path too.
                     for t in tasks:
                         t.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
-                    raise
 
             results = await asyncio.gather(*(g.process(signal) for g in gate_list))
 
