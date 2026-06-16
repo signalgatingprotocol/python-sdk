@@ -124,6 +124,8 @@ class ScriptContext:
     ) -> list[Signal]:
         """Round-robin signals across targets under the concurrency semaphore;
         results in input order. One target is serial by construction."""
+        if not targets:
+            raise ValueError("fan_out requires at least one target")
         names = [t if isinstance(t, str) else t.name for t in targets]
         steps = [
             (self._key(signal), names[i % len(names)], signal)

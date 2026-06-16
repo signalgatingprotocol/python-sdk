@@ -56,6 +56,10 @@ class _Steward:
         # and an explicit assign() can still retry it on this member.
         self.failed: set[str] = set()
         self.runner: asyncio.Task[None] | None = None
+        # The task currently being executed (claimed/assigned, awaiting its
+        # handler's reply). Tracked so a cancelling shutdown can release it
+        # instead of stranding it in_progress forever.
+        self.current: Task | None = None
 
 
 class Team:
@@ -163,6 +167,14 @@ class Team:
                 # latter so a cancelled steward never poisons shutdown.
                 if not runner.cancelled():
                     raise
+        # If the runner was cancelled mid-execution, its in-flight task is
+        # still in_progress; release it so a peer can reclaim it rather than
+        # leaving it stranded forever.
+        if steward.current is not None:
+            in_flight = steward.current
+            steward.current = None
+            with contextlib.suppress(ValueError):
+                await self.board.release(in_flight.id, member, reason="shutdown")
         while steward.assigned:
             task = steward.assigned.popleft()
             await self.board.release(task.id, member, reason="shutdown")
@@ -230,6 +242,7 @@ class Team:
                 trace_id=opened.trace_id,        # caller threads lineage
                 parent_id=opened.id,
             )
+            steward.current = task
             try:
                 reply = await self._mesh.request(
                     member, assigned, timeout=self._task_timeout
@@ -247,6 +260,10 @@ class Team:
                 )
             finally:
                 steward.worked = True
+            # Cleared only after a normal/handled exit. On cancellation (a
+            # timed-out shutdown) this line is skipped, leaving `current` set
+            # so shutdown can release the still-in_progress task.
+            steward.current = None
 
     async def _notify_idle(self, member: str) -> None:
         if self._lead is None:

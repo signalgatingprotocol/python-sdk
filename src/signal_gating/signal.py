@@ -48,6 +48,12 @@ class Signal(BaseModel):
     def _serialize_metadata(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return dict(value)
 
+    def __hash__(self) -> int:
+        # The default frozen-model hash chokes on the unhashable MappingProxyType
+        # metadata. ``id`` is unique per event and determines equality, so it is
+        # a sufficient, consistent hash.
+        return hash(self.id)
+
     # Optional override for this class's wire type name. Define in a subclass
     # body to pin a stable name independent of refactors (see registry module).
     __signal_type__: ClassVar[str]

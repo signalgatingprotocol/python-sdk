@@ -457,8 +457,11 @@ recorder.export_jsonl("runs.jsonl")  # one Receipt per line
 
 Each `Receipt` carries `event_kind`, `action`, the signal's lineage
 (`trace_id` / `parent_id`), routing (`source` -> `target`), typed domain
-`payload`, event `metadata`, and a `digest` (sha256) so the record is
-tamper-evident: `receipt.verify()`.
+`payload`, event `metadata`, and a `digest` (sha256) — an integrity checksum
+that `receipt.verify()` uses to catch accidental corruption (truncated writes,
+bit-rot) before replay. The digest is keyless, so it is not a cryptographic
+signature; to make a persisted trajectory tamper-evident against a motivated
+actor, sign or HMAC the file with a key the verifier holds out of band.
 
 A trajectory is more than readable: its signal-carrying receipts are
 **reconstructable**. Each receipt stores the full signal wire envelope, so a run

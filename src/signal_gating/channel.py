@@ -67,10 +67,25 @@ class Channel(Generic[T]):
         if self._closed:
             raise ChannelClosed()
         self._validate_type(signal)
-        if timeout is not None:
-            await asyncio.wait_for(self._queue.put(signal), timeout=timeout)
-        else:
-            await self._queue.put(signal)
+        # Race the put against close so a producer blocked on a full buffer
+        # wakes (and raises ChannelClosed) instead of hanging when we close.
+        put_task: asyncio.Task[None] = asyncio.ensure_future(self._queue.put(signal))
+        close_task = asyncio.ensure_future(self._close_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {put_task, close_task},
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=timeout,
+            )
+            if put_task in done:
+                return put_task.result()
+            if self._closed:
+                raise ChannelClosed()
+            raise asyncio.TimeoutError()
+        finally:
+            for t in (put_task, close_task):
+                if not t.done():
+                    t.cancel()
 
     async def receive(self) -> T:
         """Receive the next signal. Blocks until one is available or the channel closes."""
@@ -289,6 +304,10 @@ class PriorityChannel(Generic[T]):
             while True:
                 await self._has_space.wait()
                 async with self._lock:
+                    # close() may have fired while we waited for space; a
+                    # producer must not block forever on a closed channel.
+                    if self._closed:
+                        raise ChannelClosed()
                     if not self._max_size or len(self._heap) < self._max_size:
                         heapq.heappush(
                             self._heap, (-signal.priority, self._counter, signal)
@@ -324,6 +343,9 @@ class PriorityChannel(Generic[T]):
             return
         self._closed = True
         self._has_items.set()
+        # Wake producers blocked on a full buffer so they observe the close
+        # and raise ChannelClosed instead of hanging forever.
+        self._has_space.set()
 
     def __aiter__(self) -> PriorityChannel[T]:
         return self

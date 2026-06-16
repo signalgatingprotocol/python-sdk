@@ -607,9 +607,12 @@ class Agent:
     async def _dispatch(self, signal: Signal) -> None:
         """Dispatch a signal to matching handlers, with middleware."""
         dispatched = False
-        for signal_type, handlers in self._handlers.items():
+        # Snapshot: a `once` handler removes itself mid-dispatch, and handlers
+        # may (un)register handlers. Iterating live structures would skip a
+        # handler or raise on mutation.
+        for signal_type, handlers in list(self._handlers.items()):
             if isinstance(signal, signal_type):
-                for handler in handlers:
+                for handler in tuple(handlers):
                     await self._run_handler_with_middleware(handler, signal)
                 dispatched = True
 
@@ -683,19 +686,24 @@ class Agent:
                 self._processing = True
                 try:
                     start = time.monotonic()
+
+                    # Request/response: a reply we are actively awaiting resolves
+                    # its pending future directly, BEFORE gates. A reply you
+                    # explicitly requested must not be subject to inbox-admission
+                    # gates (e.g. a by_priority gate would otherwise silently
+                    # dead-letter the reply and hang request() until timeout).
+                    if signal.correlation_id:
+                        future = self._pending_requests.pop(signal.correlation_id, None)
+                        if future is not None and not future.done():
+                            future.set_result(signal)
+                            self._processed_count += 1
+                            continue
+
                     gated = await self._apply_gates(signal)
                     if gated is None:
                         self._rejected_count += 1
                         self.dead_letters.add(signal, "gate_rejected", self.name)
                         continue
-
-                    # Request/response: resolve pending futures for correlated responses
-                    if gated.correlation_id:
-                        future = self._pending_requests.pop(gated.correlation_id, None)
-                        if future is not None and not future.done():
-                            future.set_result(gated)
-                            self._processed_count += 1
-                            continue
 
                     self._processed_count += 1
                     try:
