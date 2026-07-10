@@ -1443,6 +1443,42 @@ class Mesh:
 
     # --- Graceful Shutdown ---
 
+    async def wait_idle(self, timeout: float = 10.0) -> None:
+        """Wait until every agent has handled its queued and in-flight work.
+
+        This includes signals that handlers emit to downstream agents while
+        the mesh is draining. Raises ``asyncio.TimeoutError`` with the active
+        agent states when the mesh does not become idle before ``timeout``.
+        """
+        if timeout < 0:
+            raise ValueError("timeout must be >= 0")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        interval = 0.01
+
+        while True:
+            active = [
+                agent
+                for agent in self._agents.values()
+                if agent.inbox.pending > 0 or agent.busy
+            ]
+            if not active:
+                return
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                states = ", ".join(
+                    f"{agent.name}(pending={agent.inbox.pending}, busy={agent.busy})"
+                    for agent in active
+                )
+                raise asyncio.TimeoutError(
+                    f"Mesh did not become idle within {timeout:g}s; active agents: {states}"
+                )
+
+            await asyncio.sleep(min(interval, remaining))
+            interval = min(interval * 1.5, 0.2)
+
     async def stop(self, drain: bool = False, drain_timeout: float = 10.0) -> None:
         """Stop all agents gracefully.
 
@@ -1453,19 +1489,10 @@ class Mesh:
         """
         self._running = False
         if drain:
-            # Wait for all inboxes to empty with adaptive polling
-            deadline = asyncio.get_running_loop().time() + drain_timeout
-            interval = 0.01  # Start fast, back off
-            while asyncio.get_running_loop().time() < deadline:
-                # An empty inbox isn't enough: a handler may be mid-flight and
-                # about to emit. Wait until every agent is also idle.
-                if all(
-                    a.inbox.pending == 0 and not a.busy
-                    for a in self._agents.values()
-                ):
-                    break
-                await asyncio.sleep(interval)
-                interval = min(interval * 1.5, 0.2)  # Adaptive: 10ms -> 200ms
+            try:
+                await self.wait_idle(timeout=drain_timeout)
+            except asyncio.TimeoutError as error:
+                logger.warning("%s; forcing shutdown", error)
         await asyncio.gather(*(agent.stop() for agent in self._agents.values()))
         logger.info("Mesh stopped")
 
@@ -1480,8 +1507,16 @@ class Mesh:
         await self.start()
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
-        await self.stop()
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: Any,
+    ) -> None:
+        # A clean context exit is the safe common path: finish work, including
+        # downstream emissions, before closing inboxes. On an exceptional exit,
+        # stop promptly instead of continuing potentially unwanted side effects.
+        await self.stop(drain=exc_type is None)
 
     def visualize(self) -> str:
         """Text-based topology visualization for introspection and debugging.

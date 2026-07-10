@@ -55,7 +55,7 @@ async def main(dlq_path: Path) -> None:
         # Fresh work — these fail on attempt 1 and get dead-lettered.
         for task in ("index", "embed", "summarize"):
             await worker.inbox.send(TaskSignal(task=task))
-        await asyncio.sleep(0.1)
+        await mesh.wait_idle()
 
     if worker.dead_letters.count:
         written = worker.dead_letters.to_jsonl(dlq_path)

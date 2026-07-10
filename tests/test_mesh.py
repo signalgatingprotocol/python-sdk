@@ -24,6 +24,59 @@ async def test_mesh_lifecycle():
     assert not agent.running
 
 
+async def test_mesh_context_exit_drains_multi_hop_work():
+    source = Agent("source")
+    middle = Agent("middle")
+    sink = Agent("sink")
+    received: list[str] = []
+
+    @middle.on(TaskSignal)
+    async def forward(signal: TaskSignal):
+        # Keep the handler active long enough for a concurrent shutdown to
+        # close downstream inboxes before this emission.
+        await asyncio.sleep(0.01)
+        await middle.emit(TaskSignal(task=f"{signal.task}:forwarded"))
+
+    @sink.on(TaskSignal)
+    async def collect(signal: TaskSignal):
+        received.append(signal.task)
+
+    mesh = Mesh([source, middle, sink])
+    mesh.connect(source, middle)
+    mesh.connect(middle, sink)
+
+    async with mesh:
+        await source.emit(TaskSignal(task="hello"))
+
+    assert received == ["hello:forwarded"]
+
+
+async def test_wait_idle_timeout_identifies_active_agents():
+    worker = Agent("blocked-worker")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    @worker.on(TaskSignal)
+    async def block(_signal: TaskSignal):
+        entered.set()
+        await release.wait()
+
+    mesh = Mesh([worker])
+    await mesh.start()
+    try:
+        await worker.inbox.send(TaskSignal(task="blocked"))
+        await entered.wait()
+
+        with pytest.raises(
+            asyncio.TimeoutError,
+            match=r"active agents: blocked-worker\(pending=0, busy=True\)",
+        ):
+            await mesh.wait_idle(timeout=0.01)
+    finally:
+        release.set()
+        await mesh.stop(drain=True)
+
+
 async def test_mesh_connect():
     producer = Agent("producer")
     consumer = Agent("consumer")

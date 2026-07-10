@@ -53,7 +53,7 @@ async def main():
     print("\nProcessing signals...")
     async with mesh:
         await ingester.emit(DataSignal(payload="sensor-reading-42", priority=5))
-        await asyncio.sleep(0.1)
+        await mesh.wait_idle()
 
     print(f"\nAggregator received {len(results)} signals:")
     for r in results:

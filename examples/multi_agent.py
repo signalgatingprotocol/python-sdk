@@ -47,7 +47,7 @@ async def main():
         await coordinator.emit(TaskSignal(task="market trends", priority=8))
         await coordinator.emit(TaskSignal(task="minor update", priority=1))  # filtered by gate
         await coordinator.emit(TaskSignal(task="risk assessment", priority=9))
-        await asyncio.sleep(0.1)
+        await mesh.wait_idle()
 
     print("\nAgent stats:")
     for agent in [coordinator, analyst, reporter]:

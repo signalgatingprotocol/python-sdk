@@ -54,10 +54,14 @@ mesh.connect(planner, worker)
 async def main():
     async with mesh:
         await planner.emit(TaskSignal(task="build feature", priority=5))
-        await asyncio.sleep(0.05)
 
 asyncio.run(main())
 ```
+
+A clean `async with mesh` exit waits for queued and in-flight work, including
+signals emitted to downstream agents. To wait while keeping the mesh open, use
+`await mesh.wait_idle(timeout=10)`; a timeout identifies the agents that are
+still busy instead of silently dropping work.
 
 ## Core Primitives
 
@@ -208,7 +212,7 @@ await mesh.remove(analyst)  # Remove agent, cleanup all connections
 # Lifecycle with graceful drain
 async with mesh:
     await coordinator.emit(TaskSignal(task="analyze"))
-await mesh.stop(drain=True)  # Wait for all pending signals to complete
+# Clean context exit waits for all pending and in-flight signals to complete.
 ```
 
 **Interceptors**: mesh-level cross-cutting concerns (auth, logging, metrics):

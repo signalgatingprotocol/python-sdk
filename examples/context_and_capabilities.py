@@ -64,7 +64,7 @@ async def main():
 
     async with mesh:
         await coordinator.emit(TaskSignal(task="market trends", priority=5))
-        await asyncio.sleep(0.1)
+        await mesh.wait_idle()
 
     # Graceful shutdown already happened via __aexit__
     print(f"\nResults collected: {len(results)}")
