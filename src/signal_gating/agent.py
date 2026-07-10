@@ -869,7 +869,10 @@ class Agent:
         automatically handles ToolCallSignal for that tool name, executes the
         function, and replies with a ToolResultSignal.
 
-        Supports both sync and async tool functions.
+        Supports both sync and async tool functions. Async tools execute on the
+        event loop; sync tools execute in a worker thread so blocking work does
+        not stall the rest of the mesh. As with ``asyncio.to_thread``, cancelling
+        a call cannot stop synchronous work that has already started.
 
             @worker.tool(description="Analyze data and return insights")
             async def analyze(data: str, depth: int = 1) -> dict:
@@ -936,9 +939,16 @@ class Agent:
                         ))
                         return
                     try:
-                        result = tool.fn(**signal.arguments)
-                        if isawaitable(result):
-                            result = await result
+                        if inspect.iscoroutinefunction(tool.fn):
+                            result = await tool.fn(**signal.arguments)
+                        else:
+                            result = await asyncio.to_thread(
+                                tool.fn, **signal.arguments
+                            )
+                            # Async callable objects are not always recognized by
+                            # iscoroutinefunction; preserve support for those.
+                            if isawaitable(result):
+                                result = await result
                         await ctx.reply(ToolResultSignal(
                             tool_name=signal.tool_name,
                             result=result,

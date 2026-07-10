@@ -1,6 +1,7 @@
 """Tests for agent-native orchestration: tool calling, map_reduce, branch_workflow."""
 
 import asyncio
+import threading
 
 import pytest
 
@@ -13,6 +14,7 @@ from signal_gating import (
     ToolResultSignal,
     ToolSpec,
 )
+from signal_gating.errors import ChannelClosed, MeshError
 
 # --- Signal types for tests ---
 
@@ -218,6 +220,21 @@ class TestAgentTool:
         assert len(results) == 1
         assert results[0].result == 30
 
+    async def test_sync_tool_runs_off_event_loop(self):
+        """A blocking sync tool must not stall every agent in the mesh."""
+        worker = Agent("worker")
+        event_loop_thread = threading.get_ident()
+
+        @worker.tool(description="Report the execution thread")
+        def execution_thread() -> int:
+            return threading.get_ident()
+
+        mesh = Mesh([worker])
+        async with mesh:
+            tool_thread = await mesh.call_tool(worker, "execution_thread")
+
+        assert tool_thread != event_loop_thread
+
 
 # --- Mesh.call_tool() ---
 
@@ -284,6 +301,107 @@ class TestMeshCallTool:
         mesh = Mesh([agent])
         all_tools = mesh.discover_tools()
         assert len(all_tools) == 0
+
+
+# --- Mesh.scatter() ---
+
+
+class TestMeshScatter:
+    """Tests for fail-fast, all-or-nothing scatter semantics."""
+
+    async def test_timeout_names_missing_targets_and_cleans_up_captures(self):
+        responsive = Agent("responsive")
+        silent_second = Agent("silent-second")
+        silent_first = Agent("silent-first")
+
+        @responsive.on(TaskSignal)
+        async def respond(signal: TaskSignal, ctx: AgentContext):
+            await ctx.reply(ResultSignal(result=f"done:{signal.task}"))
+
+        @silent_second.on(TaskSignal)
+        @silent_first.on(TaskSignal)
+        async def do_not_reply(_signal: TaskSignal):
+            return
+
+        mesh = Mesh([responsive, silent_second, silent_first])
+        async with mesh:
+            with pytest.raises(
+                asyncio.TimeoutError,
+                match=(
+                    r"Scatter timed out after 0\.05s waiting for agents: "
+                    r"'silent-second', 'silent-first'"
+                ),
+            ):
+                await mesh.scatter(
+                    TaskSignal(task="analyze"),
+                    [responsive, silent_second, silent_first],
+                    timeout=0.05,
+                )
+
+        assert responsive._outbox == []
+        assert silent_second._outbox == []
+        assert silent_first._outbox == []
+
+    async def test_duplicate_resolved_target_fails_before_dispatch(self):
+        worker = Agent("worker")
+        handled = 0
+
+        @worker.on(Signal)
+        async def count_handler(_signal: Signal):
+            nonlocal handled
+            handled += 1
+
+        mesh = Mesh([worker])
+        async with mesh:
+            with pytest.raises(
+                MeshError,
+                match=r"scatter targets must be unique; duplicate agent: 'worker'",
+            ):
+                await mesh.scatter(Signal(), [worker, "worker"])
+
+            assert handled == 0
+            assert worker._outbox == []
+
+    async def test_dispatch_failure_cleans_up_all_captures(self):
+        first = Agent("first")
+        stopped = Agent("stopped")
+        first_processed = asyncio.Event()
+
+        @first.on(Signal)
+        async def observe_partial_dispatch(_signal: Signal):
+            first_processed.set()
+
+        mesh = Mesh([first, stopped])
+        async with mesh:
+            await stopped.stop()
+
+            with pytest.raises(ChannelClosed):
+                await mesh.scatter(Signal(), [first, stopped])
+
+            await asyncio.wait_for(first_processed.wait(), timeout=0.5)
+            assert first._outbox == []
+            assert stopped._outbox == []
+
+    async def test_cancellation_cleans_up_all_captures(self):
+        silent = Agent("silent")
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        @silent.on(Signal)
+        async def wait_without_reply(_signal: Signal):
+            started.set()
+            await release.wait()
+
+        mesh = Mesh([silent])
+        async with mesh:
+            scatter = asyncio.create_task(mesh.scatter(Signal(), [silent]))
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            scatter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await scatter
+
+            assert silent._outbox == []
+            release.set()
 
 
 # --- Mesh.map_reduce() ---
@@ -355,6 +473,42 @@ class TestMeshMapReduce:
         async with mesh:
             with pytest.raises(Exception, match="at least one mapper"):
                 await mesh.map_reduce(Signal(), [], reducer)
+
+    async def test_mapper_timeout_never_invokes_reducer(self):
+        responsive = Agent("responsive")
+        silent = Agent("silent")
+        reducer = Agent("reducer")
+        reducer_called = False
+
+        @responsive.on(Signal)
+        async def respond(signal: Signal, ctx: AgentContext):
+            await ctx.reply(signal.with_metadata(mapper="responsive"))
+
+        @silent.on(Signal)
+        async def do_not_reply(_signal: Signal):
+            return
+
+        @reducer.on(Signal)
+        async def reduce(signal: Signal, ctx: AgentContext):
+            nonlocal reducer_called
+            reducer_called = True
+            await ctx.reply(signal)
+
+        mesh = Mesh([responsive, silent, reducer])
+        async with mesh:
+            with pytest.raises(
+                asyncio.TimeoutError,
+                match=r"waiting for agents: 'silent'",
+            ):
+                await mesh.map_reduce(
+                    Signal(),
+                    mappers=[responsive, silent],
+                    reducer=reducer,
+                    timeout=1.0,
+                    mapper_timeout=0.05,
+                )
+
+        assert reducer_called is False
 
 
 # --- Mesh.branch_workflow() ---

@@ -246,6 +246,15 @@ responses = await mesh.scatter(
 )
 ```
 
+Scatter is all-or-nothing: if any target misses the deadline, it raises
+`asyncio.TimeoutError` naming every missing agent instead of returning ambiguous
+partial data. For custom partial-result policies, compose individual
+`mesh.request()` tasks.
+
+Each scatter target must be unique, including when mixing agent objects and
+names. Passing the same agent more than once raises `MeshError` before any work
+is sent; use separate requests when intentionally repeating work.
+
 **Map/Reduce**: parallel analysis, then synthesis:
 
 ```python
@@ -328,6 +337,11 @@ schema = analyst.tools_schema()
 `MeshToolProvider` converts these tools into OpenAI-compatible function-tool
 schemas. It is not an MCP adapter; direct `mesh.call_tool()` calls route through
 the mesh request path and are captured by `mesh.record(...)`.
+
+`Agent.tool()` accepts both async and synchronous functions. Async tools run on
+the event loop; synchronous tools run in a worker thread so blocking I/O does
+not stall the mesh. Use an async tool for event-loop-bound resources or when
+cancellation must stop the underlying operation.
 
 ### Pipeline
 
