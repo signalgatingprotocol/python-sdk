@@ -262,6 +262,43 @@ async def test_scatter_records_fanout_and_all_replies_once():
     assert len({r.metadata["correlation_id"] for r in sends}) == 3
 
 
+async def test_scatter_timeout_records_missing_targets_and_counts():
+    recorder = TrajectoryRecorder()
+    responsive, silent = Agent("responsive"), Agent("silent")
+
+    @responsive.on(Ping)
+    async def respond(sig: Ping) -> None:
+        await responsive.reply(sig, sig.child(n=sig.n + 1))
+
+    @silent.on(Ping)
+    async def do_not_reply(_sig: Ping) -> None:
+        return
+
+    mesh = Mesh([responsive, silent])
+    mesh.record(recorder)
+
+    async with mesh:
+        with pytest.raises(asyncio.TimeoutError, match="'silent'"):
+            await mesh.scatter(Ping(n=0), [responsive, silent], timeout=0.05)
+
+    timeout_receipts = [
+        receipt
+        for receipt in recorder.receipts
+        if receipt.action == "scatter_timeout"
+    ]
+    assert len(timeout_receipts) == 1
+    timeout_receipt = timeout_receipts[0]
+    assert timeout_receipt.source == "mesh"
+    assert timeout_receipt.target == ""
+    assert timeout_receipt.signal_type == "Ping"
+    assert timeout_receipt.metadata == {
+        "missing_targets": ["silent"],
+        "received_count": 1,
+        "expected_count": 2,
+        "timeout": 0.05,
+    }
+
+
 async def test_race_records_sends_and_single_winner():
     recorder = TrajectoryRecorder()
     fast, slow = Agent("fast"), Agent("slow")

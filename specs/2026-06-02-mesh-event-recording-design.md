@@ -67,6 +67,7 @@ Direct mesh operations:
 - `response_received`: `target -> mesh`
 - `scatter_sent`: `mesh -> target`
 - `scatter_response`: `target -> mesh`
+- `scatter_timeout`: aggregate failure with missing targets and response counts
 - `race_sent`: `mesh -> target`
 - `race_response`: `target -> mesh`
 - `race_winner`: winning response
@@ -114,7 +115,7 @@ It re-delivers recorded entry events into a fresh mesh:
 - `race_sent`
 - `published`
 
-It skips audit/control events such as `response_received`, `workflow_step_start`, `workflow_step_complete`, `tool_call_complete`, `race_winner`, and connected route outcomes. Replayed deliveries are recorded as `replay_delivered` events when the target mesh has event sinks attached; metadata points back to the original action, source, and signal id.
+It skips audit/control events such as `response_received`, `scatter_timeout`, `workflow_step_start`, `workflow_step_complete`, `tool_call_complete`, `race_winner`, and connected route outcomes. Replayed deliveries are recorded as `replay_delivered` events when the target mesh has event sinks attached; metadata points back to the original action, source, and signal id.
 
 This is not full session resume. It does not recreate pending futures, workflow loops, or Claude Agent SDK conversation sessions. That future layer should build on the same event log with explicit run/session ids and idempotency keys.
 

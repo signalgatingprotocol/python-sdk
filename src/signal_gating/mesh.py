@@ -894,68 +894,109 @@ class Mesh:
             )
 
         Each target agent must `reply()` to the signal for gather to complete.
-        Returns responses in the same order as targets.
+        Returns responses in the same order as targets. Scatter is all-or-nothing:
+        if any target misses the deadline, no partial result is returned.
+        Each resolved target must appear only once; duplicate object/name
+        references raise ``MeshError`` before any work is sent.
+
+        Raises:
+            asyncio.TimeoutError: If one or more targets do not reply before
+                ``timeout``. The error identifies every missing target.
+            MeshError: If the same resolved agent appears more than once.
         """
         if not targets:
             return []
         cid = uuid4().hex
         resolved = [self._resolve(t) for t in targets]
+        seen_targets: set[str] = set()
+        duplicate_targets: list[str] = []
+        for target in resolved:
+            if target.name in seen_targets:
+                if target.name not in duplicate_targets:
+                    duplicate_targets.append(target.name)
+            else:
+                seen_targets.add(target.name)
+        if duplicate_targets:
+            duplicates = ", ".join(repr(name) for name in duplicate_targets)
+            noun = "agent" if len(duplicate_targets) == 1 else "agents"
+            raise MeshError(
+                f"scatter targets must be unique; duplicate {noun}: {duplicates}. "
+                "Pass each agent once."
+            )
 
         loop = asyncio.get_running_loop()
         futures: list[asyncio.Future[Signal]] = []
         capture_fns: list[tuple[Agent, Any]] = []
 
-        for target in resolved:
-            target_cid = f"{cid}:{target.name}"
-            future: asyncio.Future[Signal] = loop.create_future()
-            futures.append(future)
-
-            # Capture replies from this target's outbox by correlation_id.
-            # This avoids the previous bug where registering on _pending_requests
-            # caused the signal to be intercepted before reaching handlers.
-            def _make_capture(
-                f: asyncio.Future[Signal], tcid: str, tname: str
-            ) -> Any:
-                async def capture(sig: Signal) -> None:
-                    if sig.correlation_id == tcid and not f.done():
-                        await self._record_event(
-                            "scatter_response",
-                            sig,
-                            source=tname,
-                            target="mesh",
-                            correlation_id=tcid,
-                        )
-                        f.set_result(sig)
-
-                return capture
-
-            capture = _make_capture(future, target_cid, target.name)
-            target._outbox.append(capture)  # noqa: SLF001
-            capture_fns.append((target, capture))
-
-        # Send signals to all targets
-        for target in resolved:
-            target_cid = f"{cid}:{target.name}"
-            scatter_signal = signal.evolve(correlation_id=target_cid)
-            await self._record_event(
-                "scatter_sent",
-                scatter_signal,
-                source="mesh",
-                target=target.name,
-                correlation_id=target_cid,
-            )
-            await target.inbox.send(scatter_signal)
-
         try:
-            done, _ = await asyncio.wait(futures, timeout=timeout)
-            results: list[Signal] = []
-            for f in futures:
-                if f.done() and not f.cancelled() and f.exception() is None:
-                    results.append(f.result())
-                else:
-                    results.append(signal)  # Placeholder for timed-out targets
-            return results
+            for target in resolved:
+                target_cid = f"{cid}:{target.name}"
+                future: asyncio.Future[Signal] = loop.create_future()
+                futures.append(future)
+
+                # Capture replies from this target's outbox by correlation_id.
+                # This avoids the previous bug where registering on _pending_requests
+                # caused the signal to be intercepted before reaching handlers.
+                def _make_capture(
+                    f: asyncio.Future[Signal], tcid: str, tname: str
+                ) -> Any:
+                    async def capture(sig: Signal) -> None:
+                        if sig.correlation_id == tcid and not f.done():
+                            await self._record_event(
+                                "scatter_response",
+                                sig,
+                                source=tname,
+                                target="mesh",
+                                correlation_id=tcid,
+                            )
+                            f.set_result(sig)
+
+                    return capture
+
+                capture = _make_capture(future, target_cid, target.name)
+                target._outbox.append(capture)  # noqa: SLF001
+                capture_fns.append((target, capture))
+
+            # Send signals to all targets.
+            for target in resolved:
+                target_cid = f"{cid}:{target.name}"
+                scatter_signal = signal.evolve(correlation_id=target_cid)
+                await self._record_event(
+                    "scatter_sent",
+                    scatter_signal,
+                    source="mesh",
+                    target=target.name,
+                    correlation_id=target_cid,
+                )
+                await target.inbox.send(scatter_signal)
+
+            _, pending = await asyncio.wait(futures, timeout=timeout)
+            if pending:
+                missing_targets = [
+                    target.name
+                    for target, future in zip(resolved, futures, strict=True)
+                    if future in pending
+                ]
+                for future in pending:
+                    future.cancel()
+                await self._record_event(
+                    "scatter_timeout",
+                    signal,
+                    source="mesh",
+                    missing_targets=missing_targets,
+                    received_count=len(futures) - len(pending),
+                    expected_count=len(futures),
+                    timeout=timeout,
+                )
+                missing = ", ".join(repr(name) for name in missing_targets)
+                raise asyncio.TimeoutError(
+                    f"Scatter timed out after {timeout:g}s waiting for agents: {missing}"
+                )
+            return [future.result() for future in futures]
         finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
             for target, capture in capture_fns:
                 try:
                     target._outbox.remove(capture)  # noqa: SLF001
