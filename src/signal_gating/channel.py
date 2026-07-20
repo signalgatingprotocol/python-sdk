@@ -196,6 +196,9 @@ class Channel(Generic[T]):
             async for signal in Channel.merge(inbox_a, inbox_b, inbox_c):
                 process(signal)
         """
+        if not channels:
+            return
+
         output: asyncio.Queue[T | None] = asyncio.Queue()
         remaining = len(channels)
         lock = asyncio.Lock()
