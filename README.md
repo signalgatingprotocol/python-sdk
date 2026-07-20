@@ -6,29 +6,26 @@ The Signal Gating Protocol provides composable primitives for building multi-age
 
 ## Install
 
+The first PyPI release has not been published yet. Install the current alpha
+directly from GitHub:
+
 ```bash
-pip install signal-gating
+pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm]"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel]"
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
-Or from source:
-
-```bash
-pip install git+https://github.com/signalgatingprotocol/python-sdk
-```
-
-> Alpha: the API surface is still moving.
+> Alpha: the API surface is still moving. Pin a commit SHA for reproducible use.
 
 ## Quick Start
 
