@@ -96,6 +96,13 @@ async def test_pending_count():
     assert ch.pending == 0
 
 
+async def test_merge_without_channels_finishes_immediately():
+    async def collect() -> list[Signal]:
+        return [signal async for signal in Channel.merge()]
+
+    assert await asyncio.wait_for(collect(), timeout=0.1) == []
+
+
 # --- Backpressure: send_wait ---
 
 
