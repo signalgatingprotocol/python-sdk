@@ -359,9 +359,10 @@ schema = analyst.tools_schema()
 # [{"name": "analyze", "description": "...", "parameters": {...}}]
 ```
 
-`MeshToolProvider` converts these tools into OpenAI-compatible function-tool
-schemas. It is not an MCP adapter; direct `mesh.call_tool()` calls route through
-the mesh request path and are captured by `mesh.record(...)`.
+`MeshToolProvider` converts an explicit allowlist of these tools into
+OpenAI-compatible function-tool schemas. It is not an MCP adapter; direct
+`mesh.call_tool()` calls route through the mesh request path and are captured by
+`mesh.record(...)`.
 
 `Agent.tool()` accepts both async and synchronous functions. Async tools run on
 the event loop; synchronous tools run in a worker thread so blocking I/O does
@@ -459,24 +460,41 @@ call them, and act before answering:
 from signal_gating import Agent, Mesh
 from signal_gating.llm import LLMAgent, MeshToolProvider
 
-mesh = Mesh()
 analyst = Agent("analyst")
 
 @analyst.tool(description="Analyze a topic and return key points")
 async def analyze(topic: str) -> dict:
     return {"points": [...]}
 
+mesh = Mesh([analyst])
 planner = LLMAgent.from_openai(
     "planner",
     base_url="http://127.0.0.1:8642/v1", api_key="...", model="hermes-agent",
-    tools=MeshToolProvider(mesh),
+    tools=MeshToolProvider(mesh, allow={"analyst": {"analyze"}}),
 )
-mesh.add(analyst)
 mesh.add(planner)
 # planner can now call analyst.analyze before emitting its result.
 ```
 
 The loop is bounded by `max_tool_rounds` (default 4).
+
+#### LLM tool security
+
+Treat model output as untrusted. `MeshToolProvider` requires an explicit
+agent-and-tool allowlist and applies it both when generating schemas and when
+executing a requested call. Add authorized agents to the mesh and register
+their tools before constructing the provider; unknown names fail immediately.
+An empty `allow={}` disables all model tool access.
+
+Use `allow_all=True` only when every current and future tool in the mesh is safe
+for the model to invoke. It preserves dynamic discovery, so adding a tool later
+also exposes it. A prompt injection or mistaken model decision can exercise the
+full exposed surface.
+
+The provider controls LLM access through that provider. It does not authorize
+direct `mesh.call_tool()` calls, raw inbox writes, or the behavior inside a tool.
+Each tool must still validate its inputs, enforce caller permissions, protect
+secrets, and make destructive side effects explicit.
 
 ### Focused improvement loops
 

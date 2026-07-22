@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import Any, Protocol, cast
 
 from signal_gating.agent import Agent, ToolSpec
@@ -94,20 +94,99 @@ class ToolProvider(Protocol):
 
 
 class MeshToolProvider:
-    """Exposes a mesh's agent tools to an LLMAgent in OpenAI function-tool format."""
+    """Expose explicitly authorized mesh tools to an LLMAgent.
 
-    def __init__(self, mesh: Mesh) -> None:
+    Model-selected tool calls cross a security boundary. Pass ``allow`` to
+    expose only named tools, or opt a trusted internal mesh into unrestricted
+    discovery with ``allow_all=True``. Omitting both policies fails closed.
+    """
+
+    def __init__(
+        self,
+        mesh: Mesh,
+        *,
+        allow: Mapping[str, Collection[str]] | None = None,
+        allow_all: bool = False,
+    ) -> None:
         self._mesh = mesh
+        if allow is None and not allow_all:
+            raise ValueError(
+                "MeshToolProvider requires an explicit allow mapping; "
+                "use allow={} to expose no tools or allow_all=True only for a trusted mesh."
+            )
+        if allow is not None and allow_all:
+            raise ValueError(
+                "MeshToolProvider allow cannot be combined with allow_all=True; "
+                "choose one exposure policy."
+            )
+
+        self._allow = None if allow is None else self._normalize_allow(allow)
+        if self._allow is not None:
+            self._validate_allowlist()
+        # Fail early when the configured public surface is ambiguous.
+        self._index()
+
+    @staticmethod
+    def _normalize_allow(
+        allow: Mapping[str, Collection[str]],
+    ) -> dict[str, frozenset[str]]:
+        if not isinstance(allow, Mapping):
+            raise TypeError("MeshToolProvider allow must be a mapping of agent to tool names")
+
+        normalized: dict[str, frozenset[str]] = {}
+        for owner, names in allow.items():
+            if not isinstance(owner, str):
+                raise TypeError("MeshToolProvider allow agent names must be strings")
+            if isinstance(names, (str, bytes)):
+                raise TypeError(
+                    f"MeshToolProvider allow[{owner!r}] must be a collection of tool names, "
+                    "not a string"
+                )
+            if not isinstance(names, Collection):
+                raise TypeError(
+                    f"MeshToolProvider allow[{owner!r}] must be a collection of tool names"
+                )
+            if any(not isinstance(name, str) for name in names):
+                raise TypeError(
+                    f"MeshToolProvider allow[{owner!r}] tool names must be strings"
+                )
+            normalized[owner] = frozenset(names)
+        return normalized
+
+    def _validate_allowlist(self) -> None:
+        assert self._allow is not None
+        agents = {agent.name: agent for agent in self._mesh.agents}
+        for owner, allowed_names in self._allow.items():
+            agent = agents.get(owner)
+            if agent is None:
+                raise ValueError(
+                    f"MeshToolProvider allowlist references unknown agent {owner!r}; "
+                    "add the agent to the mesh before constructing the provider."
+                )
+            available_names = {spec.name for spec in agent.list_tools()}
+            unknown_names = sorted(allowed_names - available_names)
+            if unknown_names:
+                noun = "tool" if len(unknown_names) == 1 else "tools"
+                joined = ", ".join(repr(name) for name in unknown_names)
+                raise ValueError(
+                    f"MeshToolProvider allowlist references unknown {noun} {joined} "
+                    f"for agent {owner!r}; register it before constructing the provider."
+                )
+
+    def _is_allowed(self, owner: str, name: str) -> bool:
+        return self._allow is None or name in self._allow.get(owner, ())
 
     def _index(self) -> dict[str, tuple[str, ToolSpec]]:
         index: dict[str, tuple[str, ToolSpec]] = {}
         for owner, specs in self._mesh.discover_tools().items():
             for spec in specs:
+                if not self._is_allowed(owner, spec.name):
+                    continue
                 if spec.name in index:
                     raise ValueError(
-                        f"MeshToolProvider: duplicate tool name {spec.name!r} "
+                        f"MeshToolProvider: duplicate exposed tool name {spec.name!r} "
                         f"(agents {index[spec.name][0]!r} and {owner!r}); "
-                        "tool names must be unique across the mesh."
+                        "exposed tool names must be unique."
                     )
                 index[spec.name] = (owner, spec)
         return index
@@ -139,7 +218,15 @@ class MeshToolProvider:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         index = self._index()
         if name not in index:
-            raise AgentError("MeshToolProvider", f"unknown tool {name!r}")
+            if self._allow is None:
+                raise AgentError("MeshToolProvider", f"unknown tool {name!r}")
+            if not any(name in allowed_names for allowed_names in self._allow.values()):
+                raise AgentError(
+                    "MeshToolProvider", f"tool {name!r} is not allowed by this provider"
+                )
+            raise AgentError(
+                "MeshToolProvider", f"allowed tool {name!r} is no longer available"
+            )
         owner, _spec = index[name]
         return await self._mesh.call_tool(owner, name, **arguments)
 
