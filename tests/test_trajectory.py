@@ -102,11 +102,11 @@ async def test_recorder_captures_each_hop():
     seed, seen = await _run_relay_mesh(recorder)
     assert len(seen) == 1
     rs = recorder.receipts
-    assert len(rs) == 2                       # a->b and b->c (seed inject is not a hop)
-    assert (rs[0].source, rs[0].target) == ("a", "b")
-    assert (rs[1].source, rs[1].target) == ("b", "c")
-    assert rs[0].payload == {"n": 1}
-    assert rs[1].payload == {"n": 2}
+    assert len(rs) == 3                       # inject plus a->b and b->c
+    assert (rs[0].source, rs[0].target) == ("mesh", "a")
+    assert (rs[1].source, rs[1].target) == ("a", "b")
+    assert (rs[2].source, rs[2].target) == ("b", "c")
+    assert [receipt.payload for receipt in rs] == [{"n": 0}, {"n": 1}, {"n": 2}]
     assert all(r.signal_type == "Ping" for r in rs)
 
 
@@ -116,9 +116,10 @@ async def test_trajectories_group_by_trace_and_chain_lineage():
     traj = recorder.trajectories()
     assert list(traj.keys()) == [seed.trace_id]      # one run
     run = traj[seed.trace_id]
-    assert len(run) == 2
-    assert run[0].parent_id == seed.id               # first hop descends from the seed
-    assert run[1].parent_id == run[0].signal_id      # lineage chains hop-to-hop
+    assert len(run) == 3
+    assert run[0].signal_id == seed.id                # direct injection crosses the boundary
+    assert run[1].parent_id == seed.id                # first edge hop descends from seed
+    assert run[2].parent_id == run[1].signal_id       # lineage chains hop-to-hop
 
 
 async def test_all_receipts_verify():
@@ -133,9 +134,9 @@ async def test_export_jsonl_round_trips(tmp_path) -> None:
     out = tmp_path / "runs.jsonl"
     n = recorder.export_jsonl(out)
     lines = out.read_text(encoding="utf-8").strip().splitlines()
-    assert n == len(lines) == 2
+    assert n == len(lines) == 3
     first = json.loads(lines[0])
-    assert first["source"] == "a" and first["payload"] == {"n": 1}
+    assert first["source"] == "mesh" and first["payload"] == {"n": 0}
 
 
 async def test_recorder_is_pure_observer():
@@ -451,12 +452,12 @@ async def test_export_then_load_replays_typed_signals(tmp_path) -> None:
     # A fresh recorder, as if after a process restart, reloads and replays.
     reloaded = TrajectoryRecorder()
     n = reloaded.load_jsonl(out)
-    assert n == 2
+    assert n == 3
     assert all(r.verify() for r in reloaded.receipts)   # digests survive the round-trip
 
     signals = reloaded.replay()
-    assert [type(s).__name__ for s in signals] == ["Ping", "Ping"]
-    assert [s.n for s in signals] == [1, 2]             # type: ignore[attr-defined]
+    assert [type(s).__name__ for s in signals] == ["Ping", "Ping", "Ping"]
+    assert [s.n for s in signals] == [0, 1, 2]          # type: ignore[attr-defined]
     # Reconstructed signals match the originally captured ones, identity and all.
     assert signals == [r.to_signal() for r in recorder.receipts]
 

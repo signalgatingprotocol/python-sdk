@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from signal_gating.agent import Agent, ToolCallSignal, ToolResultSignal, ToolSpec
-from signal_gating.errors import AgentError, MeshError
+from signal_gating.errors import AgentError, ChannelClosed, MeshError
 from signal_gating.gate import Gate
 from signal_gating.signal import Signal
 from signal_gating.tracing import Tracer
@@ -25,6 +25,7 @@ logger = logging.getLogger("signal_gating.mesh")
 
 Interceptor = Callable[[Signal, str, str], Signal | None | Awaitable[Signal | None]]
 MeshEventSink = Callable[["MeshEvent"], None | Awaitable[None]]
+_DeliveryFn = Callable[[Signal], None | Awaitable[None]]
 
 
 class Edge:
@@ -47,6 +48,20 @@ class MeshEvent:
     event_kind: str = "mesh"
     timestamp: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _DeliveryOutcome:
+    """Internal result of one mesh-mediated delivery attempt."""
+
+    signal: Signal
+    delivered: bool
+    blocked_stage: str = ""
+    blocked_name: str = ""
+
+
+class _PublishDestinationClosedError(Exception):
+    """Internal marker for a publish destination closing during inbox send."""
 
 
 @dataclass
@@ -119,6 +134,10 @@ class Mesh:
         """Add an agent to the mesh."""
         if agent.name in self._agents:
             raise MeshError(f"Agent '{agent.name}' already exists in mesh")
+        if agent.name in self._pools:
+            raise MeshError(
+                f"Agent name '{agent.name}' conflicts with an existing pool"
+            )
         agent.set_tracer(self.tracer)
         self._agents[agent.name] = agent
 
@@ -187,7 +206,7 @@ class Mesh:
         so signals genuinely stop flowing between the disconnected agents.
         """
         src = self._resolve(source)
-        tgt_name = target if isinstance(target, str) else target.name
+        tgt_name = self._resolve(target).name
         before = len(self._edges)
         self._edges = [
             e for e in self._edges
@@ -275,42 +294,33 @@ class Mesh:
             (pred, self._resolve(tgt)) for pred, tgt in routes
         ]
         default_box: list[Agent | None] = [self._resolve(default) if default else None]
-        tracer = self.tracer
 
         async def content_route(signal: Signal) -> None:
             for predicate, target in resolved:
                 if predicate(signal):
-                    delivered = await self._intercept_for_delivery(
-                        signal, src.name, target.name
-                    )
-                    if delivered is None:
-                        return
-                    tracer.record(
-                        trace_id=delivered.trace_id,
-                        signal_id=delivered.id,
-                        agent=src.name,
-                        gate="content_route",
-                        action="routed",
+                    await self._deliver(
+                        signal,
+                        source=src.name,
                         target=target.name,
+                        send=target.inbox.send,
+                        action="routed",
+                        event_kind="signal",
+                        trace_gate="content_route",
+                        trace_action="routed",
                     )
-                    await target.inbox.send(delivered)
                     return
             resolved_default = default_box[0]
             if resolved_default is not None:
-                delivered = await self._intercept_for_delivery(
-                    signal, src.name, resolved_default.name
-                )
-                if delivered is None:
-                    return
-                tracer.record(
-                    trace_id=delivered.trace_id,
-                    signal_id=delivered.id,
-                    agent=src.name,
-                    gate="content_route",
-                    action="default_routed",
+                await self._deliver(
+                    signal,
+                    source=src.name,
                     target=resolved_default.name,
+                    send=resolved_default.inbox.send,
+                    action="routed",
+                    event_kind="signal",
+                    trace_gate="content_route",
+                    trace_action="default_routed",
                 )
-                await resolved_default.inbox.send(delivered)
 
         def prune(name: str) -> bool:
             resolved[:] = [(p, t) for p, t in resolved if t.name != name]
@@ -340,29 +350,19 @@ class Mesh:
         if not resolved:
             raise MeshError("load_balance requires at least one target")
         index = itertools.count()
-        tracer = self.tracer
-
         async def balanced_route(signal: Signal) -> None:
-            if gate is not None:
-                result = await gate.process(signal)
-                if result is None:
-                    return
-                signal = result
             target = resolved[next(index) % len(resolved)]
-            delivered = await self._intercept_for_delivery(
-                signal, src.name, target.name
-            )
-            if delivered is None:
-                return
-            tracer.record(
-                trace_id=delivered.trace_id,
-                signal_id=delivered.id,
-                agent=src.name,
-                gate="load_balance",
-                action="routed",
+            await self._deliver(
+                signal,
+                source=src.name,
                 target=target.name,
+                send=target.inbox.send,
+                action="routed",
+                event_kind="signal",
+                gate=gate,
+                trace_gate="load_balance",
+                trace_action="routed",
             )
-            await target.inbox.send(delivered)
 
         def prune(name: str) -> bool:
             resolved[:] = [t for t in resolved if t.name != name]
@@ -393,10 +393,18 @@ class Mesh:
         )
 
     async def inject(self, target: Agent | str, signal: Signal) -> None:
-        """Inject a signal directly into an agent's inbox."""
+        """Inject a signal through the mesh trust boundary into an agent."""
         agent = self._resolve(target)
-        await self._record_event("inject", signal, source="mesh", target=agent.name)
-        await agent.inbox.send(signal)
+        outcome = await self._deliver(
+            signal,
+            source="mesh",
+            target=agent.name,
+            send=agent.inbox.send,
+            action="inject",
+            trace_gate="inject",
+            trace_action="inject",
+        )
+        self._raise_if_blocked(outcome, source="mesh", target=agent.name, action="inject")
 
     def health(self) -> dict[str, Any]:
         """Aggregate health status of all agents in the mesh."""
@@ -436,7 +444,9 @@ class Mesh:
     def intercept(self, fn: Interceptor) -> None:
         """Add a mesh-level interceptor for all signal routing.
 
-        Interceptors see every signal that flows through mesh edges.
+        Interceptors see every mesh-mediated delivery, including direct
+        orchestration sends and their correlated responses. Raw writes to an
+        agent's inbox are outside the mesh boundary and are not intercepted.
         They receive (signal, source_name, target_name) and return:
         - The signal (possibly modified) to allow routing
         - None to block the signal
@@ -454,11 +464,13 @@ class Mesh:
     def record(self, sink: MeshEventSink | Any) -> None:
         """Record structured mesh execution events into a sink.
 
-        This is the production trajectory hook. Unlike interceptors, recorders
-        see direct orchestration paths such as ``inject()``, ``request()``,
+        This is the stable hook for action-specific delivery events and
+        orchestration control events from ``inject()``, ``request()``,
         ``scatter()``, ``race()``, ``publish()``, ``workflow()``, and
-        ``call_tool()``. If ``sink`` exposes ``record_event()``, that method is
-        registered; otherwise the object itself is treated as the event sink.
+        ``call_tool()``. Generic interceptors mediate every mesh-owned delivery
+        but do not observe non-delivery control events. If ``sink`` exposes
+        ``record_event()``, that method is registered; otherwise the object
+        itself is treated as the event sink.
         """
         event_sink = getattr(sink, "record_event", sink)
         self._event_sinks.append(event_sink)
@@ -501,41 +513,183 @@ class Mesh:
                 self._event_sink_errors += 1
                 logger.warning("Mesh event sink failed", exc_info=True)
 
-    async def _apply_interceptors(
-        self, signal: Signal, source: str, target: str
-    ) -> Signal | None:
-        """Apply all interceptors to a signal. Returns None if any blocks it."""
-        current: Signal | None = signal
-        for interceptor in self._interceptors:
-            if current is None:
-                return None
+    async def _deliver(
+        self,
+        signal: Signal,
+        *,
+        source: str,
+        target: str,
+        send: _DeliveryFn,
+        action: str,
+        event_kind: str = "mesh",
+        gate: Gate | None = None,
+        trace_gate: str = "delivery",
+        trace_action: str | None = None,
+        **metadata: Any,
+    ) -> _DeliveryOutcome:
+        """Apply the mesh trust boundary and perform exactly one delivery.
+
+        Every mesh-mediated signal path uses this function, including replies
+        captured by request/scatter/race. Successful events are emitted only
+        after the destination accepts the signal.
+        """
+        current = signal
+        for index, interceptor in enumerate(tuple(self._interceptors)):
             result = interceptor(current, source, target)
             if isawaitable(result):
-                current = await result
-            else:
-                current = result
-        return current
+                result = await result
+            if result is None:
+                name = getattr(interceptor, "__name__", type(interceptor).__name__)
+                await self._record_event(
+                    "intercepted",
+                    current,
+                    source=source,
+                    target=target,
+                    event_kind=event_kind,
+                    delivery_action=action,
+                    blocked_stage="interceptor",
+                    blocked_name=name,
+                    interceptor_index=index,
+                    signal_type=type(current).__name__,
+                    signal_id=current.id,
+                    **metadata,
+                )
+                self.tracer.record(
+                    trace_id=current.trace_id,
+                    signal_id=current.id,
+                    agent=f"{source}->{target}",
+                    gate="interceptor",
+                    action="intercepted",
+                    delivery_action=action,
+                    blocked_name=name,
+                )
+                return _DeliveryOutcome(
+                    current,
+                    delivered=False,
+                    blocked_stage="interceptor",
+                    blocked_name=name,
+                )
+            if not isinstance(result, Signal):
+                name = getattr(interceptor, "__name__", type(interceptor).__name__)
+                raise MeshError(
+                    f"Interceptor {name!r} returned {type(result).__name__}; "
+                    "interceptors must return Signal or None"
+                )
+            current = result
 
-    async def _intercept_for_delivery(
-        self, signal: Signal, source: str, target: str
-    ) -> Signal | None:
-        """Run interceptors before a content-route/load-balance delivery.
+        if gate is not None:
+            gated = await gate.process(current)
+            if gated is None:
+                await self._record_event(
+                    "edge_rejected",
+                    current,
+                    source=source,
+                    target=target,
+                    event_kind=event_kind,
+                    delivery_action=action,
+                    blocked_stage="gate",
+                    blocked_name=gate.name,
+                    gate=gate.name,
+                    signal_type=type(current).__name__,
+                    signal_id=current.id,
+                    **metadata,
+                )
+                self.tracer.record(
+                    trace_id=current.trace_id,
+                    signal_id=current.id,
+                    agent=f"{source}->{target}",
+                    gate=gate.name,
+                    action="edge_rejected",
+                    delivery_action=action,
+                )
+                return _DeliveryOutcome(
+                    current,
+                    delivered=False,
+                    blocked_stage="gate",
+                    blocked_name=gate.name,
+                )
+            current = gated
 
-        Returns the (possibly transformed) signal, or None if an interceptor
-        blocked it. Interceptors are the documented hook for auth, rate
-        limiting, audit and metrics, so every edge -- connected, content-routed,
-        and load-balanced -- must pass through them.
-        """
-        intercepted = await self._apply_interceptors(signal, source, target)
-        if intercepted is None:
-            self.tracer.record(
-                trace_id=signal.trace_id,
-                signal_id=signal.id,
-                agent=f"{source}->{target}",
-                gate="interceptor",
-                action="intercepted",
+        sent = send(current)
+        if isawaitable(sent):
+            await sent
+
+        self.tracer.record(
+            trace_id=current.trace_id,
+            signal_id=current.id,
+            agent=source,
+            gate=trace_gate,
+            action=trace_action or action,
+            target=target,
+            **metadata,
+        )
+        await self._record_event(
+            action,
+            current,
+            source=source,
+            target=target,
+            event_kind=event_kind,
+            **metadata,
+        )
+        return _DeliveryOutcome(current, delivered=True)
+
+    async def _deliver_replay(
+        self,
+        target: Agent | str,
+        signal: Signal,
+        *,
+        original_action: str,
+        original_source: str,
+        original_signal_id: str,
+    ) -> None:
+        """Deliver one replayed signal through the mesh trust boundary."""
+        resolved = self._resolve(target)
+        outcome = await self._deliver(
+            signal,
+            source="mesh",
+            target=resolved.name,
+            send=resolved.inbox.send,
+            action="replay_delivered",
+            trace_gate="replay",
+            original_action=original_action,
+            original_source=original_source,
+            original_signal_id=original_signal_id,
+        )
+        self._raise_if_blocked(
+            outcome,
+            source="mesh",
+            target=resolved.name,
+            action="replay_delivered",
+        )
+        return None
+
+    @staticmethod
+    def _delivery_error(
+        outcome: _DeliveryOutcome,
+        *,
+        source: str,
+        target: str,
+        action: str,
+    ) -> MeshError:
+        return MeshError(
+            f"Mesh delivery {action!r} blocked at {outcome.blocked_stage} "
+            f"{outcome.blocked_name!r}: {source!r} -> {target!r}, "
+            f"signal {type(outcome.signal).__name__} {outcome.signal.id!r}"
+        )
+
+    @classmethod
+    def _raise_if_blocked(
+        cls,
+        outcome: _DeliveryOutcome,
+        *,
+        source: str,
+        target: str,
+        action: str,
+    ) -> None:
+        if not outcome.delivered:
+            raise cls._delivery_error(
+                outcome, source=source, target=target, action=action
             )
-        return intercepted
 
     # --- Capability Discovery ---
 
@@ -548,10 +702,8 @@ class Mesh:
             # Later, find agents by what they can do
             analysts = mesh.find_capable("analysis")
         """
-        name = agent if isinstance(agent, str) else agent.name
-        if name not in self._agents:
-            raise MeshError(f"Agent '{name}' not in mesh")
-        self._capabilities.setdefault(name, set()).update(capabilities)
+        resolved = self._resolve(agent)
+        self._capabilities.setdefault(resolved.name, set()).update(capabilities)
 
     def find_capable(self, capability: str) -> list[Agent]:
         """Find all agents that have declared a given capability."""
@@ -563,8 +715,8 @@ class Mesh:
 
     def agent_capabilities(self, agent: Agent | str) -> set[str]:
         """Get all declared capabilities for an agent."""
-        name = agent if isinstance(agent, str) else agent.name
-        return set(self._capabilities.get(name, set()))
+        resolved = self._resolve(agent)
+        return set(self._capabilities.get(resolved.name, set()))
 
     # --- Agent Pools ---
 
@@ -582,9 +734,32 @@ class Mesh:
         """
         if pool.name in self._pools:
             raise MeshError(f"Pool '{pool.name}' already exists in mesh")
-        self._pools[pool.name] = pool
+        if pool.name in self._agents:
+            raise MeshError(
+                f"Pool name '{pool.name}' conflicts with an existing agent"
+            )
+        worker_names = [worker.name for worker in pool.workers]
+        seen_worker_names: set[str] = set()
+        duplicate_worker_names: list[str] = []
+        for name in worker_names:
+            if name in seen_worker_names and name not in duplicate_worker_names:
+                duplicate_worker_names.append(name)
+            seen_worker_names.add(name)
+        if duplicate_worker_names:
+            joined = ", ".join(repr(name) for name in duplicate_worker_names)
+            raise MeshError(f"Pool '{pool.name}' has duplicate worker names: {joined}")
+        agent_conflicts = [name for name in worker_names if name in self._agents]
+        if agent_conflicts:
+            joined = ", ".join(repr(name) for name in agent_conflicts)
+            raise MeshError(f"Pool workers conflict with existing agents: {joined}")
+        pool_namespace = {*self._pools, pool.name}
+        pool_conflicts = [name for name in worker_names if name in pool_namespace]
+        if pool_conflicts:
+            joined = ", ".join(repr(name) for name in pool_conflicts)
+            raise MeshError(f"Pool workers conflict with pool names: {joined}")
         for worker in pool.workers:
             self.add(worker)
+        self._pools[pool.name] = pool
 
     def get_pool(self, name: str) -> AgentPool:
         """Get a pool by name."""
@@ -599,12 +774,20 @@ class Mesh:
         from signal_gating.pool import AgentPool
 
         if isinstance(ref, AgentPool):
-            return ref
+            registered = self._pools.get(ref.name)
+            if registered is None:
+                raise MeshError(f"Pool '{ref.name}' not in mesh; add it first")
+            if registered is not ref:
+                raise MeshError(
+                    f"Pool '{ref.name}' is not the registered instance; "
+                    "use mesh.get_pool() or the object originally added"
+                )
+            return registered
         if isinstance(ref, str):
             if ref in self._pools:
                 return self._pools[ref]
             return self.get(ref)
-        return ref
+        return self._resolve(ref)
 
     def connect(
         self,
@@ -656,66 +839,20 @@ class Mesh:
         """Internal: wire two agents together."""
         edge = Edge(src, tgt, gate)
         self._edges.append(edge)
-        tracer = self.tracer
         mesh = self
 
         async def route(signal: Signal) -> None:
-            # Apply mesh-level interceptors
-            intercepted = await mesh._apply_interceptors(signal, src.name, tgt.name)
-            if intercepted is None:
-                await mesh._record_event(
-                    "intercepted",
-                    signal,
-                    source=src.name,
-                    target=tgt.name,
-                    event_kind="signal",
-                )
-                tracer.record(
-                    trace_id=signal.trace_id,
-                    signal_id=signal.id,
-                    agent=f"{src.name}->{tgt.name}",
-                    gate="interceptor",
-                    action="intercepted",
-                )
-                return
-            signal = intercepted
-
-            if gate is not None:
-                result = await gate.process(signal)
-                if result is None:
-                    await mesh._record_event(
-                        "edge_rejected",
-                        signal,
-                        source=src.name,
-                        target=tgt.name,
-                        event_kind="signal",
-                        gate=gate.name,
-                    )
-                    tracer.record(
-                        trace_id=signal.trace_id,
-                        signal_id=signal.id,
-                        agent=f"{src.name}->{tgt.name}",
-                        gate=gate.name,
-                        action="edge_rejected",
-                    )
-                    return
-                signal = result
-            tracer.record(
-                trace_id=signal.trace_id,
-                signal_id=signal.id,
-                agent=src.name,
-                gate="route",
-                action="routed",
-                target=tgt.name,
-            )
-            await mesh._record_event(
-                "routed",
+            await mesh._deliver(
                 signal,
                 source=src.name,
                 target=tgt.name,
+                send=tgt.inbox.send,
+                action="routed",
                 event_kind="signal",
+                gate=gate,
+                trace_gate="route",
+                trace_action="routed",
             )
-            await tgt.inbox.send(signal)
 
         src._add_output(
             RouteFn(fn=route, source=src.name, target=tgt.name, tag="connect")
@@ -760,7 +897,9 @@ class Mesh:
     async def publish(self, topic: str, signal: Signal) -> int:
         """Publish a signal to all subscribers of a topic.
 
-        Returns the number of subscribers that received the signal.
+        Returns the number of subscribers that accepted the signal after
+        interception. Blocked or closed subscribers do not abort delivery to
+        the remaining subscribers.
         This is fire-and-forget. The signal is sent to each subscriber's
         inbox without waiting for processing.
 
@@ -781,23 +920,33 @@ class Mesh:
                     topic, subscriber.name,
                 )
                 continue
-            await self._record_event(
-                "published",
-                signal,
-                source="mesh",
-                target=subscriber.name,
-                topic=topic,
-            )
-            self.tracer.record(
-                trace_id=signal.trace_id,
-                signal_id=signal.id,
-                agent="mesh",
-                gate=f"topic:{topic}",
-                action="published",
-                target=subscriber.name,
-            )
-            await subscriber.inbox.send(signal)
-            delivered += 1
+
+            async def send_to_subscriber(delivered_signal: Signal) -> None:
+                try:
+                    await subscriber.inbox.send(delivered_signal)
+                except ChannelClosed as error:
+                    raise _PublishDestinationClosedError from error
+
+            try:
+                outcome = await self._deliver(
+                    signal,
+                    source="mesh",
+                    target=subscriber.name,
+                    send=send_to_subscriber,
+                    action="published",
+                    trace_gate=f"topic:{topic}",
+                    trace_action="published",
+                    topic=topic,
+                )
+            except _PublishDestinationClosedError:
+                logger.warning(
+                    "publish('%s'): skipping subscriber '%s' (inbox closed)",
+                    topic,
+                    subscriber.name,
+                )
+                continue
+            if outcome.delivered:
+                delivered += 1
         return delivered
 
     def list_topics(self) -> dict[str, list[str]]:
@@ -828,7 +977,9 @@ class Mesh:
         and captures the response.
 
         The target agent must call ``reply()`` or emit a signal with the
-        matching correlation_id for the request to resolve.
+        matching correlation_id for the request to resolve. Both the request
+        and correlated response cross the interceptor boundary; a blocked
+        delivery raises ``MeshError`` immediately.
 
             response = await mesh.request(analyst, TaskSignal(task="analyze"))
             print(response.metadata)
@@ -849,25 +1000,46 @@ class Mesh:
         # Capture the reply from the target's outbox
         async def capture(sig: Signal) -> None:
             if sig.correlation_id == cid and not future.done():
-                await self._record_event(
-                    "response_received",
-                    sig,
-                    source=resolved.name,
-                    target="mesh",
-                    correlation_id=cid,
-                )
-                future.set_result(sig)
+                try:
+                    outcome = await self._deliver(
+                        sig,
+                        source=resolved.name,
+                        target="mesh",
+                        send=future.set_result,
+                        action="response_received",
+                        trace_gate="request",
+                        correlation_id=cid,
+                    )
+                    if not outcome.delivered and not future.done():
+                        future.set_exception(
+                            self._delivery_error(
+                                outcome,
+                                source=resolved.name,
+                                target="mesh",
+                                action="response_received",
+                            )
+                        )
+                except Exception as error:
+                    if not future.done():
+                        future.set_exception(error)
 
         resolved._outbox.append(capture)
         try:
-            await self._record_event(
-                "request_sent",
+            outcome = await self._deliver(
                 tagged,
                 source="mesh",
                 target=resolved.name,
+                send=resolved.inbox.send,
+                action="request_sent",
+                trace_gate="request",
                 correlation_id=cid,
             )
-            await resolved.inbox.send(tagged)
+            self._raise_if_blocked(
+                outcome,
+                source="mesh",
+                target=resolved.name,
+                action="request_sent",
+            )
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
             try:
@@ -942,14 +1114,28 @@ class Mesh:
                 ) -> Any:
                     async def capture(sig: Signal) -> None:
                         if sig.correlation_id == tcid and not f.done():
-                            await self._record_event(
-                                "scatter_response",
-                                sig,
-                                source=tname,
-                                target="mesh",
-                                correlation_id=tcid,
-                            )
-                            f.set_result(sig)
+                            try:
+                                outcome = await self._deliver(
+                                    sig,
+                                    source=tname,
+                                    target="mesh",
+                                    send=f.set_result,
+                                    action="scatter_response",
+                                    trace_gate="scatter",
+                                    correlation_id=tcid,
+                                )
+                                if not outcome.delivered and not f.done():
+                                    f.set_exception(
+                                        self._delivery_error(
+                                            outcome,
+                                            source=tname,
+                                            target="mesh",
+                                            action="scatter_response",
+                                        )
+                                    )
+                            except Exception as error:
+                                if not f.done():
+                                    f.set_exception(error)
 
                     return capture
 
@@ -961,16 +1147,37 @@ class Mesh:
             for target in resolved:
                 target_cid = f"{cid}:{target.name}"
                 scatter_signal = signal.evolve(correlation_id=target_cid)
-                await self._record_event(
-                    "scatter_sent",
+                outcome = await self._deliver(
                     scatter_signal,
                     source="mesh",
                     target=target.name,
+                    send=target.inbox.send,
+                    action="scatter_sent",
+                    trace_gate="scatter",
                     correlation_id=target_cid,
                 )
-                await target.inbox.send(scatter_signal)
+                self._raise_if_blocked(
+                    outcome,
+                    source="mesh",
+                    target=target.name,
+                    action="scatter_sent",
+                )
 
-            _, pending = await asyncio.wait(futures, timeout=timeout)
+            done, pending = await asyncio.wait(
+                futures,
+                timeout=timeout,
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            failed = next(
+                (future for future in done if not future.cancelled() and future.exception()),
+                None,
+            )
+            if failed is not None:
+                for future in pending:
+                    future.cancel()
+                error = failed.exception()
+                assert error is not None
+                raise error
             if pending:
                 missing_targets = [
                     target.name
@@ -1103,7 +1310,10 @@ class Mesh:
         """Race a signal across multiple agents. First response wins.
 
         Sends the same signal to N agents in parallel and returns the
-        first response received. All other pending responses are discarded.
+        first allowed response received. Blocked sends and responses are
+        ignored while another candidate remains; if every candidate is
+        blocked, ``MeshError`` is raised immediately. All other pending
+        responses are discarded.
         This is THE competitive execution primitive for agent systems.
 
         Use cases:
@@ -1137,9 +1347,35 @@ class Mesh:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Signal] = loop.create_future()
         capture_fns: list[tuple[Agent, Any]] = []
+        target_cids = [
+            f"{cid}:{index}:{target.name}" for index, target in enumerate(resolved)
+        ]
+        remaining: set[str] = set(target_cids)
+        blocked_errors: list[MeshError] = []
 
-        for target in resolved:
-            target_cid = f"{cid}:{target.name}"
+        def block_candidate(
+            candidate_id: str,
+            outcome: _DeliveryOutcome,
+            *,
+            source: str,
+            target: str,
+            action: str,
+        ) -> None:
+            if candidate_id not in remaining:
+                return
+            remaining.remove(candidate_id)
+            blocked_errors.append(
+                self._delivery_error(
+                    outcome,
+                    source=source,
+                    target=target,
+                    action=action,
+                )
+            )
+            if not remaining and not future.done():
+                future.set_exception(blocked_errors[0])
+
+        for target, target_cid in zip(resolved, target_cids, strict=True):
 
             def _make_capture(
                 f: asyncio.Future[Signal], tcid: str,
@@ -1147,14 +1383,28 @@ class Mesh:
             ) -> Any:
                 async def capture(sig: Signal) -> None:
                     if sig.correlation_id == tcid and not f.done():
-                        await self._record_event(
-                            "race_response",
-                            sig,
-                            source=tname,
-                            target="mesh",
-                            correlation_id=tcid,
-                        )
-                        f.set_result(sig)
+                        try:
+                            outcome = await self._deliver(
+                                sig,
+                                source=tname,
+                                target="mesh",
+                                send=f.set_result,
+                                action="race_response",
+                                trace_gate="race",
+                                correlation_id=tcid,
+                            )
+                            if not outcome.delivered:
+                                block_candidate(
+                                    tcid,
+                                    outcome,
+                                    source=tname,
+                                    target="mesh",
+                                    action="race_response",
+                                )
+                        except Exception as error:
+                            if not f.done():
+                                f.set_exception(error)
+                            return
 
                 return capture
 
@@ -1162,28 +1412,28 @@ class Mesh:
             target._outbox.append(capture)
             capture_fns.append((target, capture))
 
-        # Send to all targets in parallel
-        for target in resolved:
-            target_cid = f"{cid}:{target.name}"
-            self.tracer.record(
-                trace_id=signal.trace_id,
-                signal_id=signal.id,
-                agent="mesh",
-                gate="race",
-                action="sent",
-                target=target.name,
-            )
-            race_signal = signal.evolve(correlation_id=target_cid)
-            await self._record_event(
-                "race_sent",
-                race_signal,
-                source="mesh",
-                target=target.name,
-                correlation_id=target_cid,
-            )
-            await target.inbox.send(race_signal)
+        async def run_race() -> Signal:
+            for target, target_cid in zip(resolved, target_cids, strict=True):
+                race_signal = signal.evolve(correlation_id=target_cid)
+                outcome = await self._deliver(
+                    race_signal,
+                    source="mesh",
+                    target=target.name,
+                    send=target.inbox.send,
+                    action="race_sent",
+                    trace_gate="race",
+                    trace_action="sent",
+                    correlation_id=target_cid,
+                )
+                if not outcome.delivered:
+                    block_candidate(
+                        target_cid,
+                        outcome,
+                        source="mesh",
+                        target=target.name,
+                        action="race_sent",
+                    )
 
-        try:
             result = await asyncio.wait_for(future, timeout=timeout)
             self.tracer.record(
                 trace_id=signal.trace_id,
@@ -1199,7 +1449,14 @@ class Mesh:
                 target="",
             )
             return result
+
+        try:
+            return await run_race()
         finally:
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
             for target, capture in capture_fns:
                 try:
                     target._outbox.remove(capture)
@@ -1540,9 +1797,15 @@ class Mesh:
     def _resolve(self, agent: Agent | str) -> Agent:
         if isinstance(agent, str):
             return self.get(agent)
-        if agent.name not in self._agents:
+        registered = self._agents.get(agent.name)
+        if registered is None:
             raise MeshError(f"Agent '{agent.name}' not in mesh; add it first")
-        return agent
+        if registered is not agent:
+            raise MeshError(
+                f"Agent '{agent.name}' is not the registered instance; "
+                "use mesh.get() or the object originally added"
+            )
+        return registered
 
     async def __aenter__(self) -> Mesh:
         await self.start()
