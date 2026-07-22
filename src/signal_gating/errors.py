@@ -110,3 +110,7 @@ class BudgetExceeded(SignalGatingError):
         self.budget = budget
         self.key = key
         super().__init__(f"script budget of {budget} steps exceeded at step {key!r}")
+
+
+class EvaluationError(SignalGatingError):
+    """An evaluation suite or focused-improvement contract was violated."""

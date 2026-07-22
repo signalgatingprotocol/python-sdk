@@ -7,7 +7,6 @@ import json
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
-from inspect import isawaitable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -203,9 +202,13 @@ class Receipt:
 class TrajectoryRecorder:
     """Records verifiable Receipts for mesh events and signal hops.
 
-    Attach with ``mesh.record(recorder)`` to capture direct orchestration events
-    and connected routes. ``mesh.intercept(recorder)`` remains supported for the
-    old edge-hop-only observer path.
+    Attach with ``mesh.record(recorder)`` for stable, action-specific receipts.
+    Successful delivery receipts are captured after the destination accepts the
+    signal; blocked attempts use structured ``intercepted`` or
+    ``edge_rejected`` receipts. ``mesh.intercept(recorder)`` also observes the
+    complete mesh-mediated delivery boundary, but captures a generic ``hop``
+    receipt at the interceptor observation point rather than an action-specific
+    post-enqueue receipt.
 
         recorder = TrajectoryRecorder()
         mesh.record(recorder)
@@ -500,20 +503,13 @@ class TrajectoryReplayRunner:
                 continue
 
             signal = receipt.to_signal(strict=strict)
-            record_event = getattr(mesh, "_record_event", None)
-            if record_event is not None:
-                replay_event = record_event(
-                    "replay_delivered",
-                    signal,
-                    source="mesh",
-                    target=receipt.target,
-                    original_action=receipt.action,
-                    original_source=receipt.source,
-                    original_signal_id=receipt.signal_id,
-                )
-                if isawaitable(replay_event):
-                    await replay_event
-            await target.inbox.send(signal)
+            await mesh._deliver_replay(
+                target,
+                signal,
+                original_action=receipt.action,
+                original_source=receipt.source,
+                original_signal_id=receipt.signal_id,
+            )
             result.delivered += 1
             result.receipts.append(receipt)
             result.deliveries.append(

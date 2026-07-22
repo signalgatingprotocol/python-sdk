@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from signal_gating import Agent, AgentContext, AgentPool, Gate, Mesh, Signal
+from signal_gating import Agent, AgentContext, AgentPool, Gate, Mesh, MeshError, Signal
 
 
 class TaskSignal(Signal):
@@ -190,6 +190,30 @@ class TestPoolMeshIntegration:
         mesh.add_pool(pool)
         with pytest.raises(Exception):
             mesh.add_pool(pool)
+
+    def test_add_pool_preflights_worker_collisions_with_pool_namespace(self):
+        existing_pool = AgentPool("batch[1]", size=1)
+        mesh = Mesh()
+        mesh.add_pool(existing_pool)
+        agents_before = mesh.agents
+        pools_before = dict(mesh._pools)
+
+        with pytest.raises(MeshError, match=r"pool names: 'batch\[1\]'"):
+            mesh.add_pool(AgentPool("batch", size=2))
+
+        assert mesh.agents == agents_before
+        assert mesh._pools == pools_before
+
+    def test_add_pool_preflights_duplicate_worker_names(self):
+        malformed_pool = AgentPool("batch", size=2)
+        malformed_pool._workers[1] = Agent("batch[0]")
+        mesh = Mesh()
+
+        with pytest.raises(MeshError, match=r"duplicate worker names: 'batch\[0\]'"):
+            mesh.add_pool(malformed_pool)
+
+        assert mesh.agents == []
+        assert mesh._pools == {}
 
     async def test_get_pool(self):
         pool = AgentPool("workers", size=1)

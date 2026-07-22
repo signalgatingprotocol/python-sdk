@@ -1,31 +1,38 @@
 # SGP Python SDK
 
-Agent-native signal orchestration for autonomous AI systems.
+Agent-native executive control for autonomous AI systems.
 
-The Signal Gating Protocol provides composable primitives for building multi-agent systems with controlled, observable signal flow. Signals are typed, immutable events. Gates are composable predicates that control which signals pass. Agents process signals autonomously. Meshes connect agents into networks.
+Multi-agent systems degrade when every event reaches every agent: context fills
+with noise, stale information displaces relevant state, and one bad output can
+cascade through the system. SGP puts a controlled, observable routing layer
+between producers and consumers. Typed signals carry intent, composable gates
+decide what passes, agents process admitted work, and meshes define the network.
+
+SGP complements tool and agent-communication protocols such as MCP and A2A; it
+controls which signals flow through an agent system and records what happened.
 
 ## Install
 
+> Pre-release: the PyPI package has not been published yet. Install the current
+> alpha from source:
+
 ```bash
-pip install signal-gating
+pip install git+https://github.com/signalgatingprotocol/python-sdk
 ```
+
+After the first release, the stable install command will be
+`pip install signal-gating`.
 
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm]"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel]"
-```
-
-Or from source:
-
-```bash
-pip install git+https://github.com/signalgatingprotocol/python-sdk
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
 > Alpha: the API surface is still moving.
@@ -224,6 +231,24 @@ def audit_log(signal, source, target):
 
 mesh.intercept(audit_log)
 ```
+
+Interceptors run on every delivery mediated by `Mesh`: connected, content, and
+load-balanced routes; direct orchestration such as injection, pub/sub,
+workflows, and tool calls; request, scatter, and race sends and their correlated
+responses; and trajectory replay. Returning `None` blocks that delivery.
+Awaited point-to-point operations fail immediately with an actionable
+`MeshError`. Connected and other fire-and-forget routes drop observably.
+`publish()` continues to the remaining subscribers and returns the number that
+accepted the signal. `race()` continues while an allowed candidate remains.
+Each allowed interceptor output passes to later interceptors and, for routed
+delivery, any route gate. The final allowed post-gate signal is the exact signal
+delivered, delivery-traced, and action-recorded by mesh event sinks.
+
+Direct writes to `agent.inbox` deliberately bypass mesh delivery interceptors,
+mesh delivery traces, and receipts. If the receiving agent processes that
+signal, it can still emit its own gate and dispatch processing spans through its
+attached tracer. Treat inboxes as internal channels whenever the mesh is your
+authorization or audit boundary.
 
 **Capability Discovery**: find agents by what they can do, not just by name:
 
@@ -453,6 +478,97 @@ mesh.add(planner)
 
 The loop is bounded by `max_tool_rounds` (default 4).
 
+### Focused improvement loops
+
+Trajectories preserve experience. `ImprovementLoop` turns evaluation evidence
+into controlled improvement across runs. It is model- and harness-agnostic: the
+candidate can be a prompt, model selection, tool policy, memory strategy,
+fine-tune ID, mesh topology, or a compound configuration owned by your code.
+
+Define the capability target explicitly, then supply three callables:
+
+- a harness that runs one candidate on one case;
+- an evaluator that returns every objective's score and concrete evidence;
+- an improver that receives the weakest dimension, its weakest cases, evaluator
+  evidence, and prior experiment history.
+
+```python
+from dataclasses import replace
+from signal_gating import (
+    Assessment, EvaluationCase, EvaluationSuite, ImprovementLoop, Objective,
+)
+
+cases = [
+    EvaluationCase("routine", "summarize the filing"),
+    EvaluationCase("adversarial", "find the unsupported claim", weight=2),
+]
+objectives = [
+    Objective("correctness", target=0.90, weight=2),
+    Objective("reliability", target=0.95, regression_tolerance=0.01),
+]
+
+async def harness(config, case):
+    return await run_your_model(config, case.input)
+
+async def evaluate(case, output):
+    judged = await your_judge(case, output)
+    return Assessment(scores=judged.scores, evidence=judged.evidence)
+
+async def improve(context):
+    # Change one thing aimed at context.focus; rejected attempts remain in
+    # context.history and never replace context.incumbent.
+    return replace(context.incumbent, system=revise_prompt(context))
+
+suite = EvaluationSuite(cases, objectives, harness, evaluate, samples=3)
+loop = ImprovementLoop(suite, improve, identify=lambda config: config.version)
+result = await loop.run(initial_config, max_iterations=8)
+```
+
+`max_concurrency` is a hard execution and scheduler bound: the suite creates a
+fixed worker pool, not one task per case or sample. Raw model outputs are
+discarded immediately after evaluation by default; scores and evidence remain
+in the report. Set `retain_outputs=True` only when the improver genuinely needs
+the full responses and the memory cost is understood.
+
+Each candidate runs on the same weighted cases. Scores reduce by median across
+samples. The default acceptance policy requires both total target progress and
+the selected weak dimension to improve. Any aggregate or per-case regression
+beyond an objective's tolerance rejects the candidate, even if its average score
+rose. `ImprovementHistory("experiments.jsonl")` adds hash-chained persistence so
+later runs can learn from accepted and rejected scores, regressions, and
+per-case evaluator evidence without serializing opaque candidate objects, raw
+harness outputs, or model clients.
+
+Durable history is bounded by default: 30 days, 500 experiment records, and
+8 MiB, whichever limit is reached first. Cleanup runs only when a bound is
+crossed, keeps the newest evidence, atomically rebuilds the hash chain, and
+writes the compacted file with `0600` permissions. Tune the limits for a smaller
+machine or disable an individual bound with `None`:
+
+```python
+from signal_gating import ImprovementHistory, RetentionPolicy
+
+history = ImprovementHistory(
+    "experiments.jsonl",
+    retention=RetentionPolicy(
+        max_age_seconds=7 * 24 * 60 * 60,
+        max_records=100,
+        max_bytes=2 * 1024 * 1024,
+    ),
+)
+```
+
+Pass `retention=None` only when an external lifecycle system already owns
+cleanup. Compaction affects durable history, never the active run's in-memory
+feedback context or returned records.
+
+Lifecycle events (`baseline_evaluated`, `focus_selected`, candidate decision,
+and stop state) are ordinary `ImprovementEvent` signals exposed through an
+optional observer. Bridge that observer to a mesh when improvement events should
+drive agents or durable trajectory recording. See `examples/focused_improvement.py`
+for a deterministic end-to-end loop that first rejects a regression, then reaches
+all targets through focused changes.
+
 ### Trajectories
 
 Capture a verifiable, structured record of signal-carrying mesh events,
@@ -509,8 +625,13 @@ result = await runner.replay_into(mesh)
 print(result.delivered, result.skipped)
 ```
 
-For legacy edge-hop-only capture, `mesh.intercept(recorder)` still works, but it
-does not see direct orchestration paths.
+For legacy interceptor-based capture, `mesh.intercept(recorder)` still works.
+Because interceptors cover the complete mesh trust boundary, it observes every
+mesh-mediated delivery, including direct orchestration, correlated responses,
+and replay, rather than only connected edge hops. It records generic `hop`
+receipts at the interceptor observation point. Prefer `mesh.record(recorder)`
+for stable, action-specific receipts emitted after successful delivery, plus
+structured `intercepted` and `edge_rejected` receipts for blocked attempts.
 
 ### Wire format & durability
 
