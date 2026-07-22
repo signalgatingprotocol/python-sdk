@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
@@ -44,7 +45,9 @@ otel = [
 ]
 
 [project.urls]
+Documentation = "https://signalgatingprotocol.github.io"
 Repository = "https://github.com/signalgatingprotocol/python-sdk"
+Issues = "https://github.com/signalgatingprotocol/python-sdk/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/signal_gating"]

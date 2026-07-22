@@ -13,11 +13,11 @@ controls which signals flow through an agent system and records what happened.
 
 ## Install
 
-> Pre-release: the PyPI package has not been published yet. Install the current
-> alpha from source:
+The first PyPI release has not been published yet. Install the current alpha
+directly from GitHub:
 
 ```bash
-pip install git+https://github.com/signalgatingprotocol/python-sdk
+pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
 After the first release, the stable install command will be
@@ -35,7 +35,7 @@ For OpenTelemetry export:
 pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk"
 ```
 
-> Alpha: the API surface is still moving.
+> Alpha: the API surface is still moving. Pin a commit SHA for reproducible use.
 
 ## Quick Start
 
