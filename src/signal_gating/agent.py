@@ -44,6 +44,7 @@ class ToolCallSignal(Signal):
 
     tool_name: str
     arguments: dict[str, Any] = {}
+    expected_binding_id: str = ""
 
 
 class ToolResultSignal(Signal):
@@ -58,7 +59,7 @@ class ToolResultSignal(Signal):
     error: str = ""
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class ToolSpec:
     """Specification for a tool exposed by an agent.
 
@@ -71,6 +72,12 @@ class ToolSpec:
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
     fn: ToolFn | None = field(default=None, repr=False)
+    binding_id: str = field(
+        default_factory=lambda: uuid4().hex,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
 
 def _matches_tool_type(value: Any, type_name: str) -> bool:
@@ -888,11 +895,19 @@ class Agent:
 
         Returns:
             Decorator that registers the function as a tool.
+
+        Raises:
+            ValueError: If the agent already has a tool with the same name.
         """
         agent = self
 
         def decorator(fn: ToolFn) -> ToolFn:
             tool_name = name or fn.__name__
+            if tool_name in agent._tools:
+                raise ValueError(
+                    f"Tool {tool_name!r} is already registered on agent {agent.name!r}; "
+                    "tool names cannot be rebound"
+                )
             # Extract parameter schema from function signature
             sig = inspect.signature(fn)
             params: dict[str, Any] = {}
@@ -925,7 +940,22 @@ class Agent:
                     signal: ToolCallSignal, ctx: AgentContext,
                 ) -> None:
                     tool = agent._tools.get(signal.tool_name)
-                    if tool is None or tool.fn is None:
+                    if tool is None:
+                        await ctx.reply(ToolResultSignal(
+                            tool_name=signal.tool_name,
+                            error=f"Unknown tool: {signal.tool_name}",
+                        ))
+                        return
+                    if (
+                        signal.expected_binding_id
+                        and tool.binding_id != signal.expected_binding_id
+                    ):
+                        await ctx.reply(ToolResultSignal(
+                            tool_name=signal.tool_name,
+                            error=f"Tool binding changed: {signal.tool_name}",
+                        ))
+                        return
+                    if tool.fn is None:
                         await ctx.reply(ToolResultSignal(
                             tool_name=signal.tool_name,
                             error=f"Unknown tool: {signal.tool_name}",

@@ -484,7 +484,9 @@ Treat model output as untrusted. `MeshToolProvider` requires an explicit
 agent-and-tool allowlist and applies it both when generating schemas and when
 executing a requested call. Add authorized agents to the mesh and register
 their tools before constructing the provider; unknown names fail immediately.
-An empty `allow={}` disables all model tool access.
+An empty `allow={}` disables all model tool access. Tool names are immutable
+once registered, and an explicit provider pins each authorized callable at
+construction so a later binding change fails closed.
 
 Use `allow_all=True` only when every current and future tool in the mesh is safe
 for the model to invoke. It preserves dynamic discovery, so adding a tool later

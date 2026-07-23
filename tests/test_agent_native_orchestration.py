@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -56,6 +57,25 @@ class TestAgentTool:
 
         assert agent.get_tool("calculator") is not None
         assert agent.get_tool("add") is None
+
+    def test_duplicate_tool_name_is_rejected(self):
+        agent = Agent("worker")
+
+        @agent.tool(name="run")
+        async def safe() -> str:
+            return "safe"
+
+        with pytest.raises(
+            ValueError,
+            match="Tool 'run' is already registered on agent 'worker'.*cannot be rebound",
+        ):
+            @agent.tool(name="run")
+            async def replacement() -> str:
+                return "replacement"
+
+        spec = agent.get_tool("run")
+        assert spec is not None
+        assert spec.fn is safe
 
     def test_tool_schema_export(self):
         agent = Agent("worker")
@@ -654,3 +674,11 @@ class TestToolSpec:
             parameters={"data": {"type": "str", "required": True}},
         )
         assert spec.parameters["data"]["required"] is True
+
+    def test_tool_spec_binding_fields_are_immutable(self):
+        spec = ToolSpec(name="test", description="A test tool")
+
+        with pytest.raises(FrozenInstanceError):
+            spec.name = "replacement"  # type: ignore[misc]
+        with pytest.raises(FrozenInstanceError):
+            spec.fn = lambda: None  # type: ignore[misc]

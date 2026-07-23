@@ -121,8 +121,11 @@ class MeshToolProvider:
             )
 
         self._allow = None if allow is None else self._normalize_allow(allow)
+        self._authorized_bindings: dict[
+            tuple[str, str], tuple[ToolSpec, object | None]
+        ] = {}
         if self._allow is not None:
-            self._validate_allowlist()
+            self._authorized_bindings = self._validate_allowlist()
         # Fail early when the configured public surface is ambiguous.
         self._index()
 
@@ -153,9 +156,12 @@ class MeshToolProvider:
             normalized[owner] = frozenset(names)
         return normalized
 
-    def _validate_allowlist(self) -> None:
+    def _validate_allowlist(
+        self,
+    ) -> dict[tuple[str, str], tuple[ToolSpec, object | None]]:
         assert self._allow is not None
         agents = {agent.name: agent for agent in self._mesh.agents}
+        authorized: dict[tuple[str, str], tuple[ToolSpec, object | None]] = {}
         for owner, allowed_names in self._allow.items():
             agent = agents.get(owner)
             if agent is None:
@@ -163,8 +169,8 @@ class MeshToolProvider:
                     f"MeshToolProvider allowlist references unknown agent {owner!r}; "
                     "add the agent to the mesh before constructing the provider."
                 )
-            available_names = {spec.name for spec in agent.list_tools()}
-            unknown_names = sorted(allowed_names - available_names)
+            available = {spec.name: spec for spec in agent.list_tools()}
+            unknown_names = sorted(allowed_names - available.keys())
             if unknown_names:
                 noun = "tool" if len(unknown_names) == 1 else "tools"
                 joined = ", ".join(repr(name) for name in unknown_names)
@@ -172,6 +178,10 @@ class MeshToolProvider:
                     f"MeshToolProvider allowlist references unknown {noun} {joined} "
                     f"for agent {owner!r}; register it before constructing the provider."
                 )
+            for name in allowed_names:
+                spec = available[name]
+                authorized[(owner, name)] = (spec, spec.fn)
+        return authorized
 
     def _is_allowed(self, owner: str, name: str) -> bool:
         return self._allow is None or name in self._allow.get(owner, ())
@@ -182,6 +192,16 @@ class MeshToolProvider:
             for spec in specs:
                 if not self._is_allowed(owner, spec.name):
                     continue
+                if self._allow is not None:
+                    expected_spec, expected_fn = self._authorized_bindings[
+                        (owner, spec.name)
+                    ]
+                    if spec is not expected_spec or spec.fn is not expected_fn:
+                        raise AgentError(
+                            "MeshToolProvider",
+                            f"authorized tool binding {owner!r}.{spec.name!r} changed "
+                            "after provider construction",
+                        )
                 if spec.name in index:
                     raise ValueError(
                         f"MeshToolProvider: duplicate exposed tool name {spec.name!r} "
@@ -227,8 +247,13 @@ class MeshToolProvider:
             raise AgentError(
                 "MeshToolProvider", f"allowed tool {name!r} is no longer available"
             )
-        owner, _spec = index[name]
-        return await self._mesh.call_tool(owner, name, **arguments)
+        owner, spec = index[name]
+        return await self._mesh._call_tool(
+            owner,
+            name,
+            arguments,
+            expected_binding_id=spec.binding_id,
+        )
 
 
 Render = Callable[[Signal], str]
