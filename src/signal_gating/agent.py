@@ -986,7 +986,7 @@ class Agent:
 
         Each tool's parameter types and descriptions are extracted from the
         function signature and docstring. For OpenAI-compatible function-tool
-        schemas, use ``MeshToolProvider(mesh).tool_schemas()``.
+        schemas, construct a ``MeshToolProvider`` with an explicit allowlist.
 
             # Inspect tools exposed by this agent
             schema = agent.tools_schema()

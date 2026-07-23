@@ -16,8 +16,12 @@ async def test_mesh_tool_provider_schema_and_routing():
     async def analyze(topic: str) -> dict:
         return {"points": topic.upper()}
 
+    @analyst.tool(description="Delete everything")
+    async def delete_all() -> str:
+        return "deleted"
+
     mesh = Mesh([analyst])
-    provider = MeshToolProvider(mesh)
+    provider = MeshToolProvider(mesh, allow={"analyst": {"analyze"}})
 
     schemas = provider.tool_schemas()
     assert len(schemas) == 1
@@ -32,7 +36,87 @@ async def test_mesh_tool_provider_schema_and_routing():
     assert result == {"points": "HI"}
 
 
-def test_mesh_tool_provider_duplicate_name_raises():
+def test_mesh_tool_provider_requires_explicit_policy():
+    with pytest.raises(ValueError, match="requires an explicit allow mapping"):
+        MeshToolProvider(Mesh())
+
+
+def test_mesh_tool_provider_rejects_conflicting_policies():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        MeshToolProvider(Mesh(), allow={}, allow_all=True)
+
+
+def test_mesh_tool_provider_rejects_string_tool_collection():
+    mesh = Mesh([Agent("analyst")])
+    with pytest.raises(TypeError, match="must be a collection of tool names"):
+        MeshToolProvider(mesh, allow={"analyst": "analyze"})  # type: ignore[dict-item]
+
+
+def test_mesh_tool_provider_validates_allowlist_at_construction():
+    analyst = Agent("analyst")
+
+    @analyst.tool()
+    async def analyze() -> str:
+        return "ok"
+
+    mesh = Mesh([analyst])
+    with pytest.raises(ValueError, match="unknown agent 'missing'"):
+        MeshToolProvider(mesh, allow={"missing": {"analyze"}})
+    with pytest.raises(ValueError, match="unknown tool 'summarize'.*agent 'analyst'"):
+        MeshToolProvider(mesh, allow={"analyst": {"summarize"}})
+
+
+async def test_mesh_tool_provider_rejects_unlisted_discoverable_tool():
+    analyst = Agent("analyst")
+    called = False
+
+    @analyst.tool()
+    async def safe() -> str:
+        return "ok"
+
+    mesh = Mesh([analyst])
+    provider = MeshToolProvider(mesh, allow={"analyst": {"safe"}})
+
+    # Adding a tool later must not expand an explicit provider's surface.
+    @analyst.tool()
+    async def privileged() -> str:
+        nonlocal called
+        called = True
+        return "secret"
+
+    discovered = {spec.name for spec in mesh.discover_tools()["analyst"]}
+    assert discovered == {"safe", "privileged"}
+    assert [schema["function"]["name"] for schema in provider.tool_schemas()] == ["safe"]
+
+    async with mesh:
+        with pytest.raises(AgentError, match="tool 'privileged' is not allowed"):
+            await provider.call_tool("privileged", {})
+    assert called is False
+
+
+def test_mesh_tool_provider_accepts_empty_allowlist():
+    provider = MeshToolProvider(Mesh(), allow={})
+    assert provider.tool_schemas() == []
+
+
+async def test_mesh_tool_provider_allow_all_is_explicit_escape_hatch():
+    analyst = Agent("analyst")
+
+    @analyst.tool()
+    async def ping() -> str:
+        return "pong"
+
+    mesh = Mesh([analyst])
+    provider = MeshToolProvider(mesh, allow_all=True)
+    assert [schema["function"]["name"] for schema in provider.tool_schemas()] == ["ping"]
+
+    async with mesh:
+        assert await provider.call_tool("ping", {}) == "pong"
+        with pytest.raises(AgentError, match="unknown tool 'missing'"):
+            await provider.call_tool("missing", {})
+
+
+def test_mesh_tool_provider_duplicate_exposed_name_raises():
     a = Agent("a")
     b = Agent("b")
 
@@ -45,15 +129,25 @@ def test_mesh_tool_provider_duplicate_name_raises():
         return 2
 
     mesh = Mesh([a, b])
-    with pytest.raises(ValueError, match="duplicate tool name"):
-        MeshToolProvider(mesh).tool_schemas()
+    with pytest.raises(ValueError, match="duplicate exposed tool name 'dup'.*'a'.*'b'"):
+        MeshToolProvider(mesh, allow_all=True)
 
 
-async def test_mesh_tool_provider_unknown_tool_raises():
-    mesh = Mesh([Agent("x")])
-    with pytest.raises(AgentError, match="unknown tool"):
-        async with mesh:
-            await MeshToolProvider(mesh).call_tool("nope", {})
+def test_mesh_tool_provider_ignores_duplicate_names_outside_exposed_surface():
+    a = Agent("a")
+    b = Agent("b")
+
+    @a.tool(name="dup")
+    async def t1() -> int:
+        return 1
+
+    @b.tool(name="dup")
+    async def t2() -> int:
+        return 2
+
+    mesh = Mesh([a, b])
+    provider = MeshToolProvider(mesh, allow={"a": {"dup"}})
+    assert [schema["function"]["name"] for schema in provider.tool_schemas()] == ["dup"]
 
 
 async def test_mesh_tool_provider_rejects_missing_required_argument():
@@ -66,7 +160,9 @@ async def test_mesh_tool_provider_rejects_missing_required_argument():
     mesh = Mesh([analyst])
     with pytest.raises(AgentError, match="missing required argument 'topic'"):
         async with mesh:
-            await MeshToolProvider(mesh).call_tool("analyze", {})
+            await MeshToolProvider(
+                mesh, allow={"analyst": {"analyze"}}
+            ).call_tool("analyze", {})
 
 
 async def test_mesh_tool_provider_rejects_unexpected_argument():
@@ -79,7 +175,9 @@ async def test_mesh_tool_provider_rejects_unexpected_argument():
     mesh = Mesh([analyst])
     with pytest.raises(AgentError, match="unexpected argument 'extra'"):
         async with mesh:
-            await MeshToolProvider(mesh).call_tool("ping", {"extra": True})
+            await MeshToolProvider(
+                mesh, allow={"analyst": {"ping"}}
+            ).call_tool("ping", {"extra": True})
 
 
 async def test_mesh_tool_provider_rejects_wrong_argument_type():
@@ -92,7 +190,9 @@ async def test_mesh_tool_provider_rejects_wrong_argument_type():
     mesh = Mesh([analyst])
     with pytest.raises(AgentError, match="argument 'topic' expected str, got int"):
         async with mesh:
-            await MeshToolProvider(mesh).call_tool("analyze", {"topic": 123})
+            await MeshToolProvider(
+                mesh, allow={"analyst": {"analyze"}}
+            ).call_tool("analyze", {"topic": 123})
 
 
 # --- Task 2: LLMAgent tool-calling loop ---
@@ -272,13 +372,15 @@ async def test_llm_agent_calls_mesh_tool_end_to_end():
         calls.append(topic)
         return {"summary": f"analyzed {topic}"}
 
+    mesh.add(analyst)
+
     client = ScriptedClient(
         _FMsg(tool_calls=[_FTC("c1", "analyze", '{"topic": "signals"}')]),
         _FMsg(content="DONE"),
     )
     planner = LLMAgent(
         "planner", client=client, model="m", on=Topic, emit=Plan,
-        tools=MeshToolProvider(mesh),
+        tools=MeshToolProvider(mesh, allow={"analyst": {"analyze"}}),
     )
 
     received = []
@@ -290,7 +392,6 @@ async def test_llm_agent_calls_mesh_tool_end_to_end():
         received.append(signal)
         done.set()
 
-    mesh.add(analyst)
     mesh.add(planner)
     mesh.add(reporter)
     mesh.connect(planner, reporter)
