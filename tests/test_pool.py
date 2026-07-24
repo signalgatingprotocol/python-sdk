@@ -5,7 +5,16 @@ import re
 
 import pytest
 
-from signal_gating import Agent, AgentContext, AgentPool, Gate, Mesh, MeshError, Signal
+from signal_gating import (
+    Agent,
+    AgentContext,
+    AgentError,
+    AgentPool,
+    Gate,
+    Mesh,
+    MeshError,
+    Signal,
+)
 
 
 class TaskSignal(Signal):
@@ -636,6 +645,162 @@ class TestPoolScaling:
 
         assert early_results == ["staged"]
         assert late_results == ["staged"]
+
+    async def test_mesh_scale_up_start_failure_rolls_back_staged_workers(self):
+        pool = AgentPool("workers", size=1)
+        collector = Agent("collector")
+        mesh = Mesh([collector])
+        mesh.add_pool(pool)
+        mesh.connect(pool, collector)
+        original_agents = mesh.agents
+        original_edges = mesh.edges
+        original_outputs = list(pool.workers[0]._outbox)
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async with mesh:
+
+            @pool.on_start
+            async def fail_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+                raise RuntimeError("staged start failed")
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 3))
+            await entered_start.wait()
+            staged = [agent for agent in mesh.agents if agent not in original_agents]
+            assert [worker.name for worker in staged] == ["workers[1]", "workers[2]"]
+            assert pool.worker_names == ["workers[0]"]
+
+            release_start.set()
+            with pytest.raises(AgentError, match="staged start failed"):
+                await scaling
+
+            assert mesh.agents == original_agents
+            assert mesh.edges == original_edges
+            assert pool.worker_names == ["workers[0]"]
+            assert pool.workers[0].running
+            assert pool.workers[0]._outbox == original_outputs
+            for worker in staged:
+                assert not worker.running
+                assert worker._outbox == []
+
+    async def test_mesh_scale_up_cancellation_rolls_back_staged_workers(self):
+        pool = AgentPool("workers", size=1)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        original_agents = mesh.agents
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async with mesh:
+
+            @pool.on_start
+            async def pause_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 2))
+            await entered_start.wait()
+            staged = [agent for agent in mesh.agents if agent not in original_agents]
+            scaling.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await scaling
+
+            assert mesh.agents == original_agents
+            assert pool.worker_names == ["workers[0]"]
+            assert all(not worker.running for worker in staged)
+            assert all(worker._outbox == [] for worker in staged)
+
+            release_start.set()
+
+    async def test_mesh_scale_down_stops_new_routing_and_drains_current_work(self):
+        source = Agent("source")
+        collector = Agent("collector")
+        pool = AgentPool("workers", size=2)
+        handled: dict[str, list[str]] = {}
+        collected: list[str] = []
+        retiring_started = asyncio.Event()
+        survivor_processed = asyncio.Event()
+        release_retiring = asyncio.Event()
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext):
+            handled.setdefault(ctx.agent_name, []).append(signal.task)
+            if signal.task == "retiring":
+                retiring_started.set()
+                await release_retiring.wait()
+            if signal.task == "after-scale-started":
+                survivor_processed.set()
+            await ctx.emit(ResultSignal(result=f"{ctx.agent_name}:{signal.task}"))
+
+        @collector.on(ResultSignal)
+        async def collect(signal: ResultSignal):
+            collected.append(signal.result)
+
+        mesh = Mesh([source, collector])
+        mesh.add_pool(pool)
+        mesh.connect(source, pool)
+        mesh.connect(pool, collector)
+        retiring = pool.workers[-1]
+
+        async with mesh:
+            await source.emit(TaskSignal(task="warmup"))
+            await mesh.wait_idle()
+            await source.emit(TaskSignal(task="retiring"))
+            await retiring_started.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
+            while pool.size != 1:
+                await asyncio.sleep(0)
+            assert not scaling.done()
+
+            await source.emit(TaskSignal(task="after-scale-started"))
+            await survivor_processed.wait()
+            assert handled[retiring.name] == ["retiring"]
+
+            release_retiring.set()
+            removed = await scaling
+            assert removed == [retiring]
+
+        assert not retiring.running
+        assert retiring not in mesh.agents
+        assert f"{retiring.name}:retiring" in collected
+
+    async def test_mesh_scale_down_cancellation_finishes_retirement_cleanup(self):
+        pool = AgentPool("workers", size=2)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        retiring = pool.workers[-1]
+        retiring_started = asyncio.Event()
+        release_retiring = asyncio.Event()
+
+        @pool.on(TaskSignal)
+        async def block_retiring(signal: TaskSignal, ctx: AgentContext):
+            if ctx.agent_name == retiring.name:
+                retiring_started.set()
+                await release_retiring.wait()
+
+        async with mesh:
+            await retiring.inbox.send(TaskSignal(task="block"))
+            await retiring_started.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
+            while pool.size != 1:
+                await asyncio.sleep(0)
+            scaling.cancel()
+            await asyncio.sleep(0)
+            completed_before_release = scaling.done()
+
+            release_retiring.set()
+            with pytest.raises(asyncio.CancelledError):
+                await scaling
+
+            assert not completed_before_release
+            assert not retiring.running
+            assert retiring not in mesh.agents
+            assert retiring._outbox == []
 
     async def test_mesh_scale_pool_validates_size(self):
         pool = AgentPool("workers", size=1)

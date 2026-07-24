@@ -823,35 +823,45 @@ class Mesh:
 
             if size > current_size:
                 new_workers = resolved._prepare_workers(size - current_size)
-                initial_connections = [
-                    connection
-                    for connection in self._pool_connections
-                    if connection.source is resolved
-                ]
-                initial_connection_ids = {
-                    id(connection) for connection in initial_connections
-                }
-                for worker in new_workers:
-                    self.add(worker)
-                    for connection in initial_connections:
-                        self._wire_pool_source_worker(connection, worker)
-                if self._running:
+                try:
+                    initial_connections = [
+                        connection
+                        for connection in self._pool_connections
+                        if connection.source is resolved
+                    ]
+                    initial_connection_ids = {
+                        id(connection) for connection in initial_connections
+                    }
                     for worker in new_workers:
-                        await worker.start()
-                    # Agent.start() schedules its supervised loop; yield so
-                    # newly added capacity is running before this call returns.
-                    await asyncio.sleep(0)
-                # A start hook or another task may connect the source pool
-                # while worker startup yields. Apply those newly recorded
-                # policies before committing staged workers to membership.
-                for connection in self._pool_connections:
-                    if (
-                        connection.source is resolved
-                        and id(connection) not in initial_connection_ids
-                    ):
-                        for worker in new_workers:
+                        self.add(worker)
+                        for connection in initial_connections:
                             self._wire_pool_source_worker(connection, worker)
-                resolved._commit_workers(new_workers)
+                    if self._running:
+                        for worker in new_workers:
+                            await worker.start()
+                        # Agent.start() schedules its supervised loop; yield so
+                        # newly added capacity is running before this call returns.
+                        await asyncio.sleep(0)
+                    # A start hook or another task may connect the source pool
+                    # while worker startup yields. Apply those newly recorded
+                    # policies before committing staged workers to membership.
+                    for connection in self._pool_connections:
+                        if (
+                            connection.source is resolved
+                            and id(connection) not in initial_connection_ids
+                        ):
+                            for worker in new_workers:
+                                self._wire_pool_source_worker(connection, worker)
+                    resolved._commit_workers(new_workers)
+                except BaseException:
+                    cleanup = asyncio.create_task(
+                        self._rollback_staged_workers(new_workers)
+                    )
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await cleanup
+                    raise
                 logger.info(
                     "Pool '%s' scaled up to %d workers (+%d)",
                     resolved.name,
@@ -861,8 +871,14 @@ class Mesh:
                 return new_workers
 
             removed = resolved._take_workers(current_size - size)
-            for worker in removed:
-                await self.remove(worker)
+            retirement = asyncio.create_task(self._retire_pool_workers(removed))
+            try:
+                await asyncio.shield(retirement)
+            except asyncio.CancelledError:
+                # Topology membership has already changed. Complete worker
+                # retirement before delivering cancellation to the caller.
+                await retirement
+                raise
             logger.info(
                 "Pool '%s' scaled down to %d workers (-%d)",
                 resolved.name,
@@ -870,6 +886,19 @@ class Mesh:
                 len(removed),
             )
             return removed
+
+    async def _rollback_staged_workers(self, workers: list[Agent]) -> None:
+        """Stop and unregister every worker from a failed scale-up."""
+        for worker in reversed(workers):
+            registered = self._agents.get(worker.name)
+            await worker.stop()
+            if registered is worker:
+                await self.remove(worker)
+
+    async def _retire_pool_workers(self, workers: list[Agent]) -> None:
+        """Gracefully stop and remove workers already taken from a pool."""
+        for worker in workers:
+            await self.remove(worker)
 
     def _resolve_pool_or_agent(
         self, ref: Agent | str | AgentPool,
