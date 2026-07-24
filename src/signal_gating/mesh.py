@@ -160,6 +160,11 @@ class Mesh:
         awaiting a reply from that agent times out rather than erroring.
         """
         resolved = self._resolve(agent)
+        for pool in self._pools.values():
+            if resolved.name in pool.worker_names and pool.size == 1:
+                raise MeshError(
+                    f"Cannot remove the final worker from pool '{pool.name}'"
+                )
         if resolved.running:
             await resolved.stop()
         # Remove all outbox functions that route TO this agent (from other agents)
@@ -180,7 +185,7 @@ class Mesh:
             ]
         # Purge pool membership so pools stop selecting the dead worker
         for pool in self._pools.values():
-            pool.discard(resolved.name)
+            pool._discard_worker(resolved.name)
         # Clear the removed agent's own outbox
         resolved._outbox.clear()
         # Remove all edges involving this agent
@@ -757,6 +762,7 @@ class Mesh:
         if pool_conflicts:
             joined = ", ".join(repr(name) for name in pool_conflicts)
             raise MeshError(f"Pool workers conflict with pool names: {joined}")
+        pool._claim(self)
         for worker in pool.workers:
             self.add(worker)
         self._pools[pool.name] = pool

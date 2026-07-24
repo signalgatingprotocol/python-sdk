@@ -1,6 +1,7 @@
 """Tests for AgentPool: horizontal scaling primitive."""
 
 import asyncio
+import re
 
 import pytest
 
@@ -215,6 +216,29 @@ class TestPoolMeshIntegration:
         assert mesh.agents == []
         assert mesh._pools == {}
 
+    def test_pool_cannot_attach_to_two_meshes(self):
+        pool = AgentPool("workers", size=1)
+        first_mesh = Mesh()
+        second_mesh = Mesh()
+        first_mesh.add_pool(pool)
+
+        with pytest.raises(MeshError, match="already attached"):
+            second_mesh.add_pool(pool)
+
+        assert second_mesh.agents == []
+        assert second_mesh._pools == {}
+
+    async def test_remove_rejects_pool_final_worker(self):
+        pool = AgentPool("workers", size=1)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+
+        with pytest.raises(MeshError, match="final worker"):
+            await mesh.remove(pool.workers[0])
+
+        assert mesh.agents == pool.workers
+        assert pool.size == 1
+
     async def test_get_pool(self):
         pool = AgentPool("workers", size=1)
         mesh = Mesh()
@@ -250,6 +274,32 @@ class TestPoolMeshIntegration:
 
 
 class TestPoolScaling:
+    def test_unattached_pool_discard_removes_worker(self):
+        pool = AgentPool("workers", size=2)
+
+        assert pool.discard("workers[0]") is True
+        assert pool.worker_names == ["workers[1]"]
+
+    async def test_attached_pool_rejects_direct_scaling_and_discard(self):
+        pool = AgentPool("workers", size=2)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        error = (
+            "Pool 'workers' is attached to a mesh; "
+            "use await mesh.scale_pool('workers', size)"
+        )
+
+        with pytest.raises(MeshError, match=re.escape(error)):
+            pool.scale_to(3)
+        with pytest.raises(MeshError, match=re.escape(error)):
+            await pool.scale_up()
+        with pytest.raises(MeshError, match=re.escape(error)):
+            await pool.scale_down()
+        with pytest.raises(MeshError, match=re.escape(error)):
+            pool.discard("workers[1]")
+
+        assert pool.size == 2
+
     def test_scale_up(self):
         pool = AgentPool("workers", size=2)
 

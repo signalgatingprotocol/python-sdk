@@ -21,11 +21,15 @@ import asyncio
 import itertools
 import logging
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from signal_gating.agent import Agent, ErrorHook, Handler, LifecycleHook, Middleware
+from signal_gating.errors import MeshError
 from signal_gating.gate import Gate
 from signal_gating.signal import Signal
+
+if TYPE_CHECKING:
+    from signal_gating.mesh import Mesh
 
 T = TypeVar("T", bound=Signal)
 
@@ -71,6 +75,7 @@ class AgentPool:
         self._restart_delay = restart_delay
         self._priority_inbox = priority_inbox
         self._strategy = strategy
+        self._mesh_owner: Mesh | None = None
 
         # Handler registry: applied to all workers on creation
         self._handler_registry: list[tuple[type[Signal], Handler]] = []
@@ -127,6 +132,38 @@ class AgentPool:
         for err_hook in self._on_error_hooks:
             worker._on_error_hooks.append(err_hook)
         return worker
+
+    def _claim(self, mesh: Mesh) -> None:
+        """Mark this pool as exclusively owned by a mesh."""
+        if self._mesh_owner is not None:
+            raise MeshError(f"Pool '{self.name}' is already attached to a mesh")
+        self._mesh_owner = mesh
+
+    def _assert_detached(self) -> None:
+        """Reject pool membership changes that bypass its owning mesh."""
+        if self._mesh_owner is not None:
+            raise MeshError(
+                f"Pool '{self.name}' is attached to a mesh; "
+                f"use await mesh.scale_pool('{self.name}', size)"
+            )
+
+    def _prepare_workers(self, count: int) -> list[Agent]:
+        """Create workers without making them visible to pool routing yet."""
+        return [self._create_worker() for _ in range(count)]
+
+    def _commit_workers(self, workers: list[Agent]) -> None:
+        """Make previously prepared workers available to the pool."""
+        self._workers.extend(workers)
+
+    def _take_workers(self, count: int) -> list[Agent]:
+        """Remove workers from the end, returning them in removal order."""
+        return [self._workers.pop() for _ in range(count)]
+
+    def _discard_worker(self, name: str) -> bool:
+        """Remove a worker by name for mesh-managed cleanup."""
+        before = len(self._workers)
+        self._workers = [worker for worker in self._workers if worker.name != name]
+        return len(self._workers) != before
 
     # --- Handler Registration (mirrors Agent API) ---
 
@@ -198,6 +235,7 @@ class AgentPool:
             pool.scale_to(10)   # Handle traffic spike
             pool.scale_to(2)    # Scale back down
         """
+        self._assert_detached()
         if size < 1:
             raise ValueError("Pool size must be at least 1")
 
@@ -206,11 +244,8 @@ class AgentPool:
 
         if size > len(self._workers):
             # Scale up
-            new_workers: list[Agent] = []
-            for _ in range(size - len(self._workers)):
-                worker = self._create_worker()
-                self._workers.append(worker)
-                new_workers.append(worker)
+            new_workers = self._prepare_workers(size - len(self._workers))
+            self._commit_workers(new_workers)
             logger.info(
                 "Pool '%s' scaled up to %d workers (+%d)",
                 self.name, len(self._workers), len(new_workers),
@@ -218,10 +253,7 @@ class AgentPool:
             return new_workers
 
         # Scale down: remove from the end
-        removed: list[Agent] = []
-        while len(self._workers) > size:
-            worker = self._workers.pop()
-            removed.append(worker)
+        removed = self._take_workers(len(self._workers) - size)
         logger.info(
             "Pool '%s' scaled down to %d workers (-%d)",
             self.name, len(self._workers), len(removed),
@@ -244,9 +276,8 @@ class AgentPool:
         Returns True if a worker was removed. The pool does not backfill;
         call scale_to() to restore capacity.
         """
-        before = len(self._workers)
-        self._workers = [w for w in self._workers if w.name != name]
-        return len(self._workers) != before
+        self._assert_detached()
+        return self._discard_worker(name)
 
     # --- Routing ---
 
