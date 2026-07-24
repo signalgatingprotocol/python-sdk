@@ -857,10 +857,7 @@ class Mesh:
                     cleanup = asyncio.create_task(
                         self._rollback_staged_workers(new_workers)
                     )
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        await cleanup
+                    await self._await_cleanup(cleanup)
                     raise
                 logger.info(
                     "Pool '%s' scaled up to %d workers (+%d)",
@@ -872,13 +869,7 @@ class Mesh:
 
             removed = resolved._take_workers(current_size - size)
             retirement = asyncio.create_task(self._retire_pool_workers(removed))
-            try:
-                await asyncio.shield(retirement)
-            except asyncio.CancelledError:
-                # Topology membership has already changed. Complete worker
-                # retirement before delivering cancellation to the caller.
-                await retirement
-                raise
+            await self._await_cleanup(retirement)
             logger.info(
                 "Pool '%s' scaled down to %d workers (-%d)",
                 resolved.name,
@@ -899,6 +890,19 @@ class Mesh:
         """Gracefully stop and remove workers already taken from a pool."""
         for worker in workers:
             await self.remove(worker)
+
+    @staticmethod
+    async def _await_cleanup(task: asyncio.Task[None]) -> None:
+        """Finish cleanup before propagating any caller cancellation."""
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                cancellation = error
+        task.result()
+        if cancellation is not None:
+            raise cancellation
 
     def _resolve_pool_or_agent(
         self, ref: Agent | str | AgentPool,

@@ -692,6 +692,8 @@ class TestPoolScaling:
         original_agents = mesh.agents
         entered_start = asyncio.Event()
         release_start = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
 
         async with mesh:
 
@@ -700,14 +702,27 @@ class TestPoolScaling:
                 entered_start.set()
                 await release_start.wait()
 
+            @pool.on_stop
+            async def pause_staged_worker_cleanup():
+                cleanup_started.set()
+                await release_cleanup.wait()
+
             scaling = asyncio.create_task(mesh.scale_pool(pool, 2))
             await entered_start.wait()
             staged = [agent for agent in mesh.agents if agent not in original_agents]
             scaling.cancel()
+            await cleanup_started.wait()
+            scaling.cancel()
+            await asyncio.sleep(0)
+            scaling.cancel()
+            await asyncio.sleep(0)
+            completed_before_release = scaling.done()
+            release_cleanup.set()
 
             with pytest.raises(asyncio.CancelledError):
                 await scaling
 
+            assert not completed_before_release
             assert mesh.agents == original_agents
             assert pool.worker_names == ["workers[0]"]
             assert all(not worker.running for worker in staged)
@@ -750,6 +765,7 @@ class TestPoolScaling:
             await mesh.wait_idle()
             await source.emit(TaskSignal(task="retiring"))
             await retiring_started.wait()
+            await retiring.inbox.send(TaskSignal(task="queued"))
 
             scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
             while pool.size != 1:
@@ -766,7 +782,9 @@ class TestPoolScaling:
 
         assert not retiring.running
         assert retiring not in mesh.agents
+        assert handled[retiring.name] == ["retiring", "queued"]
         assert f"{retiring.name}:retiring" in collected
+        assert f"{retiring.name}:queued" in collected
 
     async def test_mesh_scale_down_cancellation_finishes_retirement_cleanup(self):
         pool = AgentPool("workers", size=2)
@@ -789,6 +807,8 @@ class TestPoolScaling:
             scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
             while pool.size != 1:
                 await asyncio.sleep(0)
+            scaling.cancel()
+            await asyncio.sleep(0)
             scaling.cancel()
             await asyncio.sleep(0)
             completed_before_release = scaling.done()
