@@ -239,6 +239,18 @@ class TestPoolMeshIntegration:
         assert mesh.agents == pool.workers
         assert pool.size == 1
 
+    async def test_remove_rejects_any_attached_pool_worker(self):
+        pool = AgentPool("workers", size=2)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        workers_before = pool.workers
+
+        with pytest.raises(MeshError, match="use await mesh.scale_pool"):
+            await mesh.remove(pool.workers[-1])
+
+        assert mesh.agents == workers_before
+        assert pool.workers == workers_before
+
     async def test_get_pool(self):
         pool = AgentPool("workers", size=1)
         mesh = Mesh()
@@ -581,10 +593,56 @@ class TestPoolScaling:
             assert [worker.name for worker in second_created] == ["workers[2]"]
             assert pool.worker_names == ["workers[0]", "workers[1]", "workers[2]"]
 
+    async def test_pool_connection_added_during_start_wires_staged_worker(self):
+        pool = AgentPool("workers", size=1)
+        early = Agent("early")
+        late = Agent("late")
+        early_results: list[str] = []
+        late_results: list[str] = []
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+
+        @pool.on(TaskSignal)
+        async def produce(signal: TaskSignal, ctx: AgentContext):
+            await ctx.emit(ResultSignal(result=signal.task))
+
+        @early.on(ResultSignal)
+        async def collect_early(signal: ResultSignal):
+            early_results.append(signal.result)
+
+        @late.on(ResultSignal)
+        async def collect_late(signal: ResultSignal):
+            late_results.append(signal.result)
+
+        mesh = Mesh([early, late])
+        mesh.add_pool(pool)
+        mesh.connect(pool, early)
+
+        async with mesh:
+
+            @pool.on_start
+            async def pause_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 2))
+            await entered_start.wait()
+            mesh.connect(pool, late)
+            release_start.set()
+            new_workers = await scaling
+
+            await new_workers[0].inbox.send(TaskSignal(task="staged"))
+            await mesh.wait_idle()
+
+        assert early_results == ["staged"]
+        assert late_results == ["staged"]
+
     async def test_mesh_scale_pool_validates_size(self):
         pool = AgentPool("workers", size=1)
         mesh = Mesh()
         mesh.add_pool(pool)
+
+        assert await mesh.scale_pool(pool, pool.size) == []
 
         with pytest.raises(ValueError, match="Pool size must be at least 1"):
             await mesh.scale_pool(pool, 0)

@@ -172,9 +172,12 @@ class Mesh:
         """
         resolved = self._resolve(agent)
         for pool in self._pools.values():
-            if resolved.name in pool.worker_names and pool.size == 1:
+            if resolved.name in pool.worker_names:
+                descriptor = "final worker" if pool.size == 1 else "worker"
                 raise MeshError(
-                    f"Cannot remove the final worker from pool '{pool.name}'"
+                    f"Cannot remove {descriptor} '{resolved.name}' directly "
+                    f"from attached pool '{pool.name}'; use await "
+                    f"mesh.scale_pool('{pool.name}', size)"
                 )
         if resolved.running:
             await resolved.stop()
@@ -820,17 +823,34 @@ class Mesh:
 
             if size > current_size:
                 new_workers = resolved._prepare_workers(size - current_size)
+                initial_connections = [
+                    connection
+                    for connection in self._pool_connections
+                    if connection.source is resolved
+                ]
+                initial_connection_ids = {
+                    id(connection) for connection in initial_connections
+                }
                 for worker in new_workers:
                     self.add(worker)
-                    for connection in self._pool_connections:
-                        if connection.source is resolved:
-                            self._wire_pool_source_worker(connection, worker)
+                    for connection in initial_connections:
+                        self._wire_pool_source_worker(connection, worker)
                 if self._running:
                     for worker in new_workers:
                         await worker.start()
                     # Agent.start() schedules its supervised loop; yield so
                     # newly added capacity is running before this call returns.
                     await asyncio.sleep(0)
+                # A start hook or another task may connect the source pool
+                # while worker startup yields. Apply those newly recorded
+                # policies before committing staged workers to membership.
+                for connection in self._pool_connections:
+                    if (
+                        connection.source is resolved
+                        and id(connection) not in initial_connection_ids
+                    ):
+                        for worker in new_workers:
+                            self._wire_pool_source_worker(connection, worker)
                 resolved._commit_workers(new_workers)
                 logger.info(
                     "Pool '%s' scaled up to %d workers (+%d)",
