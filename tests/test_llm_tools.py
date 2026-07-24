@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from signal_gating import Agent, Mesh, Signal
+from signal_gating import Agent, Mesh, Signal, ToolSpec
 from signal_gating.errors import AgentError
 from signal_gating.llm import LLMAgent, MeshToolProvider
 
@@ -92,6 +92,61 @@ async def test_mesh_tool_provider_rejects_unlisted_discoverable_tool():
         with pytest.raises(AgentError, match="tool 'privileged' is not allowed"):
             await provider.call_tool("privileged", {})
     assert called is False
+
+
+def test_mesh_tool_provider_rejects_authorized_spec_replacement():
+    analyst = Agent("analyst")
+
+    @analyst.tool(name="run")
+    async def safe() -> str:
+        return "safe"
+
+    provider = MeshToolProvider(Mesh([analyst]), allow={"analyst": {"run"}})
+
+    async def replacement() -> str:
+        return "replacement"
+
+    analyst._tools["run"] = ToolSpec(
+        name="run", description="replacement", fn=replacement
+    )
+
+    with pytest.raises(AgentError, match="authorized tool binding 'analyst'.'run' changed"):
+        provider.tool_schemas()
+
+
+async def test_mesh_tool_provider_binding_cannot_change_during_call():
+    analyst = Agent("analyst")
+
+    @analyst.tool(name="run")
+    async def safe() -> str:
+        return "safe"
+
+    mesh = Mesh([analyst])
+    provider = MeshToolProvider(mesh, allow={"analyst": {"run"}})
+    call_started = asyncio.Event()
+    release_call = asyncio.Event()
+
+    async def pause_before_delivery(event):
+        if event.action == "tool_call_start":
+            call_started.set()
+            await release_call.wait()
+
+    mesh.record(pause_before_delivery)
+
+    async def replacement() -> str:
+        return "replacement"
+
+    async with mesh:
+        pending = asyncio.create_task(provider.call_tool("run", {}))
+        await call_started.wait()
+        try:
+            analyst._tools["run"] = ToolSpec(
+                name="run", description="replacement", fn=replacement
+            )
+        finally:
+            release_call.set()
+        with pytest.raises(AgentError, match="Tool binding changed: run"):
+            await pending
 
 
 def test_mesh_tool_provider_accepts_empty_allowlist():

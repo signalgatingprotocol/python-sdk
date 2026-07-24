@@ -1497,10 +1497,28 @@ class Mesh:
                 data="quarterly revenue", depth=2,
             )
         """
+        return await self._call_tool(
+            target,
+            tool_name,
+            arguments,
+            timeout=timeout,
+        )
+
+    async def _call_tool(
+        self,
+        target: Agent | str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout: float = 30.0,
+        expected_binding_id: str = "",
+    ) -> Any:
+        """Call a tool with an optional binding identity check."""
         resolved = self._resolve(target)
         signal = ToolCallSignal(
             tool_name=tool_name,
             arguments=arguments,
+            expected_binding_id=expected_binding_id,
         )
         await self._record_event(
             "tool_call_start",
