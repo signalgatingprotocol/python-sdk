@@ -26,6 +26,7 @@ logger = logging.getLogger("signal_gating.mesh")
 Interceptor = Callable[[Signal, str, str], Signal | None | Awaitable[Signal | None]]
 MeshEventSink = Callable[["MeshEvent"], None | Awaitable[None]]
 _DeliveryFn = Callable[[Signal], None | Awaitable[None]]
+_DeliveryReleaseFn = Callable[[], None]
 
 
 class Edge:
@@ -128,6 +129,8 @@ class Mesh:
         self._pools: dict[str, AgentPool] = {}
         self._pool_connections: list[_PoolConnection] = []
         self._pool_scale_lock = asyncio.Lock()
+        self._pool_delivery_counts: dict[Agent, int] = {}
+        self._pool_delivery_idle: dict[Agent, asyncio.Event] = {}
         self._topics: dict[str, list[Agent]] = {}
         self.tracer = tracer or Tracer()
         for agent in agents or []:
@@ -172,13 +175,21 @@ class Mesh:
         """
         resolved = self._resolve(agent)
         for pool in self._pools.values():
-            if resolved.name in pool.worker_names:
-                descriptor = "final worker" if pool.size == 1 else "worker"
+            if pool._contains_worker(resolved):
+                descriptor = (
+                    "final worker"
+                    if pool.size == 1 and pool._is_committed_worker(resolved)
+                    else "worker"
+                )
                 raise MeshError(
                     f"Cannot remove {descriptor} '{resolved.name}' directly "
                     f"from attached pool '{pool.name}'; use await "
                     f"mesh.scale_pool('{pool.name}', size)"
                 )
+        await self._remove_resolved(resolved)
+
+    async def _remove_resolved(self, resolved: Agent) -> None:
+        """Remove an already resolved agent after ownership checks."""
         if resolved.running:
             await resolved.stop()
         # Remove all outbox functions that route TO this agent (from other agents)
@@ -855,7 +866,7 @@ class Mesh:
                     resolved._commit_workers(new_workers)
                 except BaseException:
                     cleanup = asyncio.create_task(
-                        self._rollback_staged_workers(new_workers)
+                        self._rollback_staged_workers(resolved, new_workers)
                     )
                     await self._await_cleanup(cleanup)
                     raise
@@ -867,7 +878,10 @@ class Mesh:
                 )
                 return new_workers
 
-            removed = resolved._take_workers(current_size - size)
+            removed = resolved._take_workers(
+                current_size - size,
+                track_retiring=True,
+            )
             retirement = asyncio.create_task(self._retire_pool_workers(removed))
             await self._await_cleanup(retirement)
             logger.info(
@@ -878,18 +892,25 @@ class Mesh:
             )
             return removed
 
-    async def _rollback_staged_workers(self, workers: list[Agent]) -> None:
+    async def _rollback_staged_workers(
+        self,
+        pool: AgentPool,
+        workers: list[Agent],
+    ) -> None:
         """Stop and unregister every worker from a failed scale-up."""
         for worker in reversed(workers):
             registered = self._agents.get(worker.name)
             await worker.stop()
+            pool._discard_worker(worker.name)
             if registered is worker:
-                await self.remove(worker)
+                await self._remove_resolved(worker)
 
     async def _retire_pool_workers(self, workers: list[Agent]) -> None:
         """Gracefully stop and remove workers already taken from a pool."""
         for worker in workers:
-            await self.remove(worker)
+            await self._wait_for_pool_deliveries(worker)
+            await worker.stop()
+            await self._remove_resolved(worker)
 
     @staticmethod
     async def _await_cleanup(task: asyncio.Task[None]) -> None:
@@ -983,17 +1004,21 @@ class Mesh:
 
         async def route(signal: Signal) -> None:
             target = pool.select_worker(signal)
-            await mesh._deliver(
-                signal,
-                source=src.name,
-                target=target.name,
-                send=target.inbox.send,
-                action="routed",
-                event_kind="signal",
-                gate=gate,
-                trace_gate="load_balance",
-                trace_action="routed",
-            )
+            release = mesh._reserve_pool_delivery(target)
+            try:
+                await mesh._deliver(
+                    signal,
+                    source=src.name,
+                    target=target.name,
+                    send=target.inbox.send,
+                    action="routed",
+                    event_kind="signal",
+                    gate=gate,
+                    trace_gate="load_balance",
+                    trace_action="routed",
+                )
+            finally:
+                release()
 
         src._add_output(
             RouteFn(
@@ -1003,6 +1028,34 @@ class Mesh:
                 tag="pool_connect",
             )
         )
+
+    def _reserve_pool_delivery(self, worker: Agent) -> _DeliveryReleaseFn:
+        """Keep a selected worker alive until its inbox accepts the signal."""
+        count = self._pool_delivery_counts.get(worker, 0)
+        if count == 0:
+            self._pool_delivery_idle[worker] = asyncio.Event()
+        self._pool_delivery_counts[worker] = count + 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            remaining = self._pool_delivery_counts[worker] - 1
+            if remaining:
+                self._pool_delivery_counts[worker] = remaining
+                return
+            del self._pool_delivery_counts[worker]
+            self._pool_delivery_idle.pop(worker).set()
+
+        return release
+
+    async def _wait_for_pool_deliveries(self, worker: Agent) -> None:
+        """Wait until every delivery that selected this worker has enqueued."""
+        idle = self._pool_delivery_idle.get(worker)
+        if idle is not None:
+            await idle.wait()
 
     def _connect_agents(
         self,

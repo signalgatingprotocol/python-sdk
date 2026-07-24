@@ -88,6 +88,8 @@ class AgentPool:
 
         # Create workers
         self._workers: list[Agent] = []
+        self._staged_workers: list[Agent] = []
+        self._retiring_workers: list[Agent] = []
         self._name_counter = itertools.count()
         self._robin_counter = itertools.count()
         for _ in range(size):
@@ -149,21 +151,71 @@ class AgentPool:
 
     def _prepare_workers(self, count: int) -> list[Agent]:
         """Create workers without making them visible to pool routing yet."""
-        return [self._create_worker() for _ in range(count)]
+        workers = [self._create_worker() for _ in range(count)]
+        self._staged_workers.extend(workers)
+        return workers
 
     def _commit_workers(self, workers: list[Agent]) -> None:
         """Make previously prepared workers available to the pool."""
+        committed_ids = {id(worker) for worker in workers}
+        self._staged_workers = [
+            worker
+            for worker in self._staged_workers
+            if id(worker) not in committed_ids
+        ]
         self._workers.extend(workers)
 
-    def _take_workers(self, count: int) -> list[Agent]:
+    def _take_workers(
+        self,
+        count: int,
+        *,
+        track_retiring: bool = False,
+    ) -> list[Agent]:
         """Remove workers from the end, returning them in removal order."""
-        return [self._workers.pop() for _ in range(count)]
+        workers = [self._workers.pop() for _ in range(count)]
+        if track_retiring:
+            self._retiring_workers.extend(workers)
+        return workers
 
     def _discard_worker(self, name: str) -> bool:
         """Remove a worker by name for mesh-managed cleanup."""
-        before = len(self._workers)
+        before = (
+            len(self._workers)
+            + len(self._staged_workers)
+            + len(self._retiring_workers)
+        )
         self._workers = [worker for worker in self._workers if worker.name != name]
-        return len(self._workers) != before
+        self._staged_workers = [
+            worker for worker in self._staged_workers if worker.name != name
+        ]
+        self._retiring_workers = [
+            worker for worker in self._retiring_workers if worker.name != name
+        ]
+        after = (
+            len(self._workers)
+            + len(self._staged_workers)
+            + len(self._retiring_workers)
+        )
+        return after != before
+
+    def _contains_worker(self, worker: Agent) -> bool:
+        """Return whether committed or staged membership owns this worker."""
+        return any(
+            candidate is worker
+            for candidate in (
+                *self._workers,
+                *self._staged_workers,
+                *self._retiring_workers,
+            )
+        )
+
+    def _is_committed_worker(self, worker: Agent) -> bool:
+        """Return whether this worker is visible to pool routing."""
+        return any(candidate is worker for candidate in self._workers)
+
+    def _configured_workers(self) -> tuple[Agent, ...]:
+        """Return all workers that must receive live pool configuration."""
+        return (*self._workers, *self._staged_workers)
 
     # --- Handler Registration (mirrors Agent API) ---
 
@@ -172,7 +224,7 @@ class AgentPool:
 
         def decorator(fn: Handler) -> Handler:
             self._handler_registry.append((signal_type, fn))
-            for worker in self._workers:
+            for worker in self._configured_workers():
                 worker._handlers.setdefault(signal_type, []).append(fn)
             return fn
 
@@ -181,7 +233,7 @@ class AgentPool:
     def on_any(self, fn: Handler) -> Handler:
         """Register a handler for all signal types across all pool workers."""
         self._any_handlers.append(fn)
-        for worker in self._workers:
+        for worker in self._configured_workers():
             worker._handlers.setdefault(Signal, []).append(fn)
         return fn
 
@@ -190,7 +242,7 @@ class AgentPool:
 
         def decorator(fn: Handler) -> Handler:
             self._once_handlers.append((signal_type, fn))
-            for worker in self._workers:
+            for worker in self._configured_workers():
                 worker.once(signal_type)(fn)
             return fn
 
@@ -199,28 +251,28 @@ class AgentPool:
     def on_start(self, fn: LifecycleHook) -> LifecycleHook:
         """Register a start hook for all pool workers."""
         self._on_start_hooks.append(fn)
-        for worker in self._workers:
+        for worker in self._configured_workers():
             worker._on_start_hooks.append(fn)
         return fn
 
     def on_stop(self, fn: LifecycleHook) -> LifecycleHook:
         """Register a stop hook for all pool workers."""
         self._on_stop_hooks.append(fn)
-        for worker in self._workers:
+        for worker in self._configured_workers():
             worker._on_stop_hooks.append(fn)
         return fn
 
     def on_error(self, fn: ErrorHook) -> ErrorHook:
         """Register an error hook for all pool workers."""
         self._on_error_hooks.append(fn)
-        for worker in self._workers:
+        for worker in self._configured_workers():
             worker._on_error_hooks.append(fn)
         return fn
 
     def use(self, middleware: Middleware) -> None:
         """Add middleware to all pool workers."""
         self._middleware.append(middleware)
-        for worker in self._workers:
+        for worker in self._configured_workers():
             worker.use(middleware)
 
     # --- Scaling ---

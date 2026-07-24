@@ -93,4 +93,3 @@
 - `git diff --check`
 - The full `1 -> 3 -> 1` scenario covers pool source, target, and both sides of pool-to-pool routing.
 - A final whole-branch review must approve the merge-base diff.
-
