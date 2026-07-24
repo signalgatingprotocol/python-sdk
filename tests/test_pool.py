@@ -1,10 +1,20 @@
 """Tests for AgentPool: horizontal scaling primitive."""
 
 import asyncio
+import re
 
 import pytest
 
-from signal_gating import Agent, AgentContext, AgentPool, Gate, Mesh, MeshError, Signal
+from signal_gating import (
+    Agent,
+    AgentContext,
+    AgentError,
+    AgentPool,
+    Gate,
+    Mesh,
+    MeshError,
+    Signal,
+)
 
 
 class TaskSignal(Signal):
@@ -215,6 +225,41 @@ class TestPoolMeshIntegration:
         assert mesh.agents == []
         assert mesh._pools == {}
 
+    def test_pool_cannot_attach_to_two_meshes(self):
+        pool = AgentPool("workers", size=1)
+        first_mesh = Mesh()
+        second_mesh = Mesh()
+        first_mesh.add_pool(pool)
+
+        with pytest.raises(MeshError, match="already attached"):
+            second_mesh.add_pool(pool)
+
+        assert second_mesh.agents == []
+        assert second_mesh._pools == {}
+
+    async def test_remove_rejects_pool_final_worker(self):
+        pool = AgentPool("workers", size=1)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+
+        with pytest.raises(MeshError, match="final worker"):
+            await mesh.remove(pool.workers[0])
+
+        assert mesh.agents == pool.workers
+        assert pool.size == 1
+
+    async def test_remove_rejects_any_attached_pool_worker(self):
+        pool = AgentPool("workers", size=2)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        workers_before = pool.workers
+
+        with pytest.raises(MeshError, match="use await mesh.scale_pool"):
+            await mesh.remove(pool.workers[-1])
+
+        assert mesh.agents == workers_before
+        assert pool.workers == workers_before
+
     async def test_get_pool(self):
         pool = AgentPool("workers", size=1)
         mesh = Mesh()
@@ -250,6 +295,32 @@ class TestPoolMeshIntegration:
 
 
 class TestPoolScaling:
+    def test_unattached_pool_discard_removes_worker(self):
+        pool = AgentPool("workers", size=2)
+
+        assert pool.discard("workers[0]") is True
+        assert pool.worker_names == ["workers[1]"]
+
+    async def test_attached_pool_rejects_direct_scaling_and_discard(self):
+        pool = AgentPool("workers", size=2)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        error = (
+            "Pool 'workers' is attached to a mesh; "
+            "use await mesh.scale_pool('workers', size)"
+        )
+
+        with pytest.raises(MeshError, match=re.escape(error)):
+            pool.scale_to(3)
+        with pytest.raises(MeshError, match=re.escape(error)):
+            await pool.scale_up()
+        with pytest.raises(MeshError, match=re.escape(error)):
+            await pool.scale_down()
+        with pytest.raises(MeshError, match=re.escape(error)):
+            pool.discard("workers[1]")
+
+        assert pool.size == 2
+
     def test_scale_up(self):
         pool = AgentPool("workers", size=2)
 
@@ -306,6 +377,819 @@ class TestPoolScaling:
         for w in removed:
             assert not w.running
         await pool.stop()
+
+    async def test_mesh_live_scaling_preserves_all_pool_connection_shapes(self):
+        dispatcher = Agent("dispatcher")
+        collector = Agent("collector")
+        ingress = AgentPool("ingress", size=1)
+        producers = AgentPool("producers", size=1)
+        consumers = AgentPool("consumers", size=1)
+        ingress_received: dict[str, list[str]] = {}
+        collected: list[str] = []
+        consumed: dict[str, list[str]] = {}
+        gate_calls = {"to_ingress": 0, "from_ingress": 0, "pool_to_pool": 0}
+
+        def counting_gate(name: str) -> Gate:
+            def count(signal: Signal) -> Signal:
+                gate_calls[name] += 1
+                return signal
+
+            return Gate(count, name=name)
+
+        @ingress.on(TaskSignal)
+        async def handle_ingress(signal: TaskSignal, ctx: AgentContext):
+            ingress_received.setdefault(ctx.agent_name, []).append(signal.task)
+            await ctx.emit(ResultSignal(result=f"ingress:{signal.task}"))
+
+        @collector.on(ResultSignal)
+        async def collect(signal: ResultSignal):
+            collected.append(signal.result)
+
+        @producers.on(TaskSignal)
+        async def produce(signal: TaskSignal, ctx: AgentContext):
+            await ctx.emit(ResultSignal(result=f"{ctx.agent_name}:{signal.task}"))
+
+        @consumers.on(ResultSignal)
+        async def consume(signal: ResultSignal, ctx: AgentContext):
+            consumed.setdefault(ctx.agent_name, []).append(signal.result)
+
+        mesh = Mesh([dispatcher, collector])
+        mesh.add_pool(ingress)
+        mesh.add_pool(producers)
+        mesh.add_pool(consumers)
+        mesh.connect(dispatcher, ingress, counting_gate("to_ingress"))
+        mesh.connect(ingress, collector, counting_gate("from_ingress"))
+        mesh.connect(producers, consumers, counting_gate("pool_to_pool"))
+
+        async def exercise_batch(label: str) -> None:
+            await dispatcher.emit(TaskSignal(task=label))
+            for worker in producers.workers:
+                await worker.inbox.send(TaskSignal(task=label))
+            await mesh.wait_idle()
+
+        async with mesh:
+            await exercise_batch("one")
+
+            new_ingress = await mesh.scale_pool(ingress, 3)
+            new_producers = await mesh.scale_pool("producers", 3)
+            new_consumers = await mesh.scale_pool(consumers, 3)
+
+            for worker in new_ingress + new_producers + new_consumers:
+                assert mesh.get(worker.name) is worker
+                assert worker._tracer is mesh.tracer
+                assert worker.running
+
+            for index in range(3):
+                await dispatcher.emit(TaskSignal(task=f"three-{index}"))
+            for worker in producers.workers:
+                await worker.inbox.send(TaskSignal(task="three"))
+            await mesh.wait_idle()
+
+            removed_ingress = await mesh.scale_pool("ingress", 1)
+            removed_producers = await mesh.scale_pool(producers, 1)
+            removed_consumers = await mesh.scale_pool("consumers", 1)
+            assert [worker.name for worker in removed_ingress] == [
+                "ingress[2]",
+                "ingress[1]",
+            ]
+            assert [worker.name for worker in removed_producers] == [
+                "producers[2]",
+                "producers[1]",
+            ]
+            assert [worker.name for worker in removed_consumers] == [
+                "consumers[2]",
+                "consumers[1]",
+            ]
+
+            await exercise_batch("one-again")
+
+        assert set(ingress_received) == {
+            "ingress[0]",
+            "ingress[1]",
+            "ingress[2]",
+        }
+        assert len(collected) == 5
+        assert set(consumed) == {
+            "consumers[0]",
+            "consumers[1]",
+            "consumers[2]",
+        }
+        assert sum(map(len, consumed.values())) == 5
+        assert gate_calls == {
+            "to_ingress": 5,
+            "from_ingress": 5,
+            "pool_to_pool": 5,
+        }
+
+    async def test_mesh_scale_pool_while_stopped_registers_without_starting(self):
+        pool = AgentPool("workers", size=1)
+        collector = Agent("collector")
+        mesh = Mesh([collector])
+        mesh.add_pool(pool)
+        mesh.connect(pool, collector)
+
+        created = await mesh.scale_pool(pool, 3)
+
+        assert [worker.name for worker in created] == ["workers[1]", "workers[2]"]
+        assert pool.worker_names == ["workers[0]", "workers[1]", "workers[2]"]
+        for worker in created:
+            assert mesh.get(worker.name) is worker
+            assert worker._tracer is mesh.tracer
+            assert not worker.running
+            assert any(
+                getattr(route, "target", None) == collector.name
+                for route in worker._outbox
+            )
+
+        removed = await mesh.scale_pool("workers", 1)
+        assert removed == list(reversed(created))
+        assert pool.worker_names == ["workers[0]"]
+
+    async def test_mesh_scale_down_severs_removed_workers_and_prunes_policies(self):
+        source = Agent("source")
+        target = Agent("target")
+        pool = AgentPool("workers", size=3)
+        downstream = AgentPool("downstream", size=1)
+        source_pool = AgentPool("source-pool", size=1)
+        received: list[str] = []
+        survivor = pool.workers[0]
+        removed_targets = pool.workers[1:]
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal):
+            received.append(signal.task)
+
+        mesh = Mesh([source, target])
+        mesh.add_pool(pool)
+        mesh.add_pool(downstream)
+        mesh.add_pool(source_pool)
+        mesh.connect(source, pool)
+        mesh.connect(pool, target)
+        mesh.connect(removed_targets[-1], downstream)
+        mesh.connect(source_pool, removed_targets[-1])
+        mesh.connect(source, removed_targets[-1])
+        mesh.connect(removed_targets[-1], target)
+        mesh.load_balance(source, [survivor, *removed_targets])
+        mesh.create_topic("work")
+        for worker in removed_targets:
+            mesh.subscribe(worker, "work")
+            mesh.declare_capabilities(worker, "ephemeral")
+
+        async with mesh:
+            removed = await mesh.scale_pool(pool, 1)
+            assert removed == list(reversed(removed_targets))
+            assert all(not worker.running for worker in removed)
+
+            for index in range(6):
+                await source.emit(TaskSignal(task=f"job-{index}"))
+            await mesh.wait_idle()
+
+        assert pool.workers == [survivor]
+        assert received
+        assert all(worker not in mesh.agents for worker in removed_targets)
+        for worker in removed_targets:
+            with pytest.raises(MeshError, match="not found"):
+                mesh.get(worker.name)
+            assert worker.name not in mesh._capabilities
+            assert worker not in mesh._topics["work"]
+            assert worker._outbox == []
+            assert all(
+                edge.source is not worker and edge.target is not worker
+                for edge in mesh.edges
+            )
+            assert all(
+                getattr(route, "target", None) != worker.name
+                for agent in mesh.agents
+                for route in agent._outbox
+            )
+
+        assert any(
+            connection.source is pool and connection.target is target
+            for connection in mesh._pool_connections
+        )
+        assert all(
+            connection.source not in removed_targets
+            and connection.target not in removed_targets
+            for connection in mesh._pool_connections
+        )
+
+    async def test_mesh_scale_pool_serializes_concurrent_resizes(self):
+        pool = AgentPool("workers", size=1)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async with mesh:
+
+            @pool.on_start
+            async def pause_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+
+            first = asyncio.create_task(mesh.scale_pool(pool, 2))
+            await entered_start.wait()
+            second = asyncio.create_task(mesh.scale_pool("workers", 3))
+            await asyncio.sleep(0)
+
+            assert not second.done()
+            assert pool.size == 1
+
+            release_start.set()
+            first_created, second_created = await asyncio.gather(first, second)
+
+            assert [worker.name for worker in first_created] == ["workers[1]"]
+            assert [worker.name for worker in second_created] == ["workers[2]"]
+            assert pool.worker_names == ["workers[0]", "workers[1]", "workers[2]"]
+
+    async def test_pool_connection_added_during_start_wires_staged_worker(self):
+        pool = AgentPool("workers", size=1)
+        early = Agent("early")
+        late = Agent("late")
+        early_results: list[str] = []
+        late_results: list[str] = []
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+
+        @pool.on(TaskSignal)
+        async def produce(signal: TaskSignal, ctx: AgentContext):
+            await ctx.emit(ResultSignal(result=signal.task))
+
+        @early.on(ResultSignal)
+        async def collect_early(signal: ResultSignal):
+            early_results.append(signal.result)
+
+        @late.on(ResultSignal)
+        async def collect_late(signal: ResultSignal):
+            late_results.append(signal.result)
+
+        mesh = Mesh([early, late])
+        mesh.add_pool(pool)
+        mesh.connect(pool, early)
+
+        async with mesh:
+
+            @pool.on_start
+            async def pause_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 2))
+            await entered_start.wait()
+            mesh.connect(pool, late)
+            release_start.set()
+            new_workers = await scaling
+
+            await new_workers[0].inbox.send(TaskSignal(task="staged"))
+            await mesh.wait_idle()
+
+        assert early_results == ["staged"]
+        assert late_results == ["staged"]
+
+    async def test_mesh_scale_up_start_failure_rolls_back_staged_workers(self):
+        pool = AgentPool("workers", size=1)
+        collector = Agent("collector")
+        mesh = Mesh([collector])
+        mesh.add_pool(pool)
+        mesh.connect(pool, collector)
+        original_agents = mesh.agents
+        original_edges = mesh.edges
+        original_outputs = list(pool.workers[0]._outbox)
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async with mesh:
+
+            @pool.on_start
+            async def fail_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+                raise RuntimeError("staged start failed")
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 3))
+            await entered_start.wait()
+            staged = [agent for agent in mesh.agents if agent not in original_agents]
+            assert [worker.name for worker in staged] == ["workers[1]", "workers[2]"]
+            assert pool.worker_names == ["workers[0]"]
+
+            release_start.set()
+            with pytest.raises(AgentError, match="staged start failed"):
+                await scaling
+
+            assert mesh.agents == original_agents
+            assert mesh.edges == original_edges
+            assert pool.worker_names == ["workers[0]"]
+            assert pool.workers[0].running
+            assert pool.workers[0]._outbox == original_outputs
+            for worker in staged:
+                assert not worker.running
+                assert worker._outbox == []
+
+    async def test_mesh_scale_up_cancellation_rolls_back_staged_workers(self):
+        pool = AgentPool("workers", size=1)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        original_agents = mesh.agents
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async with mesh:
+
+            @pool.on_start
+            async def pause_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+
+            @pool.on_stop
+            async def pause_staged_worker_cleanup():
+                cleanup_started.set()
+                await release_cleanup.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 2))
+            await entered_start.wait()
+            staged = [agent for agent in mesh.agents if agent not in original_agents]
+            scaling.cancel()
+            await cleanup_started.wait()
+            scaling.cancel()
+            await asyncio.sleep(0)
+            scaling.cancel()
+            await asyncio.sleep(0)
+            completed_before_release = scaling.done()
+            release_cleanup.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await scaling
+
+            assert not completed_before_release
+            assert mesh.agents == original_agents
+            assert pool.worker_names == ["workers[0]"]
+            assert all(not worker.running for worker in staged)
+            assert all(worker._outbox == [] for worker in staged)
+
+            release_start.set()
+
+    async def test_mesh_scale_down_stops_new_routing_and_drains_current_work(self):
+        source = Agent("source")
+        collector = Agent("collector")
+        pool = AgentPool("workers", size=2)
+        handled: dict[str, list[str]] = {}
+        collected: list[str] = []
+        retiring_started = asyncio.Event()
+        survivor_processed = asyncio.Event()
+        release_retiring = asyncio.Event()
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext):
+            handled.setdefault(ctx.agent_name, []).append(signal.task)
+            if signal.task == "retiring":
+                retiring_started.set()
+                await release_retiring.wait()
+            if signal.task == "after-scale-started":
+                survivor_processed.set()
+            await ctx.emit(ResultSignal(result=f"{ctx.agent_name}:{signal.task}"))
+
+        @collector.on(ResultSignal)
+        async def collect(signal: ResultSignal):
+            collected.append(signal.result)
+
+        mesh = Mesh([source, collector])
+        mesh.add_pool(pool)
+        mesh.connect(source, pool)
+        mesh.connect(pool, collector)
+        retiring = pool.workers[-1]
+
+        async with mesh:
+            await source.emit(TaskSignal(task="warmup"))
+            await mesh.wait_idle()
+            await source.emit(TaskSignal(task="retiring"))
+            await retiring_started.wait()
+            await retiring.inbox.send(TaskSignal(task="queued"))
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
+            while pool.size != 1:
+                await asyncio.sleep(0)
+            assert not scaling.done()
+
+            await source.emit(TaskSignal(task="after-scale-started"))
+            await survivor_processed.wait()
+            assert handled[retiring.name] == ["retiring"]
+
+            release_retiring.set()
+            removed = await scaling
+            assert removed == [retiring]
+
+        assert not retiring.running
+        assert retiring not in mesh.agents
+        assert handled[retiring.name] == ["retiring", "queued"]
+        assert f"{retiring.name}:retiring" in collected
+        assert f"{retiring.name}:queued" in collected
+
+    async def test_mesh_scale_down_cancellation_finishes_retirement_cleanup(self):
+        pool = AgentPool("workers", size=2)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        retiring = pool.workers[-1]
+        retiring_started = asyncio.Event()
+        release_retiring = asyncio.Event()
+
+        @pool.on(TaskSignal)
+        async def block_retiring(signal: TaskSignal, ctx: AgentContext):
+            if ctx.agent_name == retiring.name:
+                retiring_started.set()
+                await release_retiring.wait()
+
+        async with mesh:
+            await retiring.inbox.send(TaskSignal(task="block"))
+            await retiring_started.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
+            while pool.size != 1:
+                await asyncio.sleep(0)
+            scaling.cancel()
+            await asyncio.sleep(0)
+            scaling.cancel()
+            await asyncio.sleep(0)
+            completed_before_release = scaling.done()
+
+            release_retiring.set()
+            with pytest.raises(asyncio.CancelledError):
+                await scaling
+
+            assert not completed_before_release
+            assert not retiring.running
+            assert retiring not in mesh.agents
+            assert retiring._outbox == []
+
+    async def test_mesh_scale_down_stops_worker_during_restart_backoff(self):
+        crashed = asyncio.Event()
+
+        def crash_gate(signal: Signal) -> Signal:
+            crashed.set()
+            raise RuntimeError("infrastructure failure")
+
+        pool = AgentPool(
+            "workers",
+            size=2,
+            gates=[Gate(crash_gate)],
+            max_restarts=1,
+            restart_delay=0.2,
+        )
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        retiring = pool.workers[-1]
+        stop_calls = 0
+
+        @pool.on_stop
+        async def record_stop():
+            nonlocal stop_calls
+            stop_calls += 1
+
+        await mesh.start()
+        try:
+            await retiring.inbox.send(TaskSignal(task="crash"))
+            await crashed.wait()
+            while retiring._restart_count == 0 or retiring.running:
+                await asyncio.sleep(0)
+
+            supervisor = retiring._task
+            assert supervisor is not None and not supervisor.done()
+
+            removed = await mesh.scale_pool(pool, 1)
+
+            assert removed == [retiring]
+            assert supervisor.done()
+            assert retiring._task is None
+            assert retiring.inbox.closed
+            assert stop_calls == 1
+        finally:
+            if retiring._task is not None or not retiring.inbox.closed:
+                await retiring.stop()
+            await mesh.stop()
+
+    async def test_mesh_scale_down_stopped_mesh_still_stops_removed_worker(self):
+        pool = AgentPool("workers", size=2)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        retiring = pool.workers[-1]
+        stop_calls = 0
+
+        @pool.on_stop
+        async def record_stop():
+            nonlocal stop_calls
+            stop_calls += 1
+
+        try:
+            removed = await mesh.scale_pool(pool, 1)
+
+            assert removed == [retiring]
+            assert retiring.inbox.closed
+            assert stop_calls == 1
+        finally:
+            if not retiring.inbox.closed:
+                await retiring.stop()
+
+    async def test_mesh_scale_down_drains_target_selected_before_async_gate(self):
+        source = Agent("source")
+        pool = AgentPool("workers", size=2)
+        gate_entered = asyncio.Event()
+        release_gate = asyncio.Event()
+        gate_calls: list[str] = []
+        received: dict[str, list[str]] = {}
+
+        async def pause_race(signal: Signal) -> Signal:
+            assert isinstance(signal, TaskSignal)
+            gate_calls.append(signal.task)
+            if signal.task == "race":
+                gate_entered.set()
+                await release_gate.wait()
+            return signal
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext):
+            received.setdefault(ctx.agent_name, []).append(signal.task)
+
+        mesh = Mesh([source])
+        mesh.add_pool(pool)
+        mesh.connect(source, pool, Gate(pause_race, name="pause-race"))
+        survivor, retiring = pool.workers
+
+        async with mesh:
+            await source.emit(TaskSignal(task="warmup"))
+            await mesh.wait_idle()
+
+            delivery = asyncio.create_task(source.emit(TaskSignal(task="race")))
+            await gate_entered.wait()
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
+            while pool.size != 1:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            completed_before_release = scaling.done()
+
+            release_gate.set()
+            await delivery
+            removed = await scaling
+            await mesh.wait_idle()
+
+            assert removed == [retiring]
+            assert not completed_before_release
+
+        assert received == {
+            survivor.name: ["warmup"],
+            retiring.name: ["race"],
+        }
+        assert gate_calls == ["warmup", "race"]
+
+    async def test_mesh_pool_interceptor_target_stays_stable_during_retirement(self):
+        source = Agent("source")
+        pool = AgentPool("workers", size=2)
+        interceptor_entered = asyncio.Event()
+        release_interceptor = asyncio.Event()
+        intercepted_targets: list[str] = []
+        received: dict[str, list[str]] = {}
+
+        async def pause_interceptor(
+            signal: Signal,
+            source_name: str,
+            target_name: str,
+        ) -> Signal:
+            if isinstance(signal, TaskSignal) and signal.task == "race":
+                intercepted_targets.append(target_name)
+                interceptor_entered.set()
+                await release_interceptor.wait()
+            return signal
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext):
+            received.setdefault(ctx.agent_name, []).append(signal.task)
+
+        mesh = Mesh([source])
+        mesh.add_pool(pool)
+        mesh.connect(source, pool)
+        mesh.intercept(pause_interceptor)
+        survivor, retiring = pool.workers
+
+        async with mesh:
+            await source.emit(TaskSignal(task="warmup"))
+            await mesh.wait_idle()
+
+            delivery = asyncio.create_task(source.emit(TaskSignal(task="race")))
+            await interceptor_entered.wait()
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
+            while pool.size != 1:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            completed_before_release = scaling.done()
+
+            release_interceptor.set()
+            await delivery
+            removed = await scaling
+            await mesh.wait_idle()
+
+            assert removed == [retiring]
+            assert not completed_before_release
+
+        assert intercepted_targets == [retiring.name]
+        assert received == {
+            survivor.name: ["warmup"],
+            retiring.name: ["race"],
+        }
+
+    async def test_mesh_scale_down_waits_for_selected_pool_send(self, monkeypatch):
+        source = Agent("source")
+        pool = AgentPool("workers", size=2)
+        received: dict[str, list[str]] = {}
+        send_entered = asyncio.Event()
+        release_send = asyncio.Event()
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext):
+            received.setdefault(ctx.agent_name, []).append(signal.task)
+
+        mesh = Mesh([source])
+        mesh.add_pool(pool)
+        mesh.connect(source, pool)
+        survivor, retiring = pool.workers
+
+        async with mesh:
+            await source.emit(TaskSignal(task="warmup"))
+            await mesh.wait_idle()
+            original_send = retiring.inbox.send
+
+            async def hold_selected_send(signal: Signal):
+                send_entered.set()
+                await release_send.wait()
+                await original_send(signal)
+
+            monkeypatch.setattr(retiring.inbox, "send", hold_selected_send)
+            delivery = asyncio.create_task(source.emit(TaskSignal(task="selected")))
+            await send_entered.wait()
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
+            while pool.size != 1:
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            completed_before_release = scaling.done()
+
+            release_send.set()
+            await delivery
+            removed = await scaling
+            await mesh.wait_idle()
+
+            assert removed == [retiring]
+            assert not completed_before_release
+
+        assert received == {
+            survivor.name: ["warmup"],
+            retiring.name: ["selected"],
+        }
+
+    async def test_mesh_rejects_direct_removal_while_pool_worker_retires(self):
+        pool = AgentPool("workers", size=2)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        retiring = pool.workers[-1]
+        stop_entered = asyncio.Event()
+        release_stop = asyncio.Event()
+
+        @pool.on_stop
+        async def pause_retirement():
+            stop_entered.set()
+            await release_stop.wait()
+
+        async with mesh:
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 1))
+            await stop_entered.wait()
+            scaling_result: list[Agent] | BaseException | None = None
+            try:
+                with pytest.raises(
+                    MeshError,
+                    match="use await mesh.scale_pool\\('workers', size\\)",
+                ):
+                    await mesh.remove(retiring)
+            finally:
+                release_stop.set()
+                [scaling_result] = await asyncio.gather(
+                    scaling,
+                    return_exceptions=True,
+                )
+
+            assert scaling_result == [retiring]
+            assert retiring not in mesh.agents
+            assert not retiring.running
+
+    async def test_mesh_rejects_direct_removal_of_staged_pool_worker(self):
+        pool = AgentPool("workers", size=1)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async with mesh:
+
+            @pool.on_start
+            async def pause_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 2))
+            await entered_start.wait()
+            staged = mesh.get("workers[1]")
+            added: list[Agent] = []
+            try:
+                with pytest.raises(
+                    MeshError,
+                    match="use await mesh.scale_pool\\('workers', size\\)",
+                ):
+                    await mesh.remove(staged)
+            finally:
+                release_start.set()
+                added = await scaling
+                for worker in added:
+                    if worker not in mesh.agents:
+                        await worker.stop()
+
+            assert added == [staged]
+            assert pool.workers[-1] is staged
+            assert mesh.get(staged.name) is staged
+            assert staged.running
+
+    async def test_mesh_scale_up_inherits_configuration_added_during_start(self):
+        pool = AgentPool("workers", size=1)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        entered_start = asyncio.Event()
+        release_start = asyncio.Event()
+
+        async with mesh:
+
+            @pool.on_start
+            async def pause_new_worker_start():
+                entered_start.set()
+                await release_start.wait()
+
+            scaling = asyncio.create_task(mesh.scale_pool(pool, 2))
+            await entered_start.wait()
+
+            @pool.on(ResultSignal)
+            async def late_handler(signal: ResultSignal):
+                pass
+
+            @pool.on_any
+            async def late_any_handler(signal: Signal):
+                pass
+
+            @pool.once(TaskSignal)
+            async def late_once_handler(signal: TaskSignal):
+                pass
+
+            async def late_middleware(signal: Signal, call_next):
+                return await call_next(signal)
+
+            pool.use(late_middleware)
+
+            @pool.on_start
+            async def late_start_hook():
+                pass
+
+            @pool.on_stop
+            async def late_stop_hook():
+                pass
+
+            @pool.on_error
+            async def late_error_hook(signal: Signal, error: Exception):
+                pass
+
+            release_start.set()
+            added = await scaling
+            incumbent, staged = pool.workers
+
+            assert added == [staged]
+            assert late_handler in staged._handlers[ResultSignal]
+            assert late_any_handler in staged._handlers[Signal]
+            assert any(
+                getattr(handler, "__wrapped__", None) is late_once_handler
+                for handler in staged._handlers[TaskSignal]
+            )
+            assert late_middleware in staged._middleware
+            assert late_start_hook in staged._on_start_hooks
+            assert late_stop_hook in staged._on_stop_hooks
+            assert late_error_hook in staged._on_error_hooks
+            assert staged._handlers.keys() == incumbent._handlers.keys()
+            assert len(staged._middleware) == len(incumbent._middleware)
+            assert len(staged._on_start_hooks) == len(incumbent._on_start_hooks)
+            assert len(staged._on_stop_hooks) == len(incumbent._on_stop_hooks)
+            assert len(staged._on_error_hooks) == len(incumbent._on_error_hooks)
+
+    async def test_mesh_scale_pool_validates_size(self):
+        pool = AgentPool("workers", size=1)
+        mesh = Mesh()
+        mesh.add_pool(pool)
+
+        assert await mesh.scale_pool(pool, pool.size) == []
+
+        with pytest.raises(ValueError, match="Pool size must be at least 1"):
+            await mesh.scale_pool(pool, 0)
 
 
 # === Distribution Strategies ===

@@ -26,6 +26,7 @@ logger = logging.getLogger("signal_gating.mesh")
 Interceptor = Callable[[Signal, str, str], Signal | None | Awaitable[Signal | None]]
 MeshEventSink = Callable[["MeshEvent"], None | Awaitable[None]]
 _DeliveryFn = Callable[[Signal], None | Awaitable[None]]
+_DeliveryReleaseFn = Callable[[], None]
 
 
 class Edge:
@@ -58,6 +59,15 @@ class _DeliveryOutcome:
     delivered: bool
     blocked_stage: str = ""
     blocked_name: str = ""
+
+
+@dataclass(frozen=True)
+class _PoolConnection:
+    """A logical connection whose source or target is an agent pool."""
+
+    source: Agent | AgentPool
+    target: Agent | AgentPool
+    gate: Gate | None = None
 
 
 class _PublishDestinationClosedError(Exception):
@@ -117,6 +127,10 @@ class Mesh:
         self._event_sink_errors = 0
         self._capabilities: dict[str, set[str]] = {}
         self._pools: dict[str, AgentPool] = {}
+        self._pool_connections: list[_PoolConnection] = []
+        self._pool_scale_lock = asyncio.Lock()
+        self._pool_delivery_counts: dict[Agent, int] = {}
+        self._pool_delivery_idle: dict[Agent, asyncio.Event] = {}
         self._topics: dict[str, list[Agent]] = {}
         self.tracer = tracer or Tracer()
         for agent in agents or []:
@@ -160,6 +174,22 @@ class Mesh:
         awaiting a reply from that agent times out rather than erroring.
         """
         resolved = self._resolve(agent)
+        for pool in self._pools.values():
+            if pool._contains_worker(resolved):
+                descriptor = (
+                    "final worker"
+                    if pool.size == 1 and pool._is_committed_worker(resolved)
+                    else "worker"
+                )
+                raise MeshError(
+                    f"Cannot remove {descriptor} '{resolved.name}' directly "
+                    f"from attached pool '{pool.name}'; use await "
+                    f"mesh.scale_pool('{pool.name}', size)"
+                )
+        await self._remove_resolved(resolved)
+
+    async def _remove_resolved(self, resolved: Agent) -> None:
+        """Remove an already resolved agent after ownership checks."""
         if resolved.running:
             await resolved.stop()
         # Remove all outbox functions that route TO this agent (from other agents)
@@ -180,7 +210,7 @@ class Mesh:
             ]
         # Purge pool membership so pools stop selecting the dead worker
         for pool in self._pools.values():
-            pool.discard(resolved.name)
+            pool._discard_worker(resolved.name)
         # Clear the removed agent's own outbox
         resolved._outbox.clear()
         # Remove all edges involving this agent
@@ -194,6 +224,14 @@ class Mesh:
         # agent's closed inbox (and the agent object can be collected).
         for topic, subscribers in self._topics.items():
             self._topics[topic] = [a for a in subscribers if a.name != resolved.name]
+        # Drop logical pool policies with this individual agent as an endpoint.
+        # Policies whose endpoint is the owning pool remain valid for its
+        # surviving and future workers.
+        self._pool_connections = [
+            connection
+            for connection in self._pool_connections
+            if connection.source is not resolved and connection.target is not resolved
+        ]
         del self._agents[resolved.name]
 
     def disconnect(self, source: Agent | str, target: Agent | str) -> int:
@@ -757,6 +795,7 @@ class Mesh:
         if pool_conflicts:
             joined = ", ".join(repr(name) for name in pool_conflicts)
             raise MeshError(f"Pool workers conflict with pool names: {joined}")
+        pool._claim(self)
         for worker in pool.workers:
             self.add(worker)
         self._pools[pool.name] = pool
@@ -766,6 +805,125 @@ class Mesh:
         if name not in self._pools:
             raise MeshError(f"Pool '{name}' not found in mesh")
         return self._pools[name]
+
+    async def scale_pool(
+        self,
+        pool: AgentPool | str,
+        size: int,
+    ) -> list[Agent]:
+        """Resize an attached pool while preserving mesh-owned topology.
+
+        New workers are registered and wired before they become visible to
+        pool routing. When the mesh is running they are also started before
+        membership is committed. Removed workers leave pool selection before
+        they are stopped and fully removed from the mesh.
+        """
+        if size < 1:
+            raise ValueError("Pool size must be at least 1")
+
+        resolved = self._resolve_pool_or_agent(pool)
+        from signal_gating.pool import AgentPool
+
+        if not isinstance(resolved, AgentPool):
+            raise MeshError(f"Pool '{resolved.name}' not found in mesh")
+
+        async with self._pool_scale_lock:
+            current_size = resolved.size
+            if size == current_size:
+                return []
+
+            if size > current_size:
+                new_workers = resolved._prepare_workers(size - current_size)
+                try:
+                    initial_connections = [
+                        connection
+                        for connection in self._pool_connections
+                        if connection.source is resolved
+                    ]
+                    initial_connection_ids = {
+                        id(connection) for connection in initial_connections
+                    }
+                    for worker in new_workers:
+                        self.add(worker)
+                        for connection in initial_connections:
+                            self._wire_pool_source_worker(connection, worker)
+                    if self._running:
+                        for worker in new_workers:
+                            await worker.start()
+                        # Agent.start() schedules its supervised loop; yield so
+                        # newly added capacity is running before this call returns.
+                        await asyncio.sleep(0)
+                    # A start hook or another task may connect the source pool
+                    # while worker startup yields. Apply those newly recorded
+                    # policies before committing staged workers to membership.
+                    for connection in self._pool_connections:
+                        if (
+                            connection.source is resolved
+                            and id(connection) not in initial_connection_ids
+                        ):
+                            for worker in new_workers:
+                                self._wire_pool_source_worker(connection, worker)
+                    resolved._commit_workers(new_workers)
+                except BaseException:
+                    cleanup = asyncio.create_task(
+                        self._rollback_staged_workers(resolved, new_workers)
+                    )
+                    await self._await_cleanup(cleanup)
+                    raise
+                logger.info(
+                    "Pool '%s' scaled up to %d workers (+%d)",
+                    resolved.name,
+                    resolved.size,
+                    len(new_workers),
+                )
+                return new_workers
+
+            removed = resolved._take_workers(
+                current_size - size,
+                track_retiring=True,
+            )
+            retirement = asyncio.create_task(self._retire_pool_workers(removed))
+            await self._await_cleanup(retirement)
+            logger.info(
+                "Pool '%s' scaled down to %d workers (-%d)",
+                resolved.name,
+                resolved.size,
+                len(removed),
+            )
+            return removed
+
+    async def _rollback_staged_workers(
+        self,
+        pool: AgentPool,
+        workers: list[Agent],
+    ) -> None:
+        """Stop and unregister every worker from a failed scale-up."""
+        for worker in reversed(workers):
+            registered = self._agents.get(worker.name)
+            await worker.stop()
+            pool._discard_worker(worker.name)
+            if registered is worker:
+                await self._remove_resolved(worker)
+
+    async def _retire_pool_workers(self, workers: list[Agent]) -> None:
+        """Gracefully stop and remove workers already taken from a pool."""
+        for worker in workers:
+            await self._wait_for_pool_deliveries(worker)
+            await worker.stop()
+            await self._remove_resolved(worker)
+
+    @staticmethod
+    async def _await_cleanup(task: asyncio.Task[None]) -> None:
+        """Finish cleanup before propagating any caller cancellation."""
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                cancellation = error
+        task.result()
+        if cancellation is not None:
+            raise cancellation
 
     def _resolve_pool_or_agent(
         self, ref: Agent | str | AgentPool,
@@ -806,29 +964,98 @@ class Mesh:
         resolved_src = self._resolve_pool_or_agent(source)
         resolved_tgt = self._resolve_pool_or_agent(target)
 
-        if isinstance(resolved_src, AgentPool) and isinstance(resolved_tgt, AgentPool):
-            # Pool-to-pool: all source workers load-balance to target workers
-            for worker in resolved_src.workers:
-                self.load_balance(worker, resolved_tgt.workers, gate)
-            return
-
-        if isinstance(resolved_tgt, AgentPool):
-            # Load-balance across pool workers
-            src_agent = resolved_src if isinstance(resolved_src, Agent) else self.get(str(source))
-            self.load_balance(src_agent, resolved_tgt.workers, gate)
-            return
-
-        if isinstance(resolved_src, AgentPool):
-            # All pool workers connect to target
-            tgt_agent = resolved_tgt if isinstance(resolved_tgt, Agent) else self.get(str(target))
-            for worker in resolved_src.workers:
-                self._connect_agents(worker, tgt_agent, gate)
+        if isinstance(resolved_src, AgentPool) or isinstance(resolved_tgt, AgentPool):
+            connection = _PoolConnection(resolved_src, resolved_tgt, gate)
+            self._pool_connections.append(connection)
+            if isinstance(resolved_src, AgentPool):
+                for worker in resolved_src.workers:
+                    self._wire_pool_source_worker(connection, worker)
+            else:
+                assert isinstance(resolved_tgt, AgentPool)
+                self._connect_to_pool(resolved_src, resolved_tgt, gate)
             return
 
         # Standard agent-to-agent
         src_agent = resolved_src if isinstance(resolved_src, Agent) else self._resolve(source)
         tgt_agent = resolved_tgt if isinstance(resolved_tgt, Agent) else self._resolve(target)
         self._connect_agents(src_agent, tgt_agent, gate)
+
+    def _wire_pool_source_worker(
+        self,
+        connection: _PoolConnection,
+        worker: Agent,
+    ) -> None:
+        """Apply one logical source-pool policy to a current worker."""
+        from signal_gating.pool import AgentPool
+
+        if isinstance(connection.target, AgentPool):
+            self._connect_to_pool(worker, connection.target, connection.gate)
+        else:
+            self._connect_agents(worker, connection.target, connection.gate)
+
+    def _connect_to_pool(
+        self,
+        src: Agent,
+        pool: AgentPool,
+        gate: Gate | None = None,
+    ) -> None:
+        """Route each signal to a worker selected from current membership."""
+        mesh = self
+
+        async def route(signal: Signal) -> None:
+            target = pool.select_worker(signal)
+            release = mesh._reserve_pool_delivery(target)
+            try:
+                await mesh._deliver(
+                    signal,
+                    source=src.name,
+                    target=target.name,
+                    send=target.inbox.send,
+                    action="routed",
+                    event_kind="signal",
+                    gate=gate,
+                    trace_gate="load_balance",
+                    trace_action="routed",
+                )
+            finally:
+                release()
+
+        src._add_output(
+            RouteFn(
+                fn=route,
+                source=src.name,
+                target=pool.name,
+                tag="pool_connect",
+            )
+        )
+
+    def _reserve_pool_delivery(self, worker: Agent) -> _DeliveryReleaseFn:
+        """Keep a selected worker alive until its inbox accepts the signal."""
+        count = self._pool_delivery_counts.get(worker, 0)
+        if count == 0:
+            self._pool_delivery_idle[worker] = asyncio.Event()
+        self._pool_delivery_counts[worker] = count + 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            remaining = self._pool_delivery_counts[worker] - 1
+            if remaining:
+                self._pool_delivery_counts[worker] = remaining
+                return
+            del self._pool_delivery_counts[worker]
+            self._pool_delivery_idle.pop(worker).set()
+
+        return release
+
+    async def _wait_for_pool_deliveries(self, worker: Agent) -> None:
+        """Wait until every delivery that selected this worker has enqueued."""
+        idle = self._pool_delivery_idle.get(worker)
+        if idle is not None:
+            await idle.wait()
 
     def _connect_agents(
         self,

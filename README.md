@@ -329,6 +329,41 @@ result = await mesh.race(
 )
 ```
 
+#### Live pool scaling
+
+Attach an `AgentPool` once, define its connections, then resize it through the
+mesh that owns its topology:
+
+```python
+from signal_gating import AgentPool
+
+workers = AgentPool("workers", size=1)
+mesh.add_pool(workers)
+mesh.connect(coordinator, workers)  # Current workers share inbound work
+mesh.connect(workers, collector)    # Every current worker emits to collector
+
+async with mesh:
+    added = await mesh.scale_pool("workers", 3)
+    # worker names: ["workers[1]", "workers[2]"]; both are wired and running
+
+    removed = await mesh.scale_pool(workers, 1)
+    # worker names: ["workers[2]", "workers[1]"]; both are fully removed
+```
+
+Pool size must remain at least one. Once `mesh.add_pool(pool)` succeeds, the
+mesh is the exclusive owner of worker membership: direct `pool.scale_to()`,
+`scale_up()`, `scale_down()`, `discard()`, and `mesh.remove(pool_worker)` calls
+raise `MeshError` with guidance to use `mesh.scale_pool()`.
+
+When the mesh is running, added workers inherit all existing pool-source,
+pool-target, and pool-to-pool connection policies and are started before the
+call returns. On a stopped mesh, they are registered and wired but remain
+stopped until `mesh.start()`. Removed workers leave pool selection immediately,
+then drain queued and in-flight work before their routes and discovery state are
+removed. A failed or cancelled scale-up stops and unregisters every staged
+worker before propagating the error. Cancellation during scale-down completes
+retirement cleanup before `CancelledError` reaches the caller.
+
 ### Tool Calling: Agent-Native RPC
 
 Agents can expose tools that other agents (or LLMs) discover and invoke. This is the bridge between signal-based communication and structured function calling:

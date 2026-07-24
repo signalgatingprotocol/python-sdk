@@ -546,12 +546,13 @@ class TestDrainOnStop:
 
 
 class TestRemoveHardening:
-    async def test_remove_purges_pool_membership(self):
+    async def test_scale_pool_purges_pool_membership(self):
         pool = AgentPool("workers", size=3)
         mesh = Mesh()
         mesh.add_pool(pool)
-        victim = pool.workers[1]
-        await mesh.remove(victim)
+        victim = pool.workers[-1]
+        removed = await mesh.scale_pool(pool, 2)
+        assert removed == [victim]
         assert victim.name not in pool.worker_names
         assert pool.size == 2
 
