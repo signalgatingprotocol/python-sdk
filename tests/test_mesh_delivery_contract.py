@@ -26,6 +26,13 @@ class Message(Signal):
     value: int = 0
 
 
+async def never_returns(
+    signal: Signal, _source: str, _target: str
+) -> Signal:
+    await asyncio.Event().wait()
+    return signal
+
+
 def reply_with_value(agent: Agent, value: int, *, delay: float = 0.0) -> None:
     @agent.on(Message)
     async def reply(_signal: Message, ctx: AgentContext) -> None:
@@ -207,6 +214,24 @@ async def test_request_send_block_fails_without_leaking_capture() -> None:
     assert worker._outbox == []
 
 
+async def test_request_timeout_bounds_interceptor_and_removes_capture() -> None:
+    worker = Agent("worker")
+    mesh = Mesh([worker])
+    mesh.intercept(never_returns)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.request(worker, Message(value=1), timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert worker._outbox == []
+
+
 async def test_request_response_block_fails_without_timeout_or_capture_leak() -> None:
     worker = Agent("worker")
     reply_with_value(worker, 2)
@@ -270,6 +295,24 @@ async def test_scatter_response_block_fails_immediately_and_cleans_captures() ->
     assert second._outbox == []
 
 
+async def test_scatter_timeout_bounds_dispatch_and_removes_captures() -> None:
+    workers = [Agent("worker-a"), Agent("worker-b")]
+    mesh = Mesh(workers)
+    mesh.intercept(never_returns)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.scatter(Message(value=1), workers, timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert all(worker._outbox == [] for worker in workers)
+
+
 async def test_race_skips_blocked_send_when_an_allowed_target_replies() -> None:
     blocked, allowed = Agent("blocked"), Agent("allowed")
     reply_with_value(blocked, 1)
@@ -288,6 +331,24 @@ async def test_race_skips_blocked_send_when_an_allowed_target_replies() -> None:
     assert result.value == 2
     assert blocked._outbox == []
     assert allowed._outbox == []
+
+
+async def test_race_timeout_bounds_dispatch_and_removes_captures() -> None:
+    workers = [Agent("worker-a"), Agent("worker-b")]
+    mesh = Mesh(workers)
+    mesh.intercept(never_returns)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.race(Message(value=1), workers, timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert all(worker._outbox == [] for worker in workers)
 
 
 async def test_race_skips_blocked_response_when_another_response_is_allowed() -> None:

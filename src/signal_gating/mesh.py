@@ -1251,7 +1251,8 @@ class Mesh:
                         future.set_exception(error)
 
         resolved._outbox.append(capture)
-        try:
+
+        async def operation() -> Signal:
             outcome = await self._deliver(
                 tagged,
                 source="mesh",
@@ -1267,7 +1268,10 @@ class Mesh:
                 target=resolved.name,
                 action="request_sent",
             )
-            return await asyncio.wait_for(future, timeout=timeout)
+            return await future
+
+        try:
+            return await asyncio.wait_for(operation(), timeout=timeout)
         finally:
             try:
                 resolved._outbox.remove(capture)
@@ -1370,55 +1374,63 @@ class Mesh:
                 target._outbox.append(capture)  # noqa: SLF001
                 capture_fns.append((target, capture))
 
-            # Send signals to all targets.
-            for target in resolved:
-                target_cid = f"{cid}:{target.name}"
-                scatter_signal = signal.evolve(correlation_id=target_cid)
-                outcome = await self._deliver(
-                    scatter_signal,
-                    source="mesh",
-                    target=target.name,
-                    send=target.inbox.send,
-                    action="scatter_sent",
-                    trace_gate="scatter",
-                    correlation_id=target_cid,
-                )
-                self._raise_if_blocked(
-                    outcome,
-                    source="mesh",
-                    target=target.name,
-                    action="scatter_sent",
-                )
+            async def operation() -> list[Signal]:
+                # Send signals to all targets.
+                for target in resolved:
+                    target_cid = f"{cid}:{target.name}"
+                    scatter_signal = signal.evolve(correlation_id=target_cid)
+                    outcome = await self._deliver(
+                        scatter_signal,
+                        source="mesh",
+                        target=target.name,
+                        send=target.inbox.send,
+                        action="scatter_sent",
+                        trace_gate="scatter",
+                        correlation_id=target_cid,
+                    )
+                    self._raise_if_blocked(
+                        outcome,
+                        source="mesh",
+                        target=target.name,
+                        action="scatter_sent",
+                    )
 
-            done, pending = await asyncio.wait(
-                futures,
-                timeout=timeout,
-                return_when=asyncio.FIRST_EXCEPTION,
-            )
-            failed = next(
-                (future for future in done if not future.cancelled() and future.exception()),
-                None,
-            )
-            if failed is not None:
-                for future in pending:
-                    future.cancel()
-                error = failed.exception()
-                assert error is not None
-                raise error
-            if pending:
+                done, pending = await asyncio.wait(
+                    futures,
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
+                failed = next(
+                    (
+                        future
+                        for future in done
+                        if not future.cancelled() and future.exception()
+                    ),
+                    None,
+                )
+                if failed is not None:
+                    for future in pending:
+                        future.cancel()
+                    error = failed.exception()
+                    assert error is not None
+                    raise error
+                return [future.result() for future in futures]
+
+            try:
+                return await asyncio.wait_for(operation(), timeout=timeout)
+            except asyncio.TimeoutError:
                 missing_targets = [
                     target.name
                     for target, future in zip(resolved, futures, strict=True)
-                    if future in pending
+                    if not future.done()
                 ]
-                for future in pending:
-                    future.cancel()
+                if not missing_targets:
+                    raise
                 await self._record_event(
                     "scatter_timeout",
                     signal,
                     source="mesh",
                     missing_targets=missing_targets,
-                    received_count=len(futures) - len(pending),
+                    received_count=len(futures) - len(missing_targets),
                     expected_count=len(futures),
                     timeout=timeout,
                 )
@@ -1426,11 +1438,12 @@ class Mesh:
                 raise asyncio.TimeoutError(
                     f"Scatter timed out after {timeout:g}s waiting for agents: {missing}"
                 )
-            return [future.result() for future in futures]
         finally:
             for future in futures:
                 if not future.done():
                     future.cancel()
+                elif not future.cancelled():
+                    future.exception()
             for target, capture in capture_fns:
                 try:
                     target._outbox.remove(capture)  # noqa: SLF001
@@ -1661,7 +1674,7 @@ class Mesh:
                         action="race_sent",
                     )
 
-            result = await asyncio.wait_for(future, timeout=timeout)
+            result = await future
             self.tracer.record(
                 trace_id=signal.trace_id,
                 signal_id=result.id,
@@ -1678,7 +1691,7 @@ class Mesh:
             return result
 
         try:
-            return await run_race()
+            return await asyncio.wait_for(run_race(), timeout=timeout)
         finally:
             if not future.done():
                 future.cancel()

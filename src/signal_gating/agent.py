@@ -527,9 +527,13 @@ class Agent:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Signal] = loop.create_future()
         self._pending_requests[cid] = future
-        try:
+
+        async def operation() -> Signal:
             await self.emit(request_signal)
-            return await asyncio.wait_for(future, timeout=timeout)
+            return await future
+
+        try:
+            return await asyncio.wait_for(operation(), timeout=timeout)
         finally:
             self._pending_requests.pop(cid, None)
 
