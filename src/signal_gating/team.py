@@ -222,6 +222,7 @@ class Team:
     async def _run_steward(self, member: str) -> None:
         steward = self._stewards[member]
         while not steward.stopping:
+            steward.wake.clear()
             task = (
                 steward.assigned.popleft()
                 if steward.assigned
@@ -231,7 +232,6 @@ class Team:
                 if steward.worked:
                     steward.worked = False
                     await self._notify_idle(member)
-                steward.wake.clear()
                 await steward.wake.wait()
                 continue
             opened = self.board._opened[task.id]
@@ -257,6 +257,13 @@ class Team:
                 steward.failed.add(task.id)
                 await self.board.release(
                     task.id, member, reason=f"complete_gate:{err.gate_name}"
+                )
+            except Exception as error:
+                steward.failed.add(task.id)
+                await self.board.release(
+                    task.id,
+                    member,
+                    reason=f"request_error:{type(error).__name__}",
                 )
             finally:
                 steward.worked = True
