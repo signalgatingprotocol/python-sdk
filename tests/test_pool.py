@@ -418,6 +418,89 @@ class TestPoolCreation:
             assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
             assert await gate.process(TaskSignal(task=f"second-{index}")) is None
 
+    async def test_stateful_forks_do_not_restore_absent_dict_executor(
+        self, monkeypatch
+    ):
+        builds = 0
+
+        class OptionalExecutorThrottle(Gate):
+            def __init__(self, fn, name=""):
+                nonlocal builds
+                super().__init__(fn, name)
+                builds += 1
+                if builds == 1:
+                    self.executor = fn
+
+            async def process(self, signal: Signal) -> Signal | None:
+                executor = getattr(self, "executor", self._fn)
+                return await executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = OptionalExecutorThrottle.throttle(1)
+        forks = [configured_gate.fork(), configured_gate.fork()]
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks.extend(worker.gates[0] for worker in pool.workers)
+
+        assert all(not hasattr(gate, "executor") for gate in forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    async def test_stateful_forks_do_not_restore_absent_slotted_executor(
+        self, monkeypatch
+    ):
+        builds = 0
+
+        class OptionalSlottedExecutorThrottle(Gate):
+            __slots__ = ("executor",)
+
+            def __init__(self, fn, name=""):
+                nonlocal builds
+                super().__init__(fn, name)
+                builds += 1
+                if builds == 1:
+                    self.executor = fn
+
+            async def process(self, signal: Signal) -> Signal | None:
+                executor = getattr(self, "executor", self._fn)
+                return await executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = OptionalSlottedExecutorThrottle.throttle(1)
+        forks = [configured_gate.fork(), configured_gate.fork()]
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks.extend(worker.gates[0] for worker in pool.workers)
+
+        assert all(not hasattr(gate, "executor") for gate in forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    async def test_stateful_forks_preserve_rebuilt_none_executor(self, monkeypatch):
+        builds = 0
+
+        class OptionalExecutorThrottle(Gate):
+            def __init__(self, fn, name=""):
+                nonlocal builds
+                super().__init__(fn, name)
+                builds += 1
+                self.executor = fn if builds == 1 else None
+
+            async def process(self, signal: Signal) -> Signal | None:
+                executor = self.executor if callable(self.executor) else self._fn
+                return await executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = OptionalExecutorThrottle.throttle(1)
+        forks = [configured_gate.fork(), configured_gate.fork()]
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks.extend(worker.gates[0] for worker in pool.workers)
+
+        assert all(gate.executor is None for gate in forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
     @pytest.mark.parametrize(
         "build_gate",
         [

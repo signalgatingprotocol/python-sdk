@@ -119,9 +119,10 @@ class Gate:
     Stateful gates (``rate_limit``, ``throttle``, ``debounce``, ``batch``,
     ``window``, ``deduplicate``, ``circuit_breaker``) hold state for one logical
     signal stream. :meth:`fork` rebuilds built-in gates and compositions with
-    fresh state. A factory rebuild owns its callable execution attributes;
-    other instance configuration is shallow-copied from the source. Subclasses
-    with compound or non-callable execution state can override :meth:`fork`.
+    fresh state. A factory rebuild owns callable execution attribute names found
+    on either the source or rebuilt wrapper; other instance configuration is
+    shallow-copied from the source. Subclasses with compound or non-callable
+    execution state can override :meth:`fork`.
     For a caller-provided ``Gate(fn)``, the wrapper is fresh but mutable closure
     state remains owned by and shared through ``fn``.
     """
@@ -149,11 +150,12 @@ class Gate:
 
         Raw wrappers are shallow-cloned without invoking subclass constructors
         or copy hooks. Factory-backed gates rebuild through their originating
-        class, then keep ``_fn``, ``_factory``, and callable instance attributes
-        installed by the rebuilt constructor. Other runtime dictionary and slot
-        values are shallow-copied from the source. Subclasses with compound or
-        non-callable execution state can override this method. Caller-owned
-        mutable values remain shared rather than deep-cloned.
+        class, then keep ``_fn``, ``_factory``, and the rebuilt value (including
+        absence or ``None``) for callable attribute names found on either the
+        source or rebuilt wrapper. Other runtime dictionary and slot values are
+        shallow-copied from the source. Subclasses with compound or non-callable
+        execution state can override this method. Caller-owned mutable values
+        remain shared rather than deep-cloned.
         """
         if self._factory is not None:
             rebuilt = self._factory()
@@ -161,7 +163,9 @@ class Gate:
                 self,
                 rebuilt,
                 preserve_target=(
-                    _EXECUTION_ATTRIBUTES | _callable_instance_attributes(rebuilt)
+                    _EXECUTION_ATTRIBUTES
+                    | _callable_instance_attributes(self)
+                    | _callable_instance_attributes(rebuilt)
                 ),
             )
             return rebuilt
