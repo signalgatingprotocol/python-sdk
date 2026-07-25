@@ -370,6 +370,54 @@ class TestPoolCreation:
             for task in (f"first-{index}", f"second-{index}")
         ]
 
+    async def test_stateful_forks_preserve_fresh_dict_executor(self, monkeypatch):
+        class ExecutorThrottle(Gate):
+            def __init__(self, fn, name=""):
+                super().__init__(fn, name)
+                self.executor = fn
+
+            async def process(self, signal: Signal) -> Signal | None:
+                return await self.executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = ExecutorThrottle.throttle(1)
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            configured_gate.fork(),
+            configured_gate.fork(),
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        assert len({id(gate) for gate in forks}) == len(forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    async def test_stateful_forks_preserve_fresh_slotted_executor(self, monkeypatch):
+        class SlottedExecutorThrottle(Gate):
+            __slots__ = ("executor",)
+
+            def __init__(self, fn, name=""):
+                super().__init__(fn, name)
+                self.executor = fn
+
+            async def process(self, signal: Signal) -> Signal | None:
+                return await self.executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = SlottedExecutorThrottle.throttle(1)
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            configured_gate.fork(),
+            configured_gate.fork(),
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        assert len({id(gate) for gate in forks}) == len(forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
     @pytest.mark.parametrize(
         "build_gate",
         [

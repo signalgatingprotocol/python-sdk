@@ -77,6 +77,30 @@ def _copy_wrapper_state(
             object.__setattr__(target, storage_name, value)
 
 
+def _callable_instance_attributes(gate: Gate) -> frozenset[str]:
+    """Return callable values installed directly in a gate's instance state."""
+    names = {
+        name
+        for name, value in object.__getattribute__(gate, "__dict__").items()
+        if callable(value)
+    }
+    for owner in type(gate).__mro__:
+        declared_slots = owner.__dict__.get("__slots__", ())
+        if isinstance(declared_slots, str):
+            declared_slots = (declared_slots,)
+        for declared_name in declared_slots:
+            if declared_name in ("__dict__", "__weakref__"):
+                continue
+            storage_name = _slot_storage_name(owner, declared_name)
+            try:
+                value = object.__getattribute__(gate, storage_name)
+            except AttributeError:
+                continue
+            if callable(value):
+                names.add(storage_name)
+    return frozenset(names)
+
+
 def _clone_wrapper(gate: Gate) -> Gate:
     """Shallow-clone a gate wrapper without constructors or copy hooks."""
     clone = object.__new__(type(gate))
@@ -95,8 +119,11 @@ class Gate:
     Stateful gates (``rate_limit``, ``throttle``, ``debounce``, ``batch``,
     ``window``, ``deduplicate``, ``circuit_breaker``) hold state for one logical
     signal stream. :meth:`fork` rebuilds built-in gates and compositions with
-    fresh state. For a caller-provided ``Gate(fn)``, the wrapper is fresh but
-    mutable closure state remains owned by and shared through ``fn``.
+    fresh state. A factory rebuild owns its callable execution attributes;
+    other instance configuration is shallow-copied from the source. Subclasses
+    with compound or non-callable execution state can override :meth:`fork`.
+    For a caller-provided ``Gate(fn)``, the wrapper is fresh but mutable closure
+    state remains owned by and shared through ``fn``.
     """
 
     def __init__(
@@ -122,15 +149,20 @@ class Gate:
 
         Raw wrappers are shallow-cloned without invoking subclass constructors
         or copy hooks. Factory-backed gates rebuild through their originating
-        class, then receive the source wrapper's runtime dictionary and slots.
-        Caller-owned mutable values remain shared rather than deep-cloned.
+        class, then keep ``_fn``, ``_factory``, and callable instance attributes
+        installed by the rebuilt constructor. Other runtime dictionary and slot
+        values are shallow-copied from the source. Subclasses with compound or
+        non-callable execution state can override this method. Caller-owned
+        mutable values remain shared rather than deep-cloned.
         """
         if self._factory is not None:
             rebuilt = self._factory()
             _copy_wrapper_state(
                 self,
                 rebuilt,
-                preserve_target=_EXECUTION_ATTRIBUTES,
+                preserve_target=(
+                    _EXECUTION_ATTRIBUTES | _callable_instance_attributes(rebuilt)
+                ),
             )
             return rebuilt
         return _clone_wrapper(self)
