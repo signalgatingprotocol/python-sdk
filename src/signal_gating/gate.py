@@ -21,6 +21,7 @@ from typing import Any
 from signal_gating.signal import Signal
 
 GateFn = Callable[[Signal], Signal | None | Awaitable[Signal | None]]
+GateFactory = Callable[[], "Gate"]
 
 
 class Gate:
@@ -31,15 +32,22 @@ class Gate:
     - Returns None to reject it
 
     Stateful gates (``rate_limit``, ``throttle``, ``debounce``, ``batch``,
-    ``window``, ``deduplicate``, ``circuit_breaker``) hold a single shared state
-    and are designed for one logical signal stream. Do not share one instance
-    across unrelated concurrent flows expecting per-flow isolation — give each
-    flow its own gate instance, or partition upstream.
+    ``window``, ``deduplicate``, ``circuit_breaker``) hold state for one logical
+    signal stream. :meth:`fork` rebuilds built-in gates and compositions with
+    fresh state. For a caller-provided ``Gate(fn)``, the wrapper is fresh but
+    mutable closure state remains owned by and shared through ``fn``.
     """
 
-    def __init__(self, fn: GateFn, name: str = ""):
+    def __init__(
+        self,
+        fn: GateFn,
+        name: str = "",
+        *,
+        _factory: GateFactory | None = None,
+    ) -> None:
         self._fn = fn
         self.name = name or (fn.__name__ if hasattr(fn, "__name__") else "gate")
+        self._factory = _factory
 
     async def process(self, signal: Signal) -> Signal | None:
         """Process a signal through this gate. Returns None if rejected."""
@@ -47,6 +55,16 @@ class Gate:
         if isawaitable(result):
             result = await result
         return result
+
+    def fork(self) -> Gate:
+        """Return a fresh gate wrapper, including fresh built-in gate state.
+
+        A raw ``Gate(fn)`` keeps using the caller-owned callable, so any mutable
+        state captured by that callable remains shared across forks.
+        """
+        if self._factory is not None:
+            return self._factory()
+        return Gate(self._fn, name=self.name)
 
     def __rshift__(self, other: Gate) -> Gate:
         """Chain gates: signal flows through self, then other."""
@@ -60,7 +78,11 @@ class Gate:
                 return None
             return await right.process(result)
 
-        return Gate(chained, name=f"{self.name}>>{other.name}")
+        return Gate(
+            chained,
+            name=f"{self.name}>>{other.name}",
+            _factory=lambda: left.fork() >> right.fork(),
+        )
 
     def __or__(self, other: Gate) -> Gate:
         """Either gate: signal passes if either gate accepts."""
@@ -74,7 +96,11 @@ class Gate:
                 return result
             return await right.process(signal)
 
-        return Gate(either, name=f"({self.name}|{other.name})")
+        return Gate(
+            either,
+            name=f"({self.name}|{other.name})",
+            _factory=lambda: left.fork() | right.fork(),
+        )
 
     def __and__(self, other: Gate) -> Gate:
         """Both gates: signal must pass both (uses result from second)."""
@@ -91,7 +117,11 @@ class Gate:
                 return None
             return r2
 
-        return Gate(both, name=f"({self.name}&{other.name})")
+        return Gate(
+            both,
+            name=f"({self.name}&{other.name})",
+            _factory=lambda: left.fork() & right.fork(),
+        )
 
     def __invert__(self) -> Gate:
         """Invert gate: passes only if this gate rejects."""
@@ -101,7 +131,11 @@ class Gate:
             result = await inner.process(signal)
             return signal if result is None else None
 
-        return Gate(inverted, name=f"~{self.name}")
+        return Gate(
+            inverted,
+            name=f"~{self.name}",
+            _factory=lambda: ~inner.fork(),
+        )
 
     def __repr__(self) -> str:
         return f"Gate({self.name!r})"
@@ -146,7 +180,11 @@ class Gate:
                 state["last"] = time.monotonic()
                 return signal
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.rate_limit(max_per_second, name=name),
+        )
 
     @classmethod
     def deduplicate(cls, window: float = 60.0, name: str = "dedup") -> Gate:
@@ -171,7 +209,11 @@ class Gate:
                 seen[key] = now
                 return signal
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.deduplicate(window, name=name),
+        )
 
     @classmethod
     def by_type(cls, *signal_types: type[Signal], name: str = "type_filter") -> Gate:
@@ -216,7 +258,17 @@ class Gate:
                     current_delay *= backoff
             return last_result
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.retry(
+                gate.fork(),
+                max_attempts=max_attempts,
+                delay=delay,
+                backoff=backoff,
+                name=name,
+            ),
+        )
 
     @classmethod
     def circuit_breaker(
@@ -284,7 +336,16 @@ class Gate:
                     state["opened_at"] = time.monotonic()
                 return None
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.circuit_breaker(
+                gate.fork(),
+                failure_threshold=failure_threshold,
+                recovery_timeout=recovery_timeout,
+                name=name,
+            ),
+        )
 
     @classmethod
     def timeout(cls, gate: Gate, seconds: float, name: str = "timeout") -> Gate:
@@ -298,7 +359,11 @@ class Gate:
             except asyncio.TimeoutError:
                 return None
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.timeout(gate.fork(), seconds=seconds, name=name),
+        )
 
     @classmethod
     def passthrough(cls) -> Gate:
@@ -336,7 +401,16 @@ class Gate:
                 return await otherwise.process(signal)
             return signal
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.when(
+                condition,
+                then.fork(),
+                otherwise.fork() if otherwise is not None else None,
+                name=name,
+            ),
+        )
 
     @classmethod
     def sample(cls, rate: float, name: str = "sample") -> Gate:
@@ -380,7 +454,11 @@ class Gate:
                 state["last"] = now
                 return signal
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.throttle(max_per_second, name=name),
+        )
 
     @classmethod
     def ttl(cls, seconds: float, name: str = "ttl") -> Gate:
@@ -477,7 +555,11 @@ class Gate:
                     )
                 return None  # Accumulating
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.batch(size, timeout=timeout, name=name),
+        )
 
     @classmethod
     def parallel(
@@ -535,7 +617,13 @@ class Gate:
                         return r
                 return None
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.parallel(
+                *(gate.fork() for gate in gate_list), mode=mode, name=name
+            ),
+        )
 
     @classmethod
     def fallback(
@@ -565,7 +653,15 @@ class Gate:
                     return result
             return None
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.fallback(
+                all_gates[0].fork(),
+                *(gate.fork() for gate in all_gates[1:]),
+                name=name,
+            ),
+        )
 
     @classmethod
     def debounce(cls, seconds: float, name: str = "debounce") -> Gate:
@@ -598,7 +694,11 @@ class Gate:
                     return result
                 return None
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.debounce(seconds, name=name),
+        )
 
     @classmethod
     def window(
@@ -648,7 +748,13 @@ class Gate:
                     )
                 return None
 
-        return cls(fn, name=name)
+        return cls(
+            fn,
+            name=name,
+            _factory=lambda: cls.window(
+                seconds, min_signals=min_signals, name=name
+            ),
+        )
 
     @classmethod
     def map(

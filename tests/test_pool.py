@@ -63,6 +63,176 @@ class TestPoolCreation:
         for worker in pool.workers:
             assert len(worker.gates) == 1
 
+    async def test_pool_workers_have_independent_builtin_gate_state(self):
+        pool = AgentPool("workers", size=2, gates=[Gate.throttle(1)])
+        received: list[str] = []
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext) -> None:
+            received.append(ctx.agent_name)
+
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        async with mesh:
+            await pool.workers[0].inbox.send(TaskSignal(task="a"))
+            await pool.workers[1].inbox.send(TaskSignal(task="b"))
+            await mesh.wait_idle()
+
+        assert sorted(received) == ["workers[0]", "workers[1]"]
+        assert pool.workers[0].gates[0] is not pool.workers[1].gates[0]
+
+    async def test_pool_workers_have_independent_deduplicate_state(self):
+        pool = AgentPool("workers", size=2, gates=[Gate.deduplicate()])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="same")) is not None
+        assert await right.process(TaskSignal(task="same")) is not None
+
+    async def test_pool_workers_have_independent_rate_limit_state(self, monkeypatch):
+        sleep_delays: list[float] = []
+
+        async def record_sleep(delay: float) -> None:
+            sleep_delays.append(delay)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        monkeypatch.setattr("signal_gating.gate.asyncio.sleep", record_sleep)
+        pool = AgentPool("workers", size=2, gates=[Gate.rate_limit(1)])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left")) is not None
+        assert await right.process(TaskSignal(task="right")) is not None
+        assert sleep_delays == []
+
+    async def test_pool_workers_have_independent_batch_state(self):
+        pool = AgentPool("workers", size=2, gates=[Gate.batch(2)])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left-1")) is None
+        assert await right.process(TaskSignal(task="right-1")) is None
+        left_batch = await left.process(TaskSignal(task="left-2"))
+        right_batch = await right.process(TaskSignal(task="right-2"))
+
+        assert left_batch is not None
+        assert left_batch.metadata["batch_size"] == 2
+        assert right_batch is not None
+        assert right_batch.metadata["batch_size"] == 2
+
+    async def test_pool_workers_have_independent_debounce_state(self):
+        pool = AgentPool("workers", size=2, gates=[Gate.debounce(0.01)])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        results = await asyncio.gather(
+            left.process(TaskSignal(task="left")),
+            right.process(TaskSignal(task="right")),
+        )
+
+        assert all(result is not None for result in results)
+
+    async def test_pool_workers_have_independent_window_state(self):
+        pool = AgentPool(
+            "workers", size=2, gates=[Gate.window(seconds=60, min_signals=2)]
+        )
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left-1")) is None
+        assert await right.process(TaskSignal(task="right-1")) is None
+        left_window = await left.process(TaskSignal(task="left-2"))
+        right_window = await right.process(TaskSignal(task="right-2"))
+
+        assert left_window is not None
+        assert left_window.metadata["window_size"] == 2
+        assert right_window is not None
+        assert right_window.metadata["window_size"] == 2
+
+    async def test_pool_workers_have_independent_circuit_breaker_state(self):
+        calls = 0
+
+        async def reject(signal: Signal) -> None:
+            nonlocal calls
+            calls += 1
+            return None
+
+        pool = AgentPool(
+            "workers",
+            size=2,
+            gates=[
+                Gate.circuit_breaker(
+                    Gate(reject), failure_threshold=1, recovery_timeout=60
+                )
+            ],
+        )
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left")) is None
+        assert await right.process(TaskSignal(task="right")) is None
+        assert calls == 2
+
+    @pytest.mark.parametrize(
+        "build_gate",
+        [
+            pytest.param(
+                lambda: Gate.throttle(1) >> Gate.passthrough(), id="chain"
+            ),
+            pytest.param(lambda: Gate.throttle(1) | Gate.block(), id="either"),
+            pytest.param(
+                lambda: Gate.throttle(1) & Gate.passthrough(), id="both"
+            ),
+            pytest.param(
+                lambda: Gate.retry(Gate.throttle(1), max_attempts=1), id="retry"
+            ),
+            pytest.param(
+                lambda: Gate.timeout(Gate.throttle(1), seconds=1), id="timeout"
+            ),
+            pytest.param(
+                lambda: Gate.when(lambda signal: True, Gate.throttle(1)),
+                id="when",
+            ),
+            pytest.param(
+                lambda: Gate.parallel(
+                    Gate.throttle(1), Gate.passthrough(), mode="all"
+                ),
+                id="parallel",
+            ),
+            pytest.param(
+                lambda: Gate.fallback(Gate.throttle(1), Gate.block()),
+                id="fallback",
+            ),
+        ],
+    )
+    async def test_pool_workers_fork_nested_builtin_gate_state(self, build_gate):
+        pool = AgentPool("workers", size=2, gates=[build_gate()])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left")) is not None
+        assert await right.process(TaskSignal(task="right")) is not None
+
+    async def test_pool_workers_fork_inverted_builtin_gate_state(self):
+        pool = AgentPool("workers", size=2, gates=[~Gate.deduplicate()])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="same")) is None
+        assert await right.process(TaskSignal(task="same")) is None
+
+    async def test_pool_workers_share_caller_owned_callable_state(self):
+        calls = 0
+
+        def first_only(signal: Signal) -> Signal | None:
+            nonlocal calls
+            calls += 1
+            return signal if calls == 1 else None
+
+        configured_gate = Gate(first_only, name="caller-owned")
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert left is not configured_gate
+        assert right is not configured_gate
+        assert left is not right
+        assert left.name == "caller-owned"
+        assert await left.process(TaskSignal(task="left")) is not None
+        assert await right.process(TaskSignal(task="right")) is None
+        assert calls == 2
+
     def test_pool_with_priority_inbox(self):
         pool = AgentPool("workers", size=2, priority_inbox=True)
         for worker in pool.workers:
@@ -295,6 +465,29 @@ class TestPoolMeshIntegration:
 
 
 class TestPoolScaling:
+    async def test_scaled_worker_gets_fresh_builtin_gate_state(self):
+        pool = AgentPool("workers", size=1, gates=[Gate.throttle(1)])
+        received: list[str] = []
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext) -> None:
+            received.append(ctx.agent_name)
+
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        original = pool.workers[0]
+
+        async with mesh:
+            await original.inbox.send(TaskSignal(task="original"))
+            await mesh.wait_idle()
+            added = await mesh.scale_pool(pool, 2)
+            assert len(added) == 1
+            await added[0].inbox.send(TaskSignal(task="scaled"))
+            await mesh.wait_idle()
+
+        assert received == ["workers[0]", "workers[1]"]
+        assert added[0].gates[0] is not original.gates[0]
+
     def test_unattached_pool_discard_removes_worker(self):
         pool = AgentPool("workers", size=2)
 
