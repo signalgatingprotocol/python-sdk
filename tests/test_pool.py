@@ -233,6 +233,87 @@ class TestPoolCreation:
         assert await right.process(TaskSignal(task="right")) is None
         assert calls == 2
 
+    async def test_pool_fork_preserves_custom_gate_subclass_behavior(self):
+        class RejectingGate(Gate):
+            async def process(self, signal: Signal) -> None:
+                return None
+
+        configured_gate = RejectingGate(lambda signal: signal, name="rejecting")
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+
+        for worker in pool.workers:
+            forked = worker.gates[0]
+            assert forked is not configured_gate
+            assert isinstance(forked, RejectingGate)
+            assert await forked.process(TaskSignal(task="blocked")) is None
+
+    @pytest.mark.parametrize(
+        "build_gate",
+        [
+            pytest.param(lambda cls: cls.rate_limit(1000), id="rate-limit"),
+            pytest.param(lambda cls: cls.deduplicate(), id="deduplicate"),
+            pytest.param(
+                lambda cls: cls.retry(Gate.passthrough(), max_attempts=1),
+                id="retry",
+            ),
+            pytest.param(
+                lambda cls: cls.circuit_breaker(Gate.passthrough()),
+                id="circuit-breaker",
+            ),
+            pytest.param(
+                lambda cls: cls.timeout(Gate.passthrough(), seconds=1),
+                id="timeout",
+            ),
+            pytest.param(
+                lambda cls: cls.when(lambda signal: True, Gate.passthrough()),
+                id="when",
+            ),
+            pytest.param(lambda cls: cls.throttle(1000), id="throttle"),
+            pytest.param(lambda cls: cls.batch(1), id="batch"),
+            pytest.param(
+                lambda cls: cls.parallel(Gate.passthrough()), id="parallel"
+            ),
+            pytest.param(
+                lambda cls: cls.fallback(Gate.passthrough()), id="fallback"
+            ),
+            pytest.param(lambda cls: cls.debounce(0), id="debounce"),
+            pytest.param(lambda cls: cls.window(1), id="window"),
+        ],
+    )
+    def test_builtin_gate_factories_support_legacy_subclass_constructor(
+        self, build_gate
+    ):
+        class LegacyConstructorGate(Gate):
+            def __init__(self, fn, name=""):
+                super().__init__(fn, name)
+
+        configured_gate = build_gate(LegacyConstructorGate)
+        forked = configured_gate.fork()
+
+        assert isinstance(configured_gate, LegacyConstructorGate)
+        assert isinstance(forked, LegacyConstructorGate)
+        assert forked is not configured_gate
+
+    @pytest.mark.parametrize(
+        "build_gate",
+        [
+            pytest.param(lambda: Gate.throttle(1), id="built-in"),
+            pytest.param(
+                lambda: Gate.throttle(1) >> Gate.passthrough(), id="composite"
+            ),
+        ],
+    )
+    def test_pool_forks_preserve_reassigned_public_gate_name(self, build_gate):
+        configured_gate = build_gate()
+        configured_gate.name = "renamed-by-caller"
+
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+
+        assert [worker.gates[0].name for worker in pool.workers] == [
+            "renamed-by-caller",
+            "renamed-by-caller",
+        ]
+
     def test_pool_with_priority_inbox(self):
         pool = AgentPool("workers", size=2, priority_inbox=True)
         for worker in pool.workers:

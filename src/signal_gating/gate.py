@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from copy import copy as shallow_copy
 from inspect import isawaitable
 from typing import Any
 
@@ -22,6 +23,12 @@ from signal_gating.signal import Signal
 
 GateFn = Callable[[Signal], Signal | None | Awaitable[Signal | None]]
 GateFactory = Callable[[], "Gate"]
+
+
+def _with_factory(gate: Gate, factory: GateFactory) -> Gate:
+    """Attach a rebuild factory without changing the public constructor contract."""
+    gate._factory = factory
+    return gate
 
 
 class Gate:
@@ -59,12 +66,16 @@ class Gate:
     def fork(self) -> Gate:
         """Return a fresh gate wrapper, including fresh built-in gate state.
 
-        A raw ``Gate(fn)`` keeps using the caller-owned callable, so any mutable
-        state captured by that callable remains shared across forks.
+        A raw ``Gate(fn)`` is shallow-copied, preserving custom subclasses and
+        their behavior. Caller-owned callable closures and mutable custom
+        attributes therefore remain shared rather than being deep-cloned.
         """
         if self._factory is not None:
-            return self._factory()
-        return Gate(self._fn, name=self.name)
+            forked = self._factory()
+        else:
+            forked = shallow_copy(self)
+        forked.name = self.name
+        return forked
 
     def __rshift__(self, other: Gate) -> Gate:
         """Chain gates: signal flows through self, then other."""
@@ -180,10 +191,9 @@ class Gate:
                 state["last"] = time.monotonic()
                 return signal
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.rate_limit(max_per_second, name=name),
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.rate_limit(max_per_second, name=name),
         )
 
     @classmethod
@@ -209,10 +219,9 @@ class Gate:
                 seen[key] = now
                 return signal
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.deduplicate(window, name=name),
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.deduplicate(window, name=name),
         )
 
     @classmethod
@@ -258,10 +267,9 @@ class Gate:
                     current_delay *= backoff
             return last_result
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.retry(
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.retry(
                 gate.fork(),
                 max_attempts=max_attempts,
                 delay=delay,
@@ -336,10 +344,9 @@ class Gate:
                     state["opened_at"] = time.monotonic()
                 return None
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.circuit_breaker(
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.circuit_breaker(
                 gate.fork(),
                 failure_threshold=failure_threshold,
                 recovery_timeout=recovery_timeout,
@@ -359,10 +366,9 @@ class Gate:
             except asyncio.TimeoutError:
                 return None
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.timeout(gate.fork(), seconds=seconds, name=name),
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.timeout(gate.fork(), seconds=seconds, name=name),
         )
 
     @classmethod
@@ -401,10 +407,9 @@ class Gate:
                 return await otherwise.process(signal)
             return signal
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.when(
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.when(
                 condition,
                 then.fork(),
                 otherwise.fork() if otherwise is not None else None,
@@ -454,10 +459,9 @@ class Gate:
                 state["last"] = now
                 return signal
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.throttle(max_per_second, name=name),
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.throttle(max_per_second, name=name),
         )
 
     @classmethod
@@ -555,10 +559,9 @@ class Gate:
                     )
                 return None  # Accumulating
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.batch(size, timeout=timeout, name=name),
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.batch(size, timeout=timeout, name=name),
         )
 
     @classmethod
@@ -617,10 +620,9 @@ class Gate:
                         return r
                 return None
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.parallel(
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.parallel(
                 *(gate.fork() for gate in gate_list), mode=mode, name=name
             ),
         )
@@ -653,10 +655,9 @@ class Gate:
                     return result
             return None
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.fallback(
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.fallback(
                 all_gates[0].fork(),
                 *(gate.fork() for gate in all_gates[1:]),
                 name=name,
@@ -694,10 +695,9 @@ class Gate:
                     return result
                 return None
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.debounce(seconds, name=name),
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.debounce(seconds, name=name),
         )
 
     @classmethod
@@ -748,10 +748,9 @@ class Gate:
                     )
                 return None
 
-        return cls(
-            fn,
-            name=name,
-            _factory=lambda: cls.window(
+        return _with_factory(
+            cls(fn, name=name),
+            lambda: cls.window(
                 seconds, min_signals=min_signals, name=name
             ),
         )
