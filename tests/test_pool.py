@@ -247,6 +247,60 @@ class TestPoolCreation:
             assert isinstance(forked, RejectingGate)
             assert await forked.process(TaskSignal(task="blocked")) is None
 
+    def test_gate_fork_ignores_untrustworthy_subclass_copy_hook(self):
+        class SelfCopyGate(Gate):
+            def __copy__(self):
+                return self
+
+        configured_gate = SelfCopyGate(lambda signal: signal, name="self-copy")
+        first_fork = configured_gate.fork()
+        second_fork = configured_gate.fork()
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        wrappers = [
+            configured_gate,
+            first_fork,
+            second_fork,
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        assert len({id(gate) for gate in wrappers}) == len(wrappers)
+        assert all(isinstance(gate, SelfCopyGate) for gate in wrappers)
+
+    async def test_stateful_subclass_forks_preserve_slotted_runtime_policy(self):
+        class PolicyThrottle(Gate):
+            __slots__ = ("policy",)
+
+            def __init__(self, fn, name=""):
+                super().__init__(fn, name)
+                self.policy = "deny"
+
+            async def process(self, signal: Signal) -> Signal | None:
+                if self.policy != "allow":
+                    return None
+                return await super().process(signal)
+
+        configured_gate = PolicyThrottle.throttle(1)
+        configured_gate.name = "policy-throttle"
+        configured_gate.policy = "allow"
+        first_fork = configured_gate.fork()
+        second_fork = configured_gate.fork()
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            first_fork,
+            second_fork,
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        assert len({id(gate) for gate in forks}) == len(forks)
+        assert all(isinstance(gate, PolicyThrottle) for gate in forks)
+        assert [gate.policy for gate in forks] == ["allow"] * len(forks)
+        assert [gate.name for gate in forks] == ["policy-throttle"] * len(forks)
+
+        assert await configured_gate.process(TaskSignal(task="configured")) is not None
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
     @pytest.mark.parametrize(
         "build_gate",
         [
