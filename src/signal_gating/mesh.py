@@ -12,6 +12,7 @@ from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from signal_gating._immutable import deep_thaw
 from signal_gating.agent import Agent, ToolCallSignal, ToolResultSignal, ToolSpec
 from signal_gating.errors import AgentError, ChannelClosed, MeshError
 from signal_gating.gate import Gate
@@ -1839,7 +1840,7 @@ class Mesh:
             )
             if response.error:
                 raise AgentError(resolved.name, f"Tool '{tool_name}' failed: {response.error}")
-            return response.result
+            return deep_thaw(response.result)
         await self._record_event(
             "tool_call_complete",
             response,
