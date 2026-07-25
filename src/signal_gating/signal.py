@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from types import MappingProxyType
 from typing import Any, ClassVar, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
-from signal_gating._immutable import deep_freeze
+from signal_gating._immutable import deep_freeze, deep_thaw
 from signal_gating.registry import _auto_register, from_wire, to_wire, wire_type_of
 
 T = TypeVar("T", bound="Signal")
@@ -46,15 +47,30 @@ class Signal(BaseModel):
     def _freeze_metadata(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
         return MappingProxyType(dict(value))
 
-    @field_serializer("metadata")
-    def _serialize_metadata(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        return dict(value)
+    @field_serializer("*", mode="wrap")
+    def _serialize_containers(self, value: Any, handler: Any) -> Any:
+        return handler(deep_thaw(value))
 
     @model_validator(mode="after")
     def _freeze_containers(self) -> Signal:
         for field_name in type(self).model_fields:
             object.__setattr__(self, field_name, deep_freeze(getattr(self, field_name)))
         return self
+
+    def model_copy(
+        self: T,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> T:
+        """Copy this signal, validating and freezing any updated fields."""
+        if update is None:
+            return super().model_copy(deep=deep)
+        data = self.model_dump(round_trip=True)
+        data.update(update)
+        if deep:
+            data = deepcopy(data)
+        return type(self).model_validate(data)
 
     def __hash__(self) -> int:
         # The default frozen-model hash chokes on the unhashable MappingProxyType

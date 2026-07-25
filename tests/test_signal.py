@@ -1,6 +1,9 @@
 """Tests for Signal core type."""
 
+import copy
 import warnings
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -75,6 +78,7 @@ def test_signal_recursively_freezes_mutable_fields_and_input_aliases() -> None:
 
     assert signal.payload["auth"] == {"amount": 1}
     assert signal.items == [{"value": 1}]
+    assert signal.items[:] == [{"value": 1}]
     assert signal.labels == {"approved"}
 
     with pytest.raises(TypeError):
@@ -102,6 +106,140 @@ def test_nested_signal_wire_roundtrip_without_serializer_warnings() -> None:
     assert restored.payload == {"auth": {"amount": 1}}
     assert restored.items == [{"value": 1}]
     assert restored.labels == {"approved"}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda signal: dict.__setitem__(signal.payload, "tampered", True),
+        lambda signal: list.append(signal.items, {"value": 2}),
+        lambda signal: set.add(signal.labels, "tampered"),
+    ],
+)
+def test_signal_rejects_builtin_base_class_mutation(
+    mutate: Callable[[NestedSignal], Any],
+) -> None:
+    signal = NestedSignal(
+        payload={"auth": {"amount": 1}},
+        items=[{"value": 1}],
+        labels={"approved"},
+    )
+
+    with pytest.raises(TypeError):
+        mutate(signal)
+
+    assert signal.payload == {"auth": {"amount": 1}}
+    assert signal.items == [{"value": 1}]
+    assert signal.labels == {"approved"}
+
+
+@pytest.mark.parametrize(
+    "reinitialize",
+    [
+        lambda signal: dict.__init__(signal.payload, {"tampered": True}),
+        lambda signal: list.__init__(signal.items, [{"value": 2}]),
+        lambda signal: set.__init__(signal.labels, {"tampered"}),
+    ],
+)
+def test_signal_rejects_builtin_base_class_reinitialization(
+    reinitialize: Callable[[NestedSignal], Any],
+) -> None:
+    signal = NestedSignal(
+        payload={"auth": {"amount": 1}},
+        items=[{"value": 1}],
+        labels={"approved"},
+    )
+
+    with pytest.raises(TypeError):
+        reinitialize(signal)
+
+    assert signal.payload == {"auth": {"amount": 1}}
+    assert signal.items == [{"value": 1}]
+    assert signal.labels == {"approved"}
+
+
+def test_signal_model_copy_update_validates_freezes_and_isolates_aliases() -> None:
+    signal = NestedSignal(payload={}, items=[], labels=set())
+    payload = {"auth": {"amount": 1}}
+    items = [{"value": 1}]
+    labels = {"approved"}
+
+    copied = signal.model_copy(update={"payload": payload, "items": items, "labels": labels})
+    validated = signal.model_copy(update={"items": [{"value": "2"}]})  # type: ignore[list-item]
+
+    payload["auth"]["amount"] = 1000  # type: ignore[index]
+    items[0]["value"] = 1000
+    labels.add("tampered")
+
+    assert copied.payload == {"auth": {"amount": 1}}
+    assert copied.items == [{"value": 1}]
+    assert copied.labels == {"approved"}
+    assert validated.items == [{"value": 2}]
+    with pytest.raises(TypeError):
+        copied.items.append({"value": 2})
+
+
+def test_signal_supports_deepcopy_without_losing_immutability() -> None:
+    signal = NestedSignal(
+        payload={"auth": {"amount": 1}},
+        items=[{"value": 1}],
+        labels={"approved"},
+    )
+
+    copied = copy.deepcopy(signal)
+
+    assert copied == signal
+    assert copied.payload is not signal.payload
+    assert copied.payload["auth"] is not signal.payload["auth"]
+    with pytest.raises(TypeError):
+        copied.payload["auth"]["amount"] = 2  # type: ignore[index]
+
+
+def test_signal_model_copy_deep_succeeds_without_losing_immutability() -> None:
+    signal = NestedSignal(
+        payload={"auth": {"amount": 1}},
+        items=[{"value": 1}],
+        labels={"approved"},
+    )
+
+    copied = signal.model_copy(deep=True)
+
+    assert copied == signal
+    assert copied.items is not signal.items
+    assert copied.items[0] is not signal.items[0]
+    with pytest.raises(TypeError):
+        copied.items.append({"value": 2})
+
+
+def test_signal_dump_preserves_python_container_shapes_without_warnings() -> None:
+    class ContainerShapeSignal(Signal):
+        mutable_list: list[int]
+        fixed_tuple: tuple[int, ...]
+        mutable_set: set[str]
+        fixed_frozenset: frozenset[str]
+
+    signal = ContainerShapeSignal(
+        mutable_list=[1, 2],
+        fixed_tuple=(1, 2),
+        mutable_set={"a", "b"},
+        fixed_frozenset=frozenset({"a", "b"}),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        python_dump = signal.model_dump()
+        json_dump = signal.model_dump(mode="json")
+        restored = Signal.from_wire(signal.to_wire())
+
+    assert type(python_dump["mutable_list"]) is list
+    assert type(python_dump["fixed_tuple"]) is tuple
+    assert type(python_dump["mutable_set"]) is set
+    assert type(python_dump["fixed_frozenset"]) is frozenset
+    assert type(json_dump["mutable_list"]) is list
+    assert type(json_dump["fixed_tuple"]) is list
+    assert type(json_dump["mutable_set"]) is list
+    assert type(json_dump["fixed_frozenset"]) is list
+    assert restored == signal
 
 
 def test_signal_immutable():

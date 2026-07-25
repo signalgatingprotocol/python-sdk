@@ -1,8 +1,10 @@
-"""Recursively immutable, built-in-compatible signal containers."""
+"""Recursively immutable signal containers with safe serialization helpers."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence, Set
+from copy import deepcopy
+from types import MappingProxyType
 from typing import Any, NoReturn
 
 
@@ -10,7 +12,47 @@ def _immutable(*_args: Any, **_kwargs: Any) -> NoReturn:
     raise TypeError("signal containers are immutable")
 
 
-class _FrozenDict(dict[Any, Any]):
+class _FrozenDict(Mapping[Any, Any]):
+    """Immutable mapping backed by an unaliased read-only proxy."""
+
+    __slots__ = ("_data",)
+    _data: Mapping[Any, Any]
+
+    def __init__(self, values: Mapping[Any, Any]) -> None:
+        object.__setattr__(self, "_data", MappingProxyType(dict(values)))
+
+    def __getitem__(self, key: Any) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return repr(dict(self._data))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Mapping):
+            return False
+        return dict(self.items()) == dict(other.items())
+
+    def __copy__(self) -> _FrozenDict:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenDict:
+        copied = _FrozenDict(
+            {deepcopy(key, memo): deepcopy(value, memo) for key, value in self.items()}
+        )
+        memo[id(self)] = copied
+        return copied
+
+    def copy(self) -> dict[Any, Any]:
+        return dict(self._data)
+
+    __setattr__ = _immutable
+    __delattr__ = _immutable
     __setitem__ = _immutable
     __delitem__ = _immutable
     clear = _immutable
@@ -21,7 +63,49 @@ class _FrozenDict(dict[Any, Any]):
     __ior__ = _immutable
 
 
-class _FrozenList(list[Any]):
+class _FrozenList(Sequence[Any]):
+    """Immutable sequence that preserves list equality and serialization shape."""
+
+    __slots__ = ("_values",)
+    _values: tuple[Any, ...]
+
+    def __init__(self, values: Sequence[Any]) -> None:
+        object.__setattr__(self, "_values", tuple(values))
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return _FrozenList(self._values[index])
+        return self._values[index]
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __repr__(self) -> str:
+        return repr(list(self._values))
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _FrozenList):
+            return bool(self._values == other._values)
+        if isinstance(other, list):
+            return bool(list(self._values) == other)
+        return False
+
+    def __copy__(self) -> _FrozenList:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenList:
+        copied = _FrozenList([deepcopy(value, memo) for value in self])
+        memo[id(self)] = copied
+        return copied
+
+    def copy(self) -> list[Any]:
+        return list(self._values)
+
+    __setattr__ = _immutable
+    __delattr__ = _immutable
     __setitem__ = _immutable
     __delitem__ = _immutable
     append = _immutable
@@ -36,7 +120,43 @@ class _FrozenList(list[Any]):
     __imul__ = _immutable
 
 
-class _FrozenSet(set[Any]):
+class _FrozenSet(Set[Any]):
+    """Immutable set backed by a frozenset."""
+
+    __slots__ = ("_values",)
+    _values: frozenset[Any]
+
+    def __init__(self, values: Set[Any]) -> None:
+        object.__setattr__(self, "_values", frozenset(values))
+
+    def __contains__(self, value: object) -> bool:
+        return value in self._values
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __repr__(self) -> str:
+        return repr(set(self._values))
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Set) and self._values == frozenset(other)
+
+    def __copy__(self) -> _FrozenSet:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _FrozenSet:
+        copied = _FrozenSet({deepcopy(value, memo) for value in self})
+        memo[id(self)] = copied
+        return copied
+
+    def copy(self) -> set[Any]:
+        return set(self._values)
+
+    __setattr__ = _immutable
+    __delattr__ = _immutable
     add = _immutable
     clear = _immutable
     difference_update = _immutable
@@ -53,15 +173,30 @@ class _FrozenSet(set[Any]):
 
 
 def deep_freeze(value: Any) -> Any:
-    """Copy mutable containers recursively into immutable built-in subclasses."""
+    """Copy mutable containers recursively into composition-based wrappers."""
     if isinstance(value, Mapping):
         return _FrozenDict({key: deep_freeze(item) for key, item in value.items()})
     if isinstance(value, list):
-        return _FrozenList(deep_freeze(item) for item in value)
+        return _FrozenList([deep_freeze(item) for item in value])
     if isinstance(value, set):
-        return _FrozenSet(deep_freeze(item) for item in value)
+        return _FrozenSet({deep_freeze(item) for item in value})
     if isinstance(value, tuple):
         return tuple(deep_freeze(item) for item in value)
     if isinstance(value, frozenset):
         return frozenset(deep_freeze(item) for item in value)
+    return value
+
+
+def deep_thaw(value: Any) -> Any:
+    """Restore frozen wrappers to their original built-in container shapes."""
+    if isinstance(value, _FrozenDict):
+        return {key: deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, _FrozenList):
+        return [deep_thaw(item) for item in value]
+    if isinstance(value, _FrozenSet):
+        return {deep_thaw(item) for item in value}
+    if isinstance(value, tuple):
+        return tuple(deep_thaw(item) for item in value)
+    if isinstance(value, frozenset):
+        return frozenset(deep_thaw(item) for item in value)
     return value
