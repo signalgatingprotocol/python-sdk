@@ -9,8 +9,9 @@ from types import MappingProxyType
 from typing import Any, ClassVar, TypeVar
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
+from signal_gating._immutable import deep_freeze
 from signal_gating.registry import _auto_register, from_wire, to_wire, wire_type_of
 
 T = TypeVar("T", bound="Signal")
@@ -25,7 +26,8 @@ class Signal(BaseModel):
             task: str
             urgency: int = 0
 
-    Signals are immutable by design. Use `evolve()` to create modified copies.
+    Signals are immutable by design. Nested mappings, lists, and sets are frozen
+    too. Use `evolve()` to create modified copies.
     """
 
     id: str = Field(default_factory=lambda: uuid4().hex)
@@ -47,6 +49,12 @@ class Signal(BaseModel):
     @field_serializer("metadata")
     def _serialize_metadata(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return dict(value)
+
+    @model_validator(mode="after")
+    def _freeze_containers(self) -> Signal:
+        for field_name in type(self).model_fields:
+            object.__setattr__(self, field_name, deep_freeze(getattr(self, field_name)))
+        return self
 
     def __hash__(self) -> int:
         # The default frozen-model hash chokes on the unhashable MappingProxyType

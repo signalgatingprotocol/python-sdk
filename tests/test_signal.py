@@ -1,5 +1,7 @@
 """Tests for Signal core type."""
 
+import warnings
+
 import pytest
 
 from signal_gating import Signal
@@ -8,6 +10,12 @@ from signal_gating import Signal
 class TaskSignal(Signal):
     task: str
     urgency: int = 0
+
+
+class NestedSignal(Signal):
+    payload: dict[str, object]
+    items: list[dict[str, int]]
+    labels: set[str]
 
 
 def test_signal_creation():
@@ -53,6 +61,47 @@ def test_signal_metadata_immutable():
     s = Signal().with_metadata(region="us-east")
     with pytest.raises(TypeError):
         s.metadata["region"] = "eu-west"  # type: ignore[index]
+
+
+def test_signal_recursively_freezes_mutable_fields_and_input_aliases() -> None:
+    payload = {"auth": {"amount": 1}}
+    items = [{"value": 1}]
+    labels = {"approved"}
+    signal = NestedSignal(payload=payload, items=items, labels=labels)
+
+    payload["auth"]["amount"] = 1000  # type: ignore[index]
+    items[0]["value"] = 1000
+    labels.add("tampered")
+
+    assert signal.payload["auth"] == {"amount": 1}
+    assert signal.items == [{"value": 1}]
+    assert signal.labels == {"approved"}
+
+    with pytest.raises(TypeError):
+        signal.payload["auth"]["amount"] = 2  # type: ignore[index]
+    with pytest.raises(TypeError):
+        signal.items[0]["value"] = 2
+    with pytest.raises(TypeError):
+        signal.items.append({"value": 2})
+    with pytest.raises(TypeError):
+        signal.labels.add("blocked")
+
+
+def test_nested_signal_wire_roundtrip_without_serializer_warnings() -> None:
+    signal = NestedSignal(
+        payload={"auth": {"amount": 1}},
+        items=[{"value": 1}],
+        labels={"approved"},
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        restored = Signal.from_wire(signal.to_wire())
+
+    assert type(restored) is NestedSignal
+    assert restored.payload == {"auth": {"amount": 1}}
+    assert restored.items == [{"value": 1}]
+    assert restored.labels == {"approved"}
 
 
 def test_signal_immutable():
