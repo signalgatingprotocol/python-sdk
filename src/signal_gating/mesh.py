@@ -8,7 +8,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
-from inspect import isawaitable
+from inspect import isawaitable, iscoroutine
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -547,6 +547,39 @@ class Mesh:
                 result = sink(event)
                 if isawaitable(result):
                     await result
+            except Exception:
+                self._event_sink_errors += 1
+                logger.warning("Mesh event sink failed", exc_info=True)
+
+    def _record_event_nowait(
+        self,
+        action: str,
+        signal: Signal,
+        *,
+        source: str,
+        target: str = "",
+        event_kind: str = "mesh",
+        **metadata: Any,
+    ) -> None:
+        """Notify synchronous sink portions without awaiting observers."""
+        if not self._event_sinks:
+            return
+        event = MeshEvent(
+            action=action,
+            signal=signal,
+            source=source,
+            target=target,
+            event_kind=event_kind,
+            metadata=metadata,
+        )
+        for sink in tuple(self._event_sinks):
+            try:
+                result = sink(event)
+                if isawaitable(result):
+                    if iscoroutine(result):
+                        result.close()
+                    elif isinstance(result, asyncio.Future):
+                        result.cancel()
             except Exception:
                 self._event_sink_errors += 1
                 logger.warning("Mesh event sink failed", exc_info=True)
@@ -1425,7 +1458,7 @@ class Mesh:
                 ]
                 if not missing_targets:
                     raise
-                await self._record_event(
+                self._record_event_nowait(
                     "scatter_timeout",
                     signal,
                     source="mesh",

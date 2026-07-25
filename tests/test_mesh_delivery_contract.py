@@ -313,6 +313,29 @@ async def test_scatter_timeout_bounds_dispatch_and_removes_captures() -> None:
     assert all(worker._outbox == [] for worker in workers)
 
 
+async def test_scatter_timeout_bounds_blocked_event_sink_and_removes_captures() -> None:
+    workers = [Agent("worker-a"), Agent("worker-b")]
+    mesh = Mesh(workers)
+
+    async def blocked_timeout_sink(event: MeshEvent) -> None:
+        if event.action == "scatter_timeout":
+            await asyncio.Event().wait()
+
+    mesh.record(blocked_timeout_sink)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.scatter(Message(value=1), workers, timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert all(worker._outbox == [] for worker in workers)
+
+
 async def test_race_skips_blocked_send_when_an_allowed_target_replies() -> None:
     blocked, allowed = Agent("blocked"), Agent("allowed")
     reply_with_value(blocked, 1)
