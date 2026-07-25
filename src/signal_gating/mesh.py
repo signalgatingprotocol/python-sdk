@@ -8,7 +8,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
-from inspect import isawaitable, iscoroutine
+from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -576,13 +576,39 @@ class Mesh:
             try:
                 result = sink(event)
                 if isawaitable(result):
-                    if iscoroutine(result):
-                        result.close()
-                    elif isinstance(result, asyncio.Future):
-                        result.cancel()
+                    self._dispose_event_sink_awaitable(result)
             except Exception:
                 self._event_sink_errors += 1
                 logger.warning("Mesh event sink failed", exc_info=True)
+
+    def _dispose_event_sink_awaitable(self, result: Awaitable[None]) -> None:
+        """Dispose an observer awaitable without putting it on the deadline path."""
+        if isinstance(result, asyncio.Future):
+            if result.done():
+                self._observe_event_sink_future(result)
+            else:
+                result.add_done_callback(self._observe_event_sink_future)
+                result.cancel()
+            return
+
+        close = getattr(result, "close", None)
+        if callable(close):
+            close()
+            return
+
+        future = asyncio.ensure_future(result)
+        future.add_done_callback(self._observe_event_sink_future)
+        future.cancel()
+
+    def _observe_event_sink_future(self, future: asyncio.Future[Any]) -> None:
+        """Consume a disposed observer's outcome and retain error accounting."""
+        try:
+            future.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            self._event_sink_errors += 1
+            logger.warning("Mesh event sink failed", exc_info=True)
 
     async def _deliver(
         self,
