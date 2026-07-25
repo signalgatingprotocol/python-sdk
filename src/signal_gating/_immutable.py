@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence, Set
+from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
 from copy import deepcopy
 from types import MappingProxyType
 from typing import Any, NoReturn
@@ -51,6 +51,16 @@ class _FrozenDict(Mapping[Any, Any]):
     def copy(self) -> dict[Any, Any]:
         return dict(self._data)
 
+    def __or__(self, other: object) -> Any:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return dict(self) | dict(other)
+
+    def __ror__(self, other: object) -> Any:
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return dict(other) | dict(self)
+
     __setattr__ = _immutable
     __delattr__ = _immutable
     __setitem__ = _immutable
@@ -74,7 +84,7 @@ class _FrozenList(Sequence[Any]):
 
     def __getitem__(self, index: Any) -> Any:
         if isinstance(index, slice):
-            return _FrozenList(self._values[index])
+            return list(self._values[index])
         return self._values[index]
 
     def __iter__(self) -> Iterator[Any]:
@@ -103,6 +113,26 @@ class _FrozenList(Sequence[Any]):
 
     def copy(self) -> list[Any]:
         return list(self._values)
+
+    def __add__(self, other: object) -> Any:
+        if isinstance(other, _FrozenList):
+            return list(self._values) + list(other._values)
+        if isinstance(other, list):
+            return list(self._values) + other
+        return NotImplemented
+
+    def __radd__(self, other: object) -> Any:
+        if isinstance(other, _FrozenList):
+            return list(other._values) + list(self._values)
+        if isinstance(other, list):
+            return other + list(self._values)
+        return NotImplemented
+
+    def __mul__(self, count: object) -> Any:
+        return list(self._values) * count  # type: ignore[operator]
+
+    def __rmul__(self, count: object) -> Any:
+        return list(self._values) * count  # type: ignore[operator]
 
     __setattr__ = _immutable
     __delattr__ = _immutable
@@ -154,6 +184,67 @@ class _FrozenSet(Set[Any]):
 
     def copy(self) -> set[Any]:
         return set(self._values)
+
+    def union(self, *others: Iterable[Any]) -> set[Any]:
+        return set(self._values).union(*others)
+
+    def intersection(self, *others: Iterable[Any]) -> set[Any]:
+        return set(self._values).intersection(*others)
+
+    def difference(self, *others: Iterable[Any]) -> set[Any]:
+        return set(self._values).difference(*others)
+
+    def symmetric_difference(self, other: Iterable[Any]) -> set[Any]:
+        return set(self._values).symmetric_difference(other)
+
+    def issubset(self, other: Iterable[Any]) -> bool:
+        return set(self._values).issubset(other)
+
+    def issuperset(self, other: Iterable[Any]) -> bool:
+        return set(self._values).issuperset(other)
+
+    def isdisjoint(self, other: Iterable[Any]) -> bool:
+        return set(self._values).isdisjoint(other)
+
+    def __or__(self, other: object) -> Any:
+        if not isinstance(other, Set):
+            return NotImplemented
+        return set(self._values) | set(other)
+
+    def __ror__(self, other: object) -> Any:
+        if not isinstance(other, Set):
+            return NotImplemented
+        return set(other) | set(self._values)
+
+    def __and__(self, other: object) -> Any:
+        if not isinstance(other, Set):
+            return NotImplemented
+        return set(self._values) & set(other)
+
+    def __rand__(self, other: object) -> Any:
+        if not isinstance(other, Set):
+            return NotImplemented
+        return set(other) & set(self._values)
+
+    def __sub__(self, other: object) -> Any:
+        if not isinstance(other, Set):
+            return NotImplemented
+        return set(self._values) - set(other)
+
+    def __rsub__(self, other: object) -> Any:
+        if not isinstance(other, Set):
+            return NotImplemented
+        return set(other) - set(self._values)
+
+    def __xor__(self, other: object) -> Any:
+        if not isinstance(other, Set):
+            return NotImplemented
+        return set(self._values) ^ set(other)
+
+    def __rxor__(self, other: object) -> Any:
+        if not isinstance(other, Set):
+            return NotImplemented
+        return set(other) ^ set(self._values)
 
     __setattr__ = _immutable
     __delattr__ = _immutable

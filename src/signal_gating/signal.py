@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping
-from copy import deepcopy
 from types import MappingProxyType
 from typing import Any, ClassVar, TypeVar
 from uuid import uuid4
@@ -63,14 +62,13 @@ class Signal(BaseModel):
         update: Mapping[str, Any] | None = None,
         deep: bool = False,
     ) -> T:
-        """Copy this signal, validating and freezing any updated fields."""
-        if update is None:
-            return super().model_copy(deep=deep)
-        data = self.model_dump(round_trip=True)
-        data.update(update)
-        if deep:
-            data = deepcopy(data)
-        return type(self).model_validate(data)
+        """Copy this signal, recursively freezing any unvalidated update values."""
+        frozen_update = (
+            None
+            if update is None
+            else {field_name: deep_freeze(value) for field_name, value in update.items()}
+        )
+        return super().model_copy(update=frozen_update, deep=deep)
 
     def __hash__(self) -> int:
         # The default frozen-model hash chokes on the unhashable MappingProxyType
