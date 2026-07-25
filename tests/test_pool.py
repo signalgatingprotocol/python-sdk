@@ -301,6 +301,75 @@ class TestPoolCreation:
             assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
             assert await gate.process(TaskSignal(task=f"second-{index}")) is None
 
+    async def test_stateful_forks_preserve_legacy_constructor_fn_wrapper(self):
+        audited_tasks: list[str] = []
+
+        class AuditedThrottle(Gate):
+            def __init__(self, fn, name=""):
+                async def audited(signal: TaskSignal) -> Signal | None:
+                    audited_tasks.append(signal.task)
+                    return await fn(signal)
+
+                super().__init__(audited, name)
+
+        configured_gate = AuditedThrottle.throttle(1)
+        first_fork = configured_gate.fork()
+        second_fork = configured_gate.fork()
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            first_fork,
+            second_fork,
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        for index, gate in enumerate(forks):
+            assert isinstance(gate, AuditedThrottle)
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+        assert audited_tasks == [
+            task
+            for index in range(len(forks))
+            for task in (f"first-{index}", f"second-{index}")
+        ]
+
+    async def test_stateful_forks_preserve_overridden_factory_decoration(self):
+        decorated_tasks: list[str] = []
+
+        class DecoratedThrottle(Gate):
+            @classmethod
+            def throttle(cls, max_per_second, name="throttle"):
+                gate = super().throttle(max_per_second, name=name)
+                builtin_fn = gate._fn
+
+                async def decorated(signal: TaskSignal) -> Signal | None:
+                    decorated_tasks.append(signal.task)
+                    return await builtin_fn(signal)
+
+                gate._fn = decorated
+                return gate
+
+        configured_gate = DecoratedThrottle.throttle(1)
+        first_fork = configured_gate.fork()
+        second_fork = configured_gate.fork()
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            first_fork,
+            second_fork,
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        for index, gate in enumerate(forks):
+            assert isinstance(gate, DecoratedThrottle)
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+        assert decorated_tasks == [
+            task
+            for index in range(len(forks))
+            for task in (f"first-{index}", f"second-{index}")
+        ]
+
     @pytest.mark.parametrize(
         "build_gate",
         [

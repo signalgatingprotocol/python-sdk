@@ -22,6 +22,7 @@ from signal_gating.signal import Signal
 
 GateFn = Callable[[Signal], Signal | None | Awaitable[Signal | None]]
 GateFactory = Callable[[], "Gate"]
+_EXECUTION_ATTRIBUTES = frozenset({"_fn", "_factory"})
 
 
 def _with_factory(gate: Gate, factory: GateFactory) -> Gate:
@@ -37,14 +38,25 @@ def _slot_storage_name(owner: type[object], slot_name: str) -> str:
     return slot_name
 
 
-def _clone_wrapper(gate: Gate) -> Gate:
-    """Shallow-clone a gate wrapper without constructors or copy hooks."""
-    clone = object.__new__(type(gate))
-    source_dict = object.__getattribute__(gate, "__dict__")
-    clone_dict = object.__getattribute__(clone, "__dict__")
-    clone_dict.update(source_dict)
+def _copy_wrapper_state(
+    source: Gate,
+    target: Gate,
+    *,
+    preserve_target: frozenset[str] = frozenset(),
+) -> None:
+    """Copy wrapper state without invoking constructors, setters, or hooks."""
+    source_dict = object.__getattribute__(source, "__dict__")
+    target_dict = object.__getattribute__(target, "__dict__")
+    for name in tuple(target_dict):
+        if name not in preserve_target:
+            del target_dict[name]
+    target_dict.update(
+        (name, value)
+        for name, value in source_dict.items()
+        if name not in preserve_target
+    )
 
-    for owner in type(gate).__mro__:
+    for owner in type(source).__mro__:
         declared_slots = owner.__dict__.get("__slots__", ())
         if isinstance(declared_slots, str):
             declared_slots = (declared_slots,)
@@ -52,11 +64,23 @@ def _clone_wrapper(gate: Gate) -> Gate:
             if declared_name in ("__dict__", "__weakref__"):
                 continue
             storage_name = _slot_storage_name(owner, declared_name)
-            try:
-                value = object.__getattribute__(gate, storage_name)
-            except AttributeError:
+            if storage_name in preserve_target:
                 continue
-            object.__setattr__(clone, storage_name, value)
+            try:
+                value = object.__getattribute__(source, storage_name)
+            except AttributeError:
+                try:
+                    object.__delattr__(target, storage_name)
+                except AttributeError:
+                    pass
+                continue
+            object.__setattr__(target, storage_name, value)
+
+
+def _clone_wrapper(gate: Gate) -> Gate:
+    """Shallow-clone a gate wrapper without constructors or copy hooks."""
+    clone = object.__new__(type(gate))
+    _copy_wrapper_state(gate, clone)
 
     return clone
 
@@ -96,16 +120,20 @@ class Gate:
     def fork(self) -> Gate:
         """Return a fresh gate wrapper, including fresh built-in gate state.
 
-        The wrapper is shallow-cloned without invoking subclass constructors or
-        copy hooks, preserving subclass behavior, instance dictionaries, and
-        slots. Caller-owned mutable values remain shared rather than deep-cloned.
+        Raw wrappers are shallow-cloned without invoking subclass constructors
+        or copy hooks. Factory-backed gates rebuild through their originating
+        class, then receive the source wrapper's runtime dictionary and slots.
+        Caller-owned mutable values remain shared rather than deep-cloned.
         """
-        forked = _clone_wrapper(self)
         if self._factory is not None:
             rebuilt = self._factory()
-            forked._fn = rebuilt._fn
-            forked._factory = rebuilt._factory
-        return forked
+            _copy_wrapper_state(
+                self,
+                rebuilt,
+                preserve_target=_EXECUTION_ATTRIBUTES,
+            )
+            return rebuilt
+        return _clone_wrapper(self)
 
     def __rshift__(self, other: Gate) -> Gate:
         """Chain gates: signal flows through self, then other."""
@@ -223,7 +251,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.rate_limit(max_per_second, name=name),
+            lambda: cls.rate_limit(max_per_second, name=name),
         )
 
     @classmethod
@@ -251,7 +279,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.deduplicate(window, name=name),
+            lambda: cls.deduplicate(window, name=name),
         )
 
     @classmethod
@@ -299,7 +327,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.retry(
+            lambda: cls.retry(
                 gate.fork(),
                 max_attempts=max_attempts,
                 delay=delay,
@@ -376,7 +404,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.circuit_breaker(
+            lambda: cls.circuit_breaker(
                 gate.fork(),
                 failure_threshold=failure_threshold,
                 recovery_timeout=recovery_timeout,
@@ -398,7 +426,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.timeout(gate.fork(), seconds=seconds, name=name),
+            lambda: cls.timeout(gate.fork(), seconds=seconds, name=name),
         )
 
     @classmethod
@@ -439,7 +467,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.when(
+            lambda: cls.when(
                 condition,
                 then.fork(),
                 otherwise.fork() if otherwise is not None else None,
@@ -491,7 +519,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.throttle(max_per_second, name=name),
+            lambda: cls.throttle(max_per_second, name=name),
         )
 
     @classmethod
@@ -591,7 +619,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.batch(size, timeout=timeout, name=name),
+            lambda: cls.batch(size, timeout=timeout, name=name),
         )
 
     @classmethod
@@ -652,7 +680,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.parallel(
+            lambda: cls.parallel(
                 *(gate.fork() for gate in gate_list), mode=mode, name=name
             ),
         )
@@ -687,7 +715,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.fallback(
+            lambda: cls.fallback(
                 all_gates[0].fork(),
                 *(gate.fork() for gate in all_gates[1:]),
                 name=name,
@@ -727,7 +755,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.debounce(seconds, name=name),
+            lambda: cls.debounce(seconds, name=name),
         )
 
     @classmethod
@@ -780,7 +808,7 @@ class Gate:
 
         return _with_factory(
             cls(fn, name=name),
-            lambda: Gate.window(
+            lambda: cls.window(
                 seconds, min_signals=min_signals, name=name
             ),
         )
