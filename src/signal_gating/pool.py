@@ -40,8 +40,10 @@ class AgentPool:
     """An elastic pool of identical agents for horizontal scaling.
 
     Each worker in the pool shares the same handler and gate configuration
-    but maintains independent state. Signals are distributed across workers
-    using configurable strategies (round-robin or least-loaded).
+    but gets a fresh gate wrapper and independent state for built-in gates and
+    compositions. Mutable closure state in a caller-provided raw ``Gate(fn)``
+    remains owned by that callable and is shared across workers. Signals are
+    distributed using configurable strategies (round-robin or least-loaded).
 
     The pool integrates with Mesh as a first-class primitive:
         - ``mesh.add_pool(pool)`` adds all workers
@@ -112,7 +114,7 @@ class AgentPool:
         index = next(self._name_counter)
         worker = Agent(
             name=f"{self.name}[{index}]",
-            gates=list(self._gates),
+            gates=[gate.fork() for gate in self._gates],
             buffer_size=self._buffer_size,
             max_restarts=self._max_restarts,
             restart_delay=self._restart_delay,

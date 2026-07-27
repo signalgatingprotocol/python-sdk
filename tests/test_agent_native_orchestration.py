@@ -275,6 +275,99 @@ class TestMeshCallTool:
             result = await mesh.call_tool(worker, "multiply", a=6, b=7)
             assert result == 42
 
+    async def test_async_tool_receives_detached_native_containers(self):
+        worker = Agent("worker")
+        calls: list[ToolCallSignal] = []
+        responses: list[ToolResultSignal] = []
+
+        @worker.tool(description="Mutate a structured payload")
+        async def mutate(
+            payload: dict[str, object],
+            rows: list[object],
+        ) -> dict[str, object]:
+            assert type(payload) is dict
+            assert type(payload["nested"]) is dict
+            nested = payload["nested"]
+            assert isinstance(nested, dict)
+            assert type(nested["values"]) is list
+            assert type(rows) is list
+            assert type(rows[0]) is dict
+
+            values = nested["values"]
+            assert isinstance(values, list)
+            values.append(3)
+            first_row = rows[0]
+            assert isinstance(first_row, dict)
+            first_row["status"] = "processed"
+            return {"payload": payload, "rows": rows}
+
+        mesh = Mesh([worker])
+
+        def capture(signal: Signal, _source: str, _target: str) -> Signal:
+            if isinstance(signal, ToolCallSignal):
+                calls.append(signal)
+            elif isinstance(signal, ToolResultSignal):
+                responses.append(signal)
+            return signal
+
+        mesh.intercept(capture)
+        payload = {"nested": {"values": [1, 2]}}
+        rows = [{"id": 7}]
+
+        async with mesh:
+            result = await mesh.call_tool(
+                worker,
+                "mutate",
+                payload=payload,
+                rows=rows,
+            )
+
+        assert payload == {"nested": {"values": [1, 2]}}
+        assert rows == [{"id": 7}]
+        assert calls[0].arguments == {
+            "payload": {"nested": {"values": [1, 2]}},
+            "rows": [{"id": 7}],
+        }
+        assert type(result) is dict
+        assert type(result["payload"]) is dict
+        assert type(result["payload"]["nested"]) is dict
+        assert type(result["payload"]["nested"]["values"]) is list
+        assert type(result["rows"]) is list
+        assert type(result["rows"][0]) is dict
+
+        result["payload"]["nested"]["values"].append(4)
+        result["rows"][0]["status"] = "changed"
+        assert responses[0].result == {
+            "payload": {"nested": {"values": [1, 2, 3]}},
+            "rows": [{"id": 7, "status": "processed"}],
+        }
+
+    async def test_sync_tool_receives_and_returns_detached_native_containers(self):
+        worker = Agent("worker")
+
+        @worker.tool(description="Mutate a structured payload synchronously")
+        def mutate(payload: dict[str, object]) -> list[object]:
+            assert type(payload) is dict
+            assert type(payload["items"]) is list
+            items = payload["items"]
+            assert isinstance(items, list)
+            items.append({"id": 2})
+            return [payload]
+
+        mesh = Mesh([worker])
+        payload = {"items": [{"id": 1}]}
+
+        async with mesh:
+            result = await mesh.call_tool(worker, "mutate", payload=payload)
+
+        assert payload == {"items": [{"id": 1}]}
+        assert type(result) is list
+        assert type(result[0]) is dict
+        assert type(result[0]["items"]) is list
+        assert type(result[0]["items"][0]) is dict
+        result[0]["items"].append({"id": 3})
+        assert result == [{"items": [{"id": 1}, {"id": 2}, {"id": 3}]}]
+
     async def test_call_tool_error_raises(self):
         worker = Agent("worker")
 

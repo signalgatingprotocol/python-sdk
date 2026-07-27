@@ -385,6 +385,25 @@ async def test_agent_request_timeout():
     await agent.stop()
 
 
+async def test_agent_request_timeout_bounds_blocked_outbox_and_cleans_pending() -> None:
+    agent = Agent("requester")
+
+    async def blocked(_signal: Signal) -> None:
+        await asyncio.Event().wait()
+
+    agent._add_output(blocked)
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            agent.request(Signal(), timeout=0.02),
+            timeout=0.20,
+        )
+
+    assert asyncio.get_running_loop().time() - started < 0.10
+    assert agent._pending_requests == {}
+
+
 async def test_agent_reply_without_correlation():
     agent = Agent("replier")
     emitted: list[Signal] = []

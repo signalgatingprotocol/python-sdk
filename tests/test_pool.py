@@ -63,6 +63,511 @@ class TestPoolCreation:
         for worker in pool.workers:
             assert len(worker.gates) == 1
 
+    async def test_pool_workers_have_independent_builtin_gate_state(self):
+        pool = AgentPool("workers", size=2, gates=[Gate.throttle(1)])
+        received: list[str] = []
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext) -> None:
+            received.append(ctx.agent_name)
+
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        async with mesh:
+            await pool.workers[0].inbox.send(TaskSignal(task="a"))
+            await pool.workers[1].inbox.send(TaskSignal(task="b"))
+            await mesh.wait_idle()
+
+        assert sorted(received) == ["workers[0]", "workers[1]"]
+        assert pool.workers[0].gates[0] is not pool.workers[1].gates[0]
+
+    async def test_pool_workers_have_independent_deduplicate_state(self):
+        pool = AgentPool("workers", size=2, gates=[Gate.deduplicate()])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="same")) is not None
+        assert await right.process(TaskSignal(task="same")) is not None
+
+    async def test_pool_workers_have_independent_rate_limit_state(self, monkeypatch):
+        sleep_delays: list[float] = []
+
+        async def record_sleep(delay: float) -> None:
+            sleep_delays.append(delay)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        monkeypatch.setattr("signal_gating.gate.asyncio.sleep", record_sleep)
+        pool = AgentPool("workers", size=2, gates=[Gate.rate_limit(1)])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left")) is not None
+        assert await right.process(TaskSignal(task="right")) is not None
+        assert sleep_delays == []
+
+    async def test_pool_workers_have_independent_batch_state(self):
+        pool = AgentPool("workers", size=2, gates=[Gate.batch(2)])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left-1")) is None
+        assert await right.process(TaskSignal(task="right-1")) is None
+        left_batch = await left.process(TaskSignal(task="left-2"))
+        right_batch = await right.process(TaskSignal(task="right-2"))
+
+        assert left_batch is not None
+        assert left_batch.metadata["batch_size"] == 2
+        assert right_batch is not None
+        assert right_batch.metadata["batch_size"] == 2
+
+    async def test_pool_workers_have_independent_debounce_state(self):
+        pool = AgentPool("workers", size=2, gates=[Gate.debounce(0.01)])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        results = await asyncio.gather(
+            left.process(TaskSignal(task="left")),
+            right.process(TaskSignal(task="right")),
+        )
+
+        assert all(result is not None for result in results)
+
+    async def test_pool_workers_have_independent_window_state(self):
+        pool = AgentPool(
+            "workers", size=2, gates=[Gate.window(seconds=60, min_signals=2)]
+        )
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left-1")) is None
+        assert await right.process(TaskSignal(task="right-1")) is None
+        left_window = await left.process(TaskSignal(task="left-2"))
+        right_window = await right.process(TaskSignal(task="right-2"))
+
+        assert left_window is not None
+        assert left_window.metadata["window_size"] == 2
+        assert right_window is not None
+        assert right_window.metadata["window_size"] == 2
+
+    async def test_pool_workers_have_independent_circuit_breaker_state(self):
+        calls = 0
+
+        async def reject(signal: Signal) -> None:
+            nonlocal calls
+            calls += 1
+            return None
+
+        pool = AgentPool(
+            "workers",
+            size=2,
+            gates=[
+                Gate.circuit_breaker(
+                    Gate(reject), failure_threshold=1, recovery_timeout=60
+                )
+            ],
+        )
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left")) is None
+        assert await right.process(TaskSignal(task="right")) is None
+        assert calls == 2
+
+    @pytest.mark.parametrize(
+        "build_gate",
+        [
+            pytest.param(
+                lambda: Gate.throttle(1) >> Gate.passthrough(), id="chain"
+            ),
+            pytest.param(lambda: Gate.throttle(1) | Gate.block(), id="either"),
+            pytest.param(
+                lambda: Gate.throttle(1) & Gate.passthrough(), id="both"
+            ),
+            pytest.param(
+                lambda: Gate.retry(Gate.throttle(1), max_attempts=1), id="retry"
+            ),
+            pytest.param(
+                lambda: Gate.timeout(Gate.throttle(1), seconds=1), id="timeout"
+            ),
+            pytest.param(
+                lambda: Gate.when(lambda signal: True, Gate.throttle(1)),
+                id="when",
+            ),
+            pytest.param(
+                lambda: Gate.parallel(
+                    Gate.throttle(1), Gate.passthrough(), mode="all"
+                ),
+                id="parallel",
+            ),
+            pytest.param(
+                lambda: Gate.fallback(Gate.throttle(1), Gate.block()),
+                id="fallback",
+            ),
+        ],
+    )
+    async def test_pool_workers_fork_nested_builtin_gate_state(self, build_gate):
+        pool = AgentPool("workers", size=2, gates=[build_gate()])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="left")) is not None
+        assert await right.process(TaskSignal(task="right")) is not None
+
+    async def test_pool_workers_fork_inverted_builtin_gate_state(self):
+        pool = AgentPool("workers", size=2, gates=[~Gate.deduplicate()])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert await left.process(TaskSignal(task="same")) is None
+        assert await right.process(TaskSignal(task="same")) is None
+
+    async def test_pool_workers_share_caller_owned_callable_state(self):
+        calls = 0
+
+        def first_only(signal: Signal) -> Signal | None:
+            nonlocal calls
+            calls += 1
+            return signal if calls == 1 else None
+
+        configured_gate = Gate(first_only, name="caller-owned")
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        left, right = (worker.gates[0] for worker in pool.workers)
+
+        assert left is not configured_gate
+        assert right is not configured_gate
+        assert left is not right
+        assert left.name == "caller-owned"
+        assert await left.process(TaskSignal(task="left")) is not None
+        assert await right.process(TaskSignal(task="right")) is None
+        assert calls == 2
+
+    async def test_pool_fork_preserves_custom_gate_subclass_behavior(self):
+        class RejectingGate(Gate):
+            async def process(self, signal: Signal) -> None:
+                return None
+
+        configured_gate = RejectingGate(lambda signal: signal, name="rejecting")
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+
+        for worker in pool.workers:
+            forked = worker.gates[0]
+            assert forked is not configured_gate
+            assert isinstance(forked, RejectingGate)
+            assert await forked.process(TaskSignal(task="blocked")) is None
+
+    def test_gate_fork_ignores_untrustworthy_subclass_copy_hook(self):
+        class SelfCopyGate(Gate):
+            def __copy__(self):
+                return self
+
+        configured_gate = SelfCopyGate(lambda signal: signal, name="self-copy")
+        first_fork = configured_gate.fork()
+        second_fork = configured_gate.fork()
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        wrappers = [
+            configured_gate,
+            first_fork,
+            second_fork,
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        assert len({id(gate) for gate in wrappers}) == len(wrappers)
+        assert all(isinstance(gate, SelfCopyGate) for gate in wrappers)
+
+    async def test_stateful_subclass_forks_preserve_slotted_runtime_policy(self):
+        class PolicyThrottle(Gate):
+            __slots__ = ("policy",)
+
+            def __init__(self, fn, name=""):
+                super().__init__(fn, name)
+                self.policy = "deny"
+
+            async def process(self, signal: Signal) -> Signal | None:
+                if self.policy != "allow":
+                    return None
+                return await super().process(signal)
+
+        configured_gate = PolicyThrottle.throttle(1)
+        configured_gate.name = "policy-throttle"
+        configured_gate.policy = "allow"
+        first_fork = configured_gate.fork()
+        second_fork = configured_gate.fork()
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            first_fork,
+            second_fork,
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        assert len({id(gate) for gate in forks}) == len(forks)
+        assert all(isinstance(gate, PolicyThrottle) for gate in forks)
+        assert [gate.policy for gate in forks] == ["allow"] * len(forks)
+        assert [gate.name for gate in forks] == ["policy-throttle"] * len(forks)
+
+        assert await configured_gate.process(TaskSignal(task="configured")) is not None
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    async def test_stateful_forks_preserve_legacy_constructor_fn_wrapper(self):
+        audited_tasks: list[str] = []
+
+        class AuditedThrottle(Gate):
+            def __init__(self, fn, name=""):
+                async def audited(signal: TaskSignal) -> Signal | None:
+                    audited_tasks.append(signal.task)
+                    return await fn(signal)
+
+                super().__init__(audited, name)
+
+        configured_gate = AuditedThrottle.throttle(1)
+        first_fork = configured_gate.fork()
+        second_fork = configured_gate.fork()
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            first_fork,
+            second_fork,
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        for index, gate in enumerate(forks):
+            assert isinstance(gate, AuditedThrottle)
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+        assert audited_tasks == [
+            task
+            for index in range(len(forks))
+            for task in (f"first-{index}", f"second-{index}")
+        ]
+
+    async def test_stateful_forks_preserve_overridden_factory_decoration(self):
+        decorated_tasks: list[str] = []
+
+        class DecoratedThrottle(Gate):
+            @classmethod
+            def throttle(cls, max_per_second, name="throttle"):
+                gate = super().throttle(max_per_second, name=name)
+                builtin_fn = gate._fn
+
+                async def decorated(signal: TaskSignal) -> Signal | None:
+                    decorated_tasks.append(signal.task)
+                    return await builtin_fn(signal)
+
+                gate._fn = decorated
+                return gate
+
+        configured_gate = DecoratedThrottle.throttle(1)
+        first_fork = configured_gate.fork()
+        second_fork = configured_gate.fork()
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            first_fork,
+            second_fork,
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        for index, gate in enumerate(forks):
+            assert isinstance(gate, DecoratedThrottle)
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+        assert decorated_tasks == [
+            task
+            for index in range(len(forks))
+            for task in (f"first-{index}", f"second-{index}")
+        ]
+
+    async def test_stateful_forks_preserve_fresh_dict_executor(self, monkeypatch):
+        class ExecutorThrottle(Gate):
+            def __init__(self, fn, name=""):
+                super().__init__(fn, name)
+                self.executor = fn
+
+            async def process(self, signal: Signal) -> Signal | None:
+                return await self.executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = ExecutorThrottle.throttle(1)
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            configured_gate.fork(),
+            configured_gate.fork(),
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        assert len({id(gate) for gate in forks}) == len(forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    async def test_stateful_forks_preserve_fresh_slotted_executor(self, monkeypatch):
+        class SlottedExecutorThrottle(Gate):
+            __slots__ = ("executor",)
+
+            def __init__(self, fn, name=""):
+                super().__init__(fn, name)
+                self.executor = fn
+
+            async def process(self, signal: Signal) -> Signal | None:
+                return await self.executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = SlottedExecutorThrottle.throttle(1)
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks = [
+            configured_gate.fork(),
+            configured_gate.fork(),
+            *(worker.gates[0] for worker in pool.workers),
+        ]
+
+        assert len({id(gate) for gate in forks}) == len(forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    async def test_stateful_forks_do_not_restore_absent_dict_executor(
+        self, monkeypatch
+    ):
+        builds = 0
+
+        class OptionalExecutorThrottle(Gate):
+            def __init__(self, fn, name=""):
+                nonlocal builds
+                super().__init__(fn, name)
+                builds += 1
+                if builds == 1:
+                    self.executor = fn
+
+            async def process(self, signal: Signal) -> Signal | None:
+                executor = getattr(self, "executor", self._fn)
+                return await executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = OptionalExecutorThrottle.throttle(1)
+        forks = [configured_gate.fork(), configured_gate.fork()]
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks.extend(worker.gates[0] for worker in pool.workers)
+
+        assert all(not hasattr(gate, "executor") for gate in forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    async def test_stateful_forks_do_not_restore_absent_slotted_executor(
+        self, monkeypatch
+    ):
+        builds = 0
+
+        class OptionalSlottedExecutorThrottle(Gate):
+            __slots__ = ("executor",)
+
+            def __init__(self, fn, name=""):
+                nonlocal builds
+                super().__init__(fn, name)
+                builds += 1
+                if builds == 1:
+                    self.executor = fn
+
+            async def process(self, signal: Signal) -> Signal | None:
+                executor = getattr(self, "executor", self._fn)
+                return await executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = OptionalSlottedExecutorThrottle.throttle(1)
+        forks = [configured_gate.fork(), configured_gate.fork()]
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks.extend(worker.gates[0] for worker in pool.workers)
+
+        assert all(not hasattr(gate, "executor") for gate in forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    async def test_stateful_forks_preserve_rebuilt_none_executor(self, monkeypatch):
+        builds = 0
+
+        class OptionalExecutorThrottle(Gate):
+            def __init__(self, fn, name=""):
+                nonlocal builds
+                super().__init__(fn, name)
+                builds += 1
+                self.executor = fn if builds == 1 else None
+
+            async def process(self, signal: Signal) -> Signal | None:
+                executor = self.executor if callable(self.executor) else self._fn
+                return await executor(signal)
+
+        monkeypatch.setattr("signal_gating.gate.time.monotonic", lambda: 100.0)
+        configured_gate = OptionalExecutorThrottle.throttle(1)
+        forks = [configured_gate.fork(), configured_gate.fork()]
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+        forks.extend(worker.gates[0] for worker in pool.workers)
+
+        assert all(gate.executor is None for gate in forks)
+        for index, gate in enumerate(forks):
+            assert await gate.process(TaskSignal(task=f"first-{index}")) is not None
+            assert await gate.process(TaskSignal(task=f"second-{index}")) is None
+
+    @pytest.mark.parametrize(
+        "build_gate",
+        [
+            pytest.param(lambda cls: cls.rate_limit(1000), id="rate-limit"),
+            pytest.param(lambda cls: cls.deduplicate(), id="deduplicate"),
+            pytest.param(
+                lambda cls: cls.retry(Gate.passthrough(), max_attempts=1),
+                id="retry",
+            ),
+            pytest.param(
+                lambda cls: cls.circuit_breaker(Gate.passthrough()),
+                id="circuit-breaker",
+            ),
+            pytest.param(
+                lambda cls: cls.timeout(Gate.passthrough(), seconds=1),
+                id="timeout",
+            ),
+            pytest.param(
+                lambda cls: cls.when(lambda signal: True, Gate.passthrough()),
+                id="when",
+            ),
+            pytest.param(lambda cls: cls.throttle(1000), id="throttle"),
+            pytest.param(lambda cls: cls.batch(1), id="batch"),
+            pytest.param(
+                lambda cls: cls.parallel(Gate.passthrough()), id="parallel"
+            ),
+            pytest.param(
+                lambda cls: cls.fallback(Gate.passthrough()), id="fallback"
+            ),
+            pytest.param(lambda cls: cls.debounce(0), id="debounce"),
+            pytest.param(lambda cls: cls.window(1), id="window"),
+        ],
+    )
+    def test_builtin_gate_factories_support_legacy_subclass_constructor(
+        self, build_gate
+    ):
+        class LegacyConstructorGate(Gate):
+            def __init__(self, fn, name=""):
+                super().__init__(fn, name)
+
+        configured_gate = build_gate(LegacyConstructorGate)
+        forked = configured_gate.fork()
+
+        assert isinstance(configured_gate, LegacyConstructorGate)
+        assert isinstance(forked, LegacyConstructorGate)
+        assert forked is not configured_gate
+
+    @pytest.mark.parametrize(
+        "build_gate",
+        [
+            pytest.param(lambda: Gate.throttle(1), id="built-in"),
+            pytest.param(
+                lambda: Gate.throttle(1) >> Gate.passthrough(), id="composite"
+            ),
+        ],
+    )
+    def test_pool_forks_preserve_reassigned_public_gate_name(self, build_gate):
+        configured_gate = build_gate()
+        configured_gate.name = "renamed-by-caller"
+
+        pool = AgentPool("workers", size=2, gates=[configured_gate])
+
+        assert [worker.gates[0].name for worker in pool.workers] == [
+            "renamed-by-caller",
+            "renamed-by-caller",
+        ]
+
     def test_pool_with_priority_inbox(self):
         pool = AgentPool("workers", size=2, priority_inbox=True)
         for worker in pool.workers:
@@ -295,6 +800,29 @@ class TestPoolMeshIntegration:
 
 
 class TestPoolScaling:
+    async def test_scaled_worker_gets_fresh_builtin_gate_state(self):
+        pool = AgentPool("workers", size=1, gates=[Gate.throttle(1)])
+        received: list[str] = []
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal, ctx: AgentContext) -> None:
+            received.append(ctx.agent_name)
+
+        mesh = Mesh()
+        mesh.add_pool(pool)
+        original = pool.workers[0]
+
+        async with mesh:
+            await original.inbox.send(TaskSignal(task="original"))
+            await mesh.wait_idle()
+            added = await mesh.scale_pool(pool, 2)
+            assert len(added) == 1
+            await added[0].inbox.send(TaskSignal(task="scaled"))
+            await mesh.wait_idle()
+
+        assert received == ["workers[0]", "workers[1]"]
+        assert added[0].gates[0] is not original.gates[0]
+
     def test_unattached_pool_discard_removes_worker(self):
         pool = AgentPool("workers", size=2)
 
