@@ -25,6 +25,83 @@ class ResultSignal(Signal):
     result: str
 
 
+class TestPoolDisconnection:
+    async def test_disconnect_agent_to_pool_removes_route_and_policy(self):
+        source = Agent("source")
+        pool = AgentPool("workers", size=2)
+        received: list[str] = []
+
+        @pool.on(TaskSignal)
+        async def handle(signal: TaskSignal):
+            received.append(signal.task)
+
+        mesh = Mesh([source])
+        mesh.add_pool(pool)
+        mesh.connect(source, pool)
+
+        async with mesh:
+            await source.emit(TaskSignal(task="before"))
+            await mesh.wait_idle()
+            assert mesh.disconnect(source, pool) == 1
+            await source.emit(TaskSignal(task="after"))
+            await mesh.wait_idle()
+
+        assert received == ["before"]
+        assert mesh.disconnect(source, pool) == 0
+
+    async def test_disconnect_pool_to_agent_survives_source_scaling(self):
+        pool = AgentPool("workers", size=1)
+        target = Agent("target")
+        received: list[str] = []
+
+        @target.on(TaskSignal)
+        async def handle(signal: TaskSignal):
+            received.append(signal.task)
+
+        mesh = Mesh([target])
+        mesh.add_pool(pool)
+        mesh.connect(pool, target)
+        assert mesh.disconnect("workers", "target") == 1
+        await mesh.scale_pool(pool, 3)
+
+        async with mesh:
+            for worker in pool.workers:
+                await worker.emit(TaskSignal(task=worker.name))
+            await mesh.wait_idle()
+
+        assert received == []
+
+    async def test_disconnect_pool_to_pool_isolated_and_reconnects_once(self):
+        sources = AgentPool("sources", size=2)
+        targets = AgentPool("targets", size=2)
+        audit = Agent("audit")
+        received: list[str] = []
+        audited: list[str] = []
+
+        @targets.on(TaskSignal)
+        async def handle(signal: TaskSignal):
+            received.append(signal.task)
+
+        @audit.on(TaskSignal)
+        async def handle_audit(signal: TaskSignal):
+            audited.append(signal.task)
+
+        mesh = Mesh([audit])
+        mesh.add_pool(sources)
+        mesh.add_pool(targets)
+        mesh.connect(sources, targets)
+        mesh.connect(sources, audit)
+        assert mesh.disconnect("sources", targets) == 1
+        mesh.connect(sources, targets)
+
+        async with mesh:
+            await sources.workers[0].emit(TaskSignal(task="one"))
+            await mesh.wait_idle()
+
+        assert received == ["one"]
+        assert audited == ["one"]
+
+
 # === Pool Creation ===
 
 
