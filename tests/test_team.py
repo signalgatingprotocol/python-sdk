@@ -87,6 +87,63 @@ async def test_crash_releases_task_and_peer_recovers():
     assert crasher.dead_letters.count >= 1
 
 
+async def test_delivery_failure_releases_task_without_killing_steward():
+    worker = make_worker("worker")
+    mesh = Mesh([worker])
+    team = Team("t", mesh, task_timeout=0.2)
+    team.enroll(worker)
+
+    async with mesh:
+        await team.start()
+        await worker.stop()
+        released = asyncio.Event()
+        team.board.on_event(
+            lambda event: released.set()
+            if event.wire_type() == "sgp.task.released"
+            else None
+        )
+        task_id = await team.open("recover me")
+        await asyncio.wait_for(released.wait(), timeout=1.0)
+
+        assert team.board.task(task_id).status == "pending"
+        release = team.board.events[-1]
+        assert release.reason == "request_error:ChannelClosed"
+        steward = team._stewards["worker"]
+        assert steward.runner is not None
+        assert not steward.runner.done()
+        assert steward.current is None
+        await team.dissolve()
+
+
+async def test_board_event_during_idle_notification_is_not_lost():
+    lead, worker = Agent("lead"), make_worker("worker")
+    idle_entered = asyncio.Event()
+    release_idle = asyncio.Event()
+
+    async def block_idle(signal, _source, _target):
+        if isinstance(signal, MemberIdle):
+            idle_entered.set()
+            await release_idle.wait()
+        return signal
+
+    mesh = Mesh([lead, worker])
+    mesh.intercept(block_idle)
+    team = Team("t", mesh)
+    team.lead(lead)
+    team.enroll(worker)
+
+    async with mesh:
+        async with team:
+            first = await team.open("first")
+            await drained(team.board)
+            assert team.board.task(first).status == "completed"
+            await asyncio.wait_for(idle_entered.wait(), timeout=1.0)
+            second = await team.open("second")
+            release_idle.set()
+            await drained(team.board)
+            assert team.board.task(second).status == "completed"
+
+
 async def test_member_idle_reaches_lead_edge_triggered():
     lead, worker = Agent("lead"), make_worker("w")
     idles: list[str] = []

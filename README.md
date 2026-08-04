@@ -41,7 +41,7 @@ pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/p
 
 ```python
 import asyncio
-from signal_gating import Signal, Gate, Agent, Mesh
+from signal_gating.core import Agent, Gate, Mesh, Signal
 
 class TaskSignal(Signal):
     task: str
@@ -69,6 +69,27 @@ A clean `async with mesh` exit waits for queued and in-flight work, including
 signals emitted to downstream agents. To wait while keeping the mesh open, use
 `await mesh.wait_idle(timeout=10)`; a timeout identifies the agents that are
 still busy instead of silently dropping work.
+
+## Stable core
+
+Production integrations should import the compatibility-focused API from
+`signal_gating.core`:
+
+```python
+from signal_gating.core import (
+    Agent,
+    Gate,
+    Mesh,
+    MeshEvent,
+    Receipt,
+    Signal,
+    TrajectoryRecorder,
+)
+```
+
+Package-root imports remain compatible throughout `0.1.x`. Pools, teams,
+scripts, LLM helpers, task boards, and improvement loops are alpha modules;
+their APIs may change before `1.0`.
 
 ## Core Primitives
 
@@ -788,13 +809,17 @@ one-shot step chain. See `examples/scripted_workflow.py`.
 ## Architecture
 
 ```
-Signal -> [Gate >> Gate >> Gate] -> Agent -> [Gate] -> Agent -> ...
-              Pipeline                  Edge (Mesh)
+Experimental orchestration
+(pools, teams, scripts, LLM helpers, task boards, improvement loops)
+                              |
+                              v
+Stable core: Signal -> [Gate >> Gate >> Gate] -> Agent -> [Gate] -> Agent
+                          Pipeline                  Edge (Mesh)
 
-Mesh: Agent --(gate)--> Agent --(gate)--> Agent
-        |                                    ^
-        +----------(gate)-------------------+
-                   fan-out / fan-in
+             Mesh: Agent --(gate)--> Agent --(gate)--> Agent
+                     |                                    ^
+                     +----------(gate)-------------------+
+                                fan-out / fan-in
 ```
 
 ## Development

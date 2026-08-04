@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, TypeVar, get_type_hints
 from uuid import uuid4
 
+from signal_gating._immutable import deep_thaw
 from signal_gating.channel import Channel, PriorityChannel
 from signal_gating.errors import AgentError
 from signal_gating.gate import Gate
@@ -527,9 +528,13 @@ class Agent:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Signal] = loop.create_future()
         self._pending_requests[cid] = future
-        try:
+
+        async def operation() -> Signal:
             await self.emit(request_signal)
-            return await asyncio.wait_for(future, timeout=timeout)
+            return await future
+
+        try:
+            return await asyncio.wait_for(operation(), timeout=timeout)
         finally:
             self._pending_requests.pop(cid, None)
 
@@ -961,7 +966,8 @@ class Agent:
                             error=f"Unknown tool: {signal.tool_name}",
                         ))
                         return
-                    validation_error = _validate_tool_arguments(tool, signal.arguments)
+                    arguments: dict[str, Any] = deep_thaw(signal.arguments)
+                    validation_error = _validate_tool_arguments(tool, arguments)
                     if validation_error:
                         await ctx.reply(ToolResultSignal(
                             tool_name=signal.tool_name,
@@ -970,10 +976,10 @@ class Agent:
                         return
                     try:
                         if inspect.iscoroutinefunction(tool.fn):
-                            result = await tool.fn(**signal.arguments)
+                            result = await tool.fn(**arguments)
                         else:
                             result = await asyncio.to_thread(
-                                tool.fn, **signal.arguments
+                                tool.fn, **arguments
                             )
                             # Async callable objects are not always recognized by
                             # iscoroutinefunction; preserve support for those.

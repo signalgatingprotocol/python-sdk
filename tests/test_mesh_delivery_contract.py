@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from collections.abc import Callable
 
 import pytest
@@ -24,6 +25,13 @@ from signal_gating.errors import ChannelClosed, MeshError
 
 class Message(Signal):
     value: int = 0
+
+
+async def never_returns(
+    signal: Signal, _source: str, _target: str
+) -> Signal:
+    await asyncio.Event().wait()
+    return signal
 
 
 def reply_with_value(agent: Agent, value: int, *, delay: float = 0.0) -> None:
@@ -207,6 +215,24 @@ async def test_request_send_block_fails_without_leaking_capture() -> None:
     assert worker._outbox == []
 
 
+async def test_request_timeout_bounds_interceptor_and_removes_capture() -> None:
+    worker = Agent("worker")
+    mesh = Mesh([worker])
+    mesh.intercept(never_returns)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.request(worker, Message(value=1), timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert worker._outbox == []
+
+
 async def test_request_response_block_fails_without_timeout_or_capture_leak() -> None:
     worker = Agent("worker")
     reply_with_value(worker, 2)
@@ -270,6 +296,112 @@ async def test_scatter_response_block_fails_immediately_and_cleans_captures() ->
     assert second._outbox == []
 
 
+async def test_scatter_timeout_bounds_dispatch_and_removes_captures() -> None:
+    workers = [Agent("worker-a"), Agent("worker-b")]
+    mesh = Mesh(workers)
+    mesh.intercept(never_returns)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.scatter(Message(value=1), workers, timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert all(worker._outbox == [] for worker in workers)
+
+
+async def test_scatter_timeout_bounds_blocked_event_sink_and_removes_captures() -> None:
+    workers = [Agent("worker-a"), Agent("worker-b")]
+    mesh = Mesh(workers)
+
+    async def blocked_timeout_sink(event: MeshEvent) -> None:
+        if event.action == "scatter_timeout":
+            await asyncio.Event().wait()
+
+    mesh.record(blocked_timeout_sink)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.scatter(Message(value=1), workers, timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert all(worker._outbox == [] for worker in workers)
+
+
+async def test_scatter_timeout_observes_failed_future_sink_without_warning() -> None:
+    workers = [Agent("worker-a"), Agent("worker-b")]
+    mesh = Mesh(workers)
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+
+    def failed_timeout_sink(event: MeshEvent) -> asyncio.Future[None] | None:
+        if event.action != "scatter_timeout":
+            return None
+        future: asyncio.Future[None] = loop.create_future()
+        future.set_exception(RuntimeError("timeout sink failed"))
+        return future
+
+    mesh.record(failed_timeout_sink)
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        async with mesh:
+            with pytest.raises(asyncio.TimeoutError):
+                await mesh.scatter(Message(value=1), workers, timeout=0.02)
+        await asyncio.sleep(0)
+        gc.collect()
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert mesh.event_sink_errors == 1
+    assert unhandled == []
+    assert all(worker._outbox == [] for worker in workers)
+
+
+async def test_scatter_timeout_disposes_custom_awaitable_sink_without_delay() -> None:
+    class DisposableAwaitable:
+        def __init__(self) -> None:
+            self.disposed = False
+
+        def __await__(self):
+            while True:
+                yield
+
+        def close(self) -> None:
+            self.disposed = True
+
+    workers = [Agent("worker-a"), Agent("worker-b")]
+    mesh = Mesh(workers)
+    awaitable = DisposableAwaitable()
+
+    def custom_timeout_sink(event: MeshEvent) -> DisposableAwaitable | None:
+        return awaitable if event.action == "scatter_timeout" else None
+
+    mesh.record(custom_timeout_sink)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.scatter(Message(value=1), workers, timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert awaitable.disposed is True
+    assert all(worker._outbox == [] for worker in workers)
+
+
 async def test_race_skips_blocked_send_when_an_allowed_target_replies() -> None:
     blocked, allowed = Agent("blocked"), Agent("allowed")
     reply_with_value(blocked, 1)
@@ -288,6 +420,24 @@ async def test_race_skips_blocked_send_when_an_allowed_target_replies() -> None:
     assert result.value == 2
     assert blocked._outbox == []
     assert allowed._outbox == []
+
+
+async def test_race_timeout_bounds_dispatch_and_removes_captures() -> None:
+    workers = [Agent("worker-a"), Agent("worker-b")]
+    mesh = Mesh(workers)
+    mesh.intercept(never_returns)
+
+    async with mesh:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mesh.race(Message(value=1), workers, timeout=0.02),
+                timeout=0.20,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.10
+    assert all(worker._outbox == [] for worker in workers)
 
 
 async def test_race_skips_blocked_response_when_another_response_is_allowed() -> None:
