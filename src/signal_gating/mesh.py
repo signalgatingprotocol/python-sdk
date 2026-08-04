@@ -32,10 +32,18 @@ _DeliveryReleaseFn = Callable[[], None]
 class Edge:
     """A directional connection between two agents, optionally gated."""
 
-    def __init__(self, source: Agent, target: Agent, gate: Gate | None = None):
+    def __init__(
+        self,
+        source: Agent,
+        target: Agent,
+        gate: Gate | None = None,
+        *,
+        tag: str = "connect",
+    ):
         self.source = source
         self.target = target
         self.gate = gate
+        self.tag = tag
 
 
 @dataclass
@@ -68,6 +76,7 @@ class _PoolConnection:
     source: Agent | AgentPool
     target: Agent | AgentPool
     gate: Gate | None = None
+    route_tag: str = field(default_factory=lambda: f"pool_connect:{uuid4().hex}")
 
 
 class _PublishDestinationClosedError(Exception):
@@ -234,17 +243,55 @@ class Mesh:
         ]
         del self._agents[resolved.name]
 
-    def disconnect(self, source: Agent | str, target: Agent | str) -> int:
-        """Remove all edges between source and target. Returns count removed.
+    def disconnect(
+        self,
+        source: Agent | str | AgentPool,
+        target: Agent | str | AgentPool,
+    ) -> int:
+        """Remove all logical connections between two endpoints.
 
         Enables runtime topology rewiring. Agents can be reconnected
-        to different targets without restarting the mesh.
+        to different targets without restarting the mesh. Pool endpoints are
+        disconnected as one logical route, including every current worker,
+        and the policy is removed so future workers do not inherit it.
 
         This removes both the edge records AND the actual routing functions,
-        so signals genuinely stop flowing between the disconnected agents.
+        so signals genuinely stop flowing between the disconnected endpoints.
+        Returns the number of logical connections removed.
         """
-        src = self._resolve(source)
-        tgt_name = self._resolve(target).name
+        from signal_gating.pool import AgentPool
+
+        resolved_src = self._resolve_pool_or_agent(source)
+        resolved_tgt = self._resolve_pool_or_agent(target)
+
+        if isinstance(resolved_src, AgentPool) or isinstance(resolved_tgt, AgentPool):
+            matched = [
+                connection
+                for connection in self._pool_connections
+                if connection.source is resolved_src and connection.target is resolved_tgt
+            ]
+            if not matched:
+                return 0
+
+            tags = {connection.route_tag for connection in matched}
+            self._pool_connections = [
+                connection
+                for connection in self._pool_connections
+                if connection.route_tag not in tags
+            ]
+            sources = (
+                resolved_src.workers
+                if isinstance(resolved_src, AgentPool)
+                else [resolved_src]
+            )
+            for agent in sources:
+                for tag in tags:
+                    agent._remove_outputs(tag=tag)
+            self._edges = [edge for edge in self._edges if edge.tag not in tags]
+            return len(matched)
+
+        src = resolved_src
+        tgt_name = resolved_tgt.name
         before = len(self._edges)
         self._edges = [
             e for e in self._edges
@@ -972,7 +1019,12 @@ class Mesh:
                     self._wire_pool_source_worker(connection, worker)
             else:
                 assert isinstance(resolved_tgt, AgentPool)
-                self._connect_to_pool(resolved_src, resolved_tgt, gate)
+                self._connect_to_pool(
+                    resolved_src,
+                    resolved_tgt,
+                    gate,
+                    tag=connection.route_tag,
+                )
             return
 
         # Standard agent-to-agent
@@ -989,15 +1041,27 @@ class Mesh:
         from signal_gating.pool import AgentPool
 
         if isinstance(connection.target, AgentPool):
-            self._connect_to_pool(worker, connection.target, connection.gate)
+            self._connect_to_pool(
+                worker,
+                connection.target,
+                connection.gate,
+                tag=connection.route_tag,
+            )
         else:
-            self._connect_agents(worker, connection.target, connection.gate)
+            self._connect_agents(
+                worker,
+                connection.target,
+                connection.gate,
+                tag=connection.route_tag,
+            )
 
     def _connect_to_pool(
         self,
         src: Agent,
         pool: AgentPool,
         gate: Gate | None = None,
+        *,
+        tag: str = "pool_connect",
     ) -> None:
         """Route each signal to a worker selected from current membership."""
         mesh = self
@@ -1025,7 +1089,7 @@ class Mesh:
                 fn=route,
                 source=src.name,
                 target=pool.name,
-                tag="pool_connect",
+                tag=tag,
             )
         )
 
@@ -1062,9 +1126,11 @@ class Mesh:
         src: Agent,
         tgt: Agent,
         gate: Gate | None = None,
+        *,
+        tag: str = "connect",
     ) -> None:
         """Internal: wire two agents together."""
-        edge = Edge(src, tgt, gate)
+        edge = Edge(src, tgt, gate, tag=tag)
         self._edges.append(edge)
         mesh = self
 
@@ -1082,7 +1148,7 @@ class Mesh:
             )
 
         src._add_output(
-            RouteFn(fn=route, source=src.name, target=tgt.name, tag="connect")
+            RouteFn(fn=route, source=src.name, target=tgt.name, tag=tag)
         )
 
     # --- Pub/Sub Topics ---
