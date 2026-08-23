@@ -42,4 +42,4 @@ jobs:
       - name: Smoke-test built wheel
         run: |
           python -m pip install --force-reinstall dist/*.whl
-          python -c "import signal_gating; assert signal_gating.__version__ == '0.1.0'"
+          python scripts/check_release_version.py
