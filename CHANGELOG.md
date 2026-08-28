@@ -8,7 +8,7 @@ documented stable core may still change during the `0.x` series.
 
 No user-visible changes yet.
 
-## 0.1.0 - release candidate
+## 0.1.0 - 2026-08-28
 
 The first public alpha establishes the SDK's signal-routing model and a stable
 integration surface for early adopters.
