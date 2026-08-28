@@ -14,10 +14,10 @@ controls which signals flow through an agent system and records what happened.
 ## Install
 
 The first PyPI release has not been published yet. Install the current alpha
-directly from GitHub:
+from the verified commit used for the `0.1.0` release candidate:
 
 ```bash
-pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk"
+pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@d541e249dec3e7f85e7657d08d7da7e631da85f7"
 ```
 
 After the first release, the stable install command will be
@@ -26,16 +26,17 @@ After the first release, the stable install command will be
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@d541e249dec3e7f85e7657d08d7da7e631da85f7"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk"
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@d541e249dec3e7f85e7657d08d7da7e631da85f7"
 ```
 
-> Alpha: the API surface is still moving. Pin a commit SHA for reproducible use.
+The pinned commit makes installs reproducible. See [CHANGELOG.md](CHANGELOG.md)
+for the release-candidate scope and stability notes.
 
 ## Quick Start
 
