@@ -45,6 +45,7 @@ otel = [
 ]
 
 [project.urls]
+Changelog = "https://github.com/signalgatingprotocol/python-sdk/blob/main/CHANGELOG.md"
 Documentation = "https://signalgatingprotocol.github.io"
 Repository = "https://github.com/signalgatingprotocol/python-sdk"
 Issues = "https://github.com/signalgatingprotocol/python-sdk/issues"
