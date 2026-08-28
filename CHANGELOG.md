@@ -23,8 +23,9 @@ integration surface for early adopters.
 - Trajectory recording and replay, durable recovery, agent pools, teams,
   taskboards, scripted workflows, and focused improvement loops.
 - Optional OpenAI-compatible LLM agents and OpenTelemetry export integrations.
-- A deterministic incident-triage example that demonstrates 75% context
-  reduction while preserving every unique critical incident in its fixture.
+- A deterministic incident-triage example that demonstrates 75% handler-load
+  reduction while preserving every unique critical incident in its fixture,
+  runnable from an installed package with `signal-gating-demo`.
 
 ### Stability
 
