@@ -43,3 +43,4 @@ jobs:
         run: |
           python -m pip install --force-reinstall dist/*.whl
           python scripts/check_release_version.py
+          signal-gating-demo

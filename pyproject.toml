@@ -29,6 +29,9 @@ dependencies = [
     "pydantic>=2.0",
 ]
 
+[project.scripts]
+signal-gating-demo = "signal_gating.demo:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
