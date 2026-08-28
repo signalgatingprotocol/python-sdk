@@ -17,7 +17,7 @@ The first PyPI release has not been published yet. Install the current alpha
 from the verified commit used for the `0.1.0` release candidate:
 
 ```bash
-pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@d541e249dec3e7f85e7657d08d7da7e631da85f7"
+pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@b6bd41e729716c6589eabe8cd8292349bbdadfdb"
 ```
 
 After the first release, the stable install command will be
@@ -26,13 +26,13 @@ After the first release, the stable install command will be
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@d541e249dec3e7f85e7657d08d7da7e631da85f7"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@b6bd41e729716c6589eabe8cd8292349bbdadfdb"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@d541e249dec3e7f85e7657d08d7da7e631da85f7"
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@b6bd41e729716c6589eabe8cd8292349bbdadfdb"
 ```
 
 The pinned commit makes installs reproducible. See [CHANGELOG.md](CHANGELOG.md)
@@ -71,29 +71,32 @@ signals emitted to downstream agents. To wait while keeping the mesh open, use
 `await mesh.wait_idle(timeout=10)`; a timeout identifies the agents that are
 still busy instead of silently dropping work.
 
-## Measure the value
+## Run a measurable demo
 
-Run the deterministic incident-triage scenario to see the gates make a
-measurable decision instead of only reading an API example:
+After installation, run the deterministic incident-triage scenario from any
+directory:
 
 ```bash
-python examples/incident_triage.py
+signal-gating-demo
 ```
 
 ```text
 signals_in=12
 signals_admitted=3
-context_reduction=75.0%
+handler_load_reduction=75.0%
 priority_drops=6
 duplicate_drops=3
 critical_incidents_preserved=3/3
+result=PASS
 ```
 
-The scenario sends six low-priority alerts and two copies of three critical
-incidents through real `by_priority` and `deduplicate` gates. It derives each
-drop count from SDK trace spans and verifies that every unique critical
-incident reaches the handler. The fixture is intentionally small and exact; it
-is a behavioral proof, not a throughput benchmark.
+The scenario sends six low-priority alerts and two exact copies of three
+critical incidents through real `by_priority` and `deduplicate` gates. It
+derives each drop count from SDK trace spans and records 75% fewer handler
+invocations than the ungated 12-alert baseline while preserving all three
+unique critical incidents. `PASS` requires every expected fixture metric to
+match. The fixture is intentionally small and exact; it is a behavioral proof,
+not a throughput, token, latency, or cost benchmark.
 
 ## Stable core
 
