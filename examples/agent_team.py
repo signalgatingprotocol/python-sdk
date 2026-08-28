@@ -84,4 +84,5 @@ async def main():
     print(f"\nLedger head digest: {team.board.head_digest}")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
