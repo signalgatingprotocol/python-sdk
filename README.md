@@ -70,6 +70,30 @@ signals emitted to downstream agents. To wait while keeping the mesh open, use
 `await mesh.wait_idle(timeout=10)`; a timeout identifies the agents that are
 still busy instead of silently dropping work.
 
+## Measure the value
+
+Run the deterministic incident-triage scenario to see the gates make a
+measurable decision instead of only reading an API example:
+
+```bash
+python examples/incident_triage.py
+```
+
+```text
+signals_in=12
+signals_admitted=3
+context_reduction=75.0%
+priority_drops=6
+duplicate_drops=3
+critical_incidents_preserved=3/3
+```
+
+The scenario sends six low-priority alerts and two copies of three critical
+incidents through real `by_priority` and `deduplicate` gates. It derives each
+drop count from SDK trace spans and verifies that every unique critical
+incident reaches the handler. The fixture is intentionally small and exact; it
+is a behavioral proof, not a throughput benchmark.
+
 ## Stable core
 
 Production integrations should import the compatibility-focused API from
