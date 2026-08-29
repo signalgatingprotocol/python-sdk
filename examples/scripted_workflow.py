@@ -92,4 +92,5 @@ async def main():
     print("Rerun this script: completed steps replay from sweep-checkpoints.jsonl.")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
