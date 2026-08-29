@@ -268,6 +268,10 @@ class PriorityChannel(Generic[T]):
             raise ChannelClosed()
         self._validate_type(signal)
         async with self._lock:
+            # The channel may close while this sender is waiting to acquire
+            # the lock. Recheck at the mutation boundary so close is final.
+            if self._closed:
+                raise ChannelClosed()
             if self._max_size and len(self._heap) >= self._max_size:
                 raise ChannelFull()
             # Negate priority for max-heap behavior (heapq is a min-heap)
