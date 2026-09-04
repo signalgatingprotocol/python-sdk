@@ -6,7 +6,10 @@ documented stable core may still change during the `0.x` series.
 
 ## Unreleased
 
-No user-visible changes yet.
+### Fixed
+
+- Dead-letter replay now retains the failed signal and all later signals when
+  a destination rejects delivery, so a partial replay cannot discard work.
 
 ## 0.1.0 - 2026-08-28
 

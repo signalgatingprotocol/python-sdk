@@ -235,7 +235,9 @@ await worker.stop()
 await worker.start()  # Fresh inbox, preserved state and handlers
 ```
 
-**Supervision**: agents auto-restart on failure with exponential backoff:
+**Supervision**: if an agent's processing loop crashes, supervision restarts it
+with exponential backoff. Handler exceptions are caught, sent to the dead-letter
+queue, and processing continues without consuming the restart budget:
 
 ```python
 worker = Agent("worker", max_restarts=5, restart_delay=1.0)
@@ -458,10 +460,13 @@ cancellation must stop the underlying operation.
 Ordered gate chains:
 
 ```python
+from signal_gating import Gate, Pipeline, Signal
+
+signal = Signal(priority=5)
 pipeline = Pipeline([
     Gate.by_priority(3),
     Gate.deduplicate(window=30),
-    Gate.transform(enrich),
+    Gate.transform(lambda item: item.with_metadata(enriched=True)),
 ])
 result = await pipeline.process(signal)
 ```
@@ -471,13 +476,16 @@ result = await pipeline.process(signal)
 Async typed conduits with backpressure and priority ordering:
 
 ```python
+from signal_gating import Channel, PriorityChannel, Signal
+
+signal = Signal(priority=5)
+
 # Standard FIFO channel with backpressure
 channel = Channel(Signal, buffer_size=100)
 await channel.send(signal)        # Raises ChannelFull if full
 await channel.send_wait(signal)   # Blocks until space is available
 
 # Priority channel: highest priority dequeued first
-from signal_gating import PriorityChannel
 channel = PriorityChannel(Signal, buffer_size=1000)
 ```
 
@@ -703,7 +711,10 @@ actor, sign or HMAC the file with a key the verifier holds out of band.
 
 A trajectory is more than readable: its signal-carrying receipts are
 **reconstructable**. Each receipt stores the full signal wire envelope, so a run
-persisted to disk reloads as verifiable receipts and exact typed signals.
+persisted to disk reloads as verifiable receipts and exact typed signals. In a
+fresh process, import the modules that define your signal subclasses before
+replay so their wire names are registered; strict replay raises
+`UnknownSignalType` for an unregistered type.
 
 ```python
 reloaded = TrajectoryRecorder()
@@ -742,7 +753,8 @@ structured `intercepted` and `edge_rejected` receipts for blocked attempts.
 A protocol that only lives inside one process is a library. Signals serialize to
 a self-describing JSON envelope and reconstruct as their **original subclass** —
 the foundation for persistence, durable replay, and crossing process or network
-boundaries. Subclasses register themselves automatically; no boilerplate:
+boundaries. Subclasses register themselves automatically when their defining
+module is imported; no manual registration boilerplate:
 
 ```python
 class TaskSignal(Signal):

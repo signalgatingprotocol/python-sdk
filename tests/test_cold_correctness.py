@@ -12,7 +12,15 @@ import asyncio
 
 import pytest
 
-from signal_gating import Agent, AgentContext, Channel, Gate, Mesh, Signal
+from signal_gating import (
+    Agent,
+    AgentContext,
+    Channel,
+    Gate,
+    Mesh,
+    PriorityChannel,
+    Signal,
+)
 from signal_gating.errors import ChannelClosed
 
 
@@ -79,6 +87,22 @@ async def test_channel_close_is_idempotent():
     ch.close()
     ch.close()  # must not raise
     assert ch.closed
+
+
+async def test_priority_channel_send_waiting_for_lock_cannot_cross_close():
+    """A send already queued on the internal lock must still observe close."""
+    ch: PriorityChannel[Ping] = PriorityChannel(Ping, buffer_size=1)
+
+    await ch._lock.acquire()
+    send = asyncio.create_task(ch.send(Ping(n=1)))
+    await asyncio.sleep(0)  # let send block after its initial closed check
+
+    ch.close()
+    ch._lock.release()
+
+    with pytest.raises(ChannelClosed):
+        await send
+    assert ch.pending == 0
 
 
 # --- Agent: restart contract.
