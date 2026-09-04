@@ -4,7 +4,16 @@ import asyncio
 
 import pytest
 
-from signal_gating import Agent, AgentContext, Gate, Mesh, Signal
+from signal_gating import (
+    Agent,
+    AgentContext,
+    Channel,
+    ChannelFull,
+    DeadLetterQueue,
+    Gate,
+    Mesh,
+    Signal,
+)
 
 
 class TaskSignal(Signal):
@@ -237,6 +246,46 @@ async def test_dead_letter_queue_on_handler_error():
     entry = agent.dead_letters.entries[0]
     assert entry["reason"] == "handler_error"
     assert "ValueError: boom" in entry["error"]
+
+
+async def test_dead_letter_replay_retains_signals_not_accepted_by_channel():
+    queue = DeadLetterQueue()
+    first = Signal(priority=1)
+    second = Signal(priority=2)
+    queue.add(first, "failed")
+    queue.add(second, "failed")
+    channel: Channel[Signal] = Channel(Signal, buffer_size=1)
+
+    with pytest.raises(ChannelFull):
+        await queue.replay(channel)
+
+    assert channel.try_receive() is first
+    assert queue.count == 1
+    assert queue.signals == [second]
+    assert await queue.replay(channel) == 1
+    assert channel.try_receive() is second
+    assert queue.count == 0
+
+
+async def test_dead_letter_replay_retains_signal_when_cancelled_before_delivery():
+    started = asyncio.Event()
+
+    class BlockingChannel(Channel[Signal]):
+        async def send(self, signal: Signal) -> None:
+            started.set()
+            await asyncio.Future()
+
+    queue = DeadLetterQueue()
+    signal = Signal()
+    queue.add(signal, "failed")
+    replay = asyncio.create_task(queue.replay(BlockingChannel(Signal)))
+    await started.wait()
+
+    replay.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await replay
+
+    assert queue.signals == [signal]
 
 
 # --- New: Stats include errors and dead letters ---

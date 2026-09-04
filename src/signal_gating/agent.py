@@ -225,12 +225,24 @@ class DeadLetterQueue:
         This is the agent-native recovery pattern: when signals fail,
         fix the issue, then replay them without losing any work.
 
+        A signal is removed only after the destination accepts it. If replay
+        is interrupted by backpressure, closure, or cancellation, the failed
+        signal and everything after it remain available for another attempt.
+
         Returns the number of signals replayed.
         """
-        signals = self.drain()
-        for signal in signals:
-            await channel.send(signal)
-        return len(signals)
+        signals = tuple(self._signals)
+        replayed = 0
+        try:
+            for signal in signals:
+                await channel.send(signal)
+                replayed += 1
+        finally:
+            # Keep entries and signals aligned, including when send() raises.
+            if replayed:
+                del self._entries[:replayed]
+                del self._signals[:replayed]
+        return replayed
 
     def to_jsonl(self, path: str | Path) -> int:
         """Persist the dead-lettered signals, with failure context, as JSON Lines.
