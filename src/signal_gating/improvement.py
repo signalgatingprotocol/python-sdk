@@ -693,7 +693,6 @@ class ImprovementHistory:
         removed = len(original) - len(retained)
         if removed == 0:
             return 0
-        self._records = retained
         payload, head = _encode_history(retained)
         if self._path is not None:
             temporary = self._path.with_name(
@@ -711,6 +710,9 @@ class ImprovementHistory:
                     temporary.unlink()
                 except FileNotFoundError:
                     pass
+        # Publish the retained records only after persistence succeeds. A
+        # failed rewrite must leave memory aligned with the existing chain.
+        self._records = retained
         self._head_digest = head
         return removed
 
