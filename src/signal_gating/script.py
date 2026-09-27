@@ -123,7 +123,11 @@ class ScriptContext:
         timeout: float = 30.0,
     ) -> list[Signal]:
         """Round-robin signals across targets under the concurrency semaphore;
-        results in input order. One target is serial by construction."""
+        results in input order. One target is serial by construction.
+
+        If a step fails, completed checkpoints remain, but unfinished sibling
+        requests are cancelled and joined before the failure is propagated.
+        """
         if not targets:
             raise ValueError("fan_out requires at least one target")
         names = [t if isinstance(t, str) else t.name for t in targets]
@@ -131,11 +135,17 @@ class ScriptContext:
             (self._key(signal), names[i % len(names)], signal)
             for i, signal in enumerate(signals)
         ]
-        return list(
-            await asyncio.gather(
-                *(self._execute(k, name, s, timeout) for k, name, s in steps)
-            )
-        )
+        tasks = [
+            asyncio.create_task(self._execute(k, name, s, timeout))
+            for k, name, s in steps
+        ]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def spawn(
         self,

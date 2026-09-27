@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from signal_gating import Agent, AgentContext, Mesh, Signal
-from signal_gating.errors import BudgetExceeded, SignalSerializationError
+from signal_gating.errors import BudgetExceeded, MeshError, SignalSerializationError
 from signal_gating.script import CheckpointStore, Script, step_key
 
 
@@ -124,6 +124,46 @@ async def test_fan_out_respects_concurrency_and_order():
         out = await Script("s", mesh, flow, max_concurrency=2).run()
     assert out == [str(n) for n in range(8)]     # input order preserved
     assert peak <= 2
+
+
+async def test_failed_fan_out_does_not_checkpoint_unfinished_siblings(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    waiting = Agent("waiting")
+    blocked = Agent("blocked")
+
+    @waiting.on(Ping)
+    async def handle(signal: Ping, ctx: AgentContext):
+        started.set()
+        await release.wait()
+        await ctx.reply(Pong(text=signal.text))
+
+    async def intercept(signal: Signal, source: str, target: str):
+        if isinstance(signal, Ping) and signal.text == "fail":
+            await started.wait()
+            return None
+        return signal
+
+    async def flow(ctx):
+        async with ctx.phase("scan"):
+            return await ctx.fan_out(
+                ["waiting", "blocked"],
+                [Ping(text="slow"), Ping(text="fail")],
+            )
+
+    path = tmp_path / "cp.jsonl"
+    mesh = Mesh([waiting, blocked])
+    mesh.intercept(intercept)
+    async with mesh:
+        try:
+            with pytest.raises(MeshError, match="request_sent"):
+                await Script("s", mesh, flow, store=CheckpointStore(path)).run()
+        finally:
+            release.set()
+        await mesh.wait_idle(timeout=2)
+        await asyncio.sleep(0)
+
+    assert len(CheckpointStore(path)) == 0
 
 
 async def test_budget_exceeded_keeps_checkpoints(tmp_path):
