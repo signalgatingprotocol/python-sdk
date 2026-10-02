@@ -841,6 +841,11 @@ script = Script("sweep", mesh, audit, max_concurrency=16,
 report = await script.run(args={...})   # rerun after interruption -> resumes
 ```
 
+If one `fan_out` step fails, unfinished sibling requests are cancelled before
+the error returns; completed checkpoints remain available for resume. A
+request already delivered to an agent may still have external side effects,
+so handlers must be safe to retry when that matters.
+
 `ctx.spawn(factory, signal)` runs ephemeral agents — added, started, asked one
 checkpointed request, then removed — so a script can use dozens of agents
 without preregistering them. Unrelated to `mesh.workflow()`, which is a

@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from signal_gating import Agent, AgentContext, Mesh, Signal
-from signal_gating.errors import BudgetExceeded, SignalSerializationError
+from signal_gating.errors import BudgetExceeded, MeshError, SignalSerializationError
 from signal_gating.script import CheckpointStore, Script, step_key
 
 
@@ -124,6 +124,110 @@ async def test_fan_out_respects_concurrency_and_order():
         out = await Script("s", mesh, flow, max_concurrency=2).run()
     assert out == [str(n) for n in range(8)]     # input order preserved
     assert peak <= 2
+
+
+async def test_failed_fan_out_does_not_checkpoint_unfinished_siblings(tmp_path):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    waiting = Agent("waiting")
+    blocked = Agent("blocked")
+
+    @waiting.on(Ping)
+    async def handle(signal: Ping, ctx: AgentContext):
+        started.set()
+        await release.wait()
+        await ctx.reply(Pong(text=signal.text))
+
+    async def intercept(signal: Signal, source: str, target: str):
+        if isinstance(signal, Ping) and signal.text == "fail":
+            await started.wait()
+            return None
+        return signal
+
+    async def flow(ctx):
+        async with ctx.phase("scan"):
+            return await ctx.fan_out(
+                ["waiting", "blocked"],
+                [Ping(text="slow"), Ping(text="fail")],
+            )
+
+    path = tmp_path / "cp.jsonl"
+    mesh = Mesh([waiting, blocked])
+    mesh.intercept(intercept)
+    async with mesh:
+        try:
+            with pytest.raises(MeshError, match="request_sent"):
+                await Script("s", mesh, flow, store=CheckpointStore(path)).run()
+        finally:
+            release.set()
+        await mesh.wait_idle(timeout=2)
+        await asyncio.sleep(0)
+
+    assert len(CheckpointStore(path)) == 0
+
+
+@pytest.mark.parametrize("failure", [True, False], ids=["step-failure", "caller-cancellation"])
+async def test_fan_out_finishes_cleanup_despite_repeated_cancellation(tmp_path, failure):
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    propagated_errors = []
+
+    async def intercept(signal: Signal, source: str, target: str):
+        if isinstance(signal, Ping) and signal.text == "slow":
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                cleanup_finished.set()
+        if isinstance(signal, Ping) and signal.text == "fail":
+            await started.wait()
+            return None
+        return signal
+
+    async def flow(ctx):
+        async with ctx.phase("scan"):
+            signals = [Ping(text="slow")]
+            if failure:
+                signals.append(Ping(text="fail"))
+            try:
+                return await ctx.fan_out(["waiting", "blocked"], signals)
+            except BaseException as error:
+                propagated_errors.append(error)
+                raise
+
+    path = tmp_path / "cp.jsonl"
+    mesh = Mesh([Agent("waiting"), Agent("blocked")])
+    mesh.intercept(intercept)
+    async with mesh:
+        pending = asyncio.create_task(Script("s", mesh, flow, store=CheckpointStore(path)).run())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=2)
+            if not failure:
+                pending.cancel("initial cancellation")
+            await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+            pending.cancel("repeated cancellation")
+            await asyncio.sleep(0)
+            pending.cancel("repeated cancellation")
+            await asyncio.sleep(0)
+            assert not pending.done()
+        finally:
+            release_cleanup.set()
+        error = MeshError if failure else asyncio.CancelledError
+        message = "request_sent" if failure else "initial cancellation"
+        with pytest.raises(error):
+            await asyncio.wait_for(pending, timeout=2)
+        # Check at the SDK boundary: Python 3.10 can drop a cancellation's
+        # message when a different task awaits the cancelled task.
+        assert len(propagated_errors) == 1
+        assert message in str(propagated_errors[0])
+        assert cleanup_finished.is_set()
+        assert len(mesh.get("waiting")._outbox) == 0
+
+    assert len(CheckpointStore(path)) == 0
 
 
 async def test_budget_exceeded_keeps_checkpoints(tmp_path):

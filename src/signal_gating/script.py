@@ -123,7 +123,11 @@ class ScriptContext:
         timeout: float = 30.0,
     ) -> list[Signal]:
         """Round-robin signals across targets under the concurrency semaphore;
-        results in input order. One target is serial by construction."""
+        results in input order. One target is serial by construction.
+
+        If a step fails, completed checkpoints remain, but unfinished sibling
+        requests are cancelled and joined before the failure is propagated.
+        """
         if not targets:
             raise ValueError("fan_out requires at least one target")
         names = [t if isinstance(t, str) else t.name for t in targets]
@@ -131,11 +135,28 @@ class ScriptContext:
             (self._key(signal), names[i % len(names)], signal)
             for i, signal in enumerate(signals)
         ]
-        return list(
-            await asyncio.gather(
-                *(self._execute(k, name, s, timeout) for k, name, s in steps)
-            )
-        )
+        tasks = [
+            asyncio.create_task(self._execute(k, name, s, timeout))
+            for k, name, s in steps
+        ]
+        results = asyncio.gather(*tasks)
+        try:
+            # Own cancellation so repeated caller cancellation cannot interrupt
+            # a request's asynchronous cleanup by cancelling its task again.
+            return list(await asyncio.shield(results))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            cleanup = asyncio.gather(*tasks, return_exceptions=True)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
+            # Retrieve the original gather's outcome even if its shield was
+            # cancelled before gather finished; preserve the original error.
+            results.exception()
+            raise
 
     async def spawn(
         self,
