@@ -172,6 +172,7 @@ async def test_fan_out_finishes_cleanup_despite_repeated_cancellation(tmp_path, 
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
     cleanup_finished = asyncio.Event()
+    propagated_errors = []
 
     async def intercept(signal: Signal, source: str, target: str):
         if isinstance(signal, Ping) and signal.text == "slow":
@@ -192,7 +193,11 @@ async def test_fan_out_finishes_cleanup_despite_repeated_cancellation(tmp_path, 
             signals = [Ping(text="slow")]
             if failure:
                 signals.append(Ping(text="fail"))
-            return await ctx.fan_out(["waiting", "blocked"], signals)
+            try:
+                return await ctx.fan_out(["waiting", "blocked"], signals)
+            except BaseException as error:
+                propagated_errors.append(error)
+                raise
 
     path = tmp_path / "cp.jsonl"
     mesh = Mesh([Agent("waiting"), Agent("blocked")])
@@ -213,8 +218,12 @@ async def test_fan_out_finishes_cleanup_despite_repeated_cancellation(tmp_path, 
             release_cleanup.set()
         error = MeshError if failure else asyncio.CancelledError
         message = "request_sent" if failure else "initial cancellation"
-        with pytest.raises(error, match=message):
+        with pytest.raises(error):
             await asyncio.wait_for(pending, timeout=2)
+        # Check at the SDK boundary: Python 3.10 can drop a cancellation's
+        # message when a different task awaits the cancelled task.
+        assert len(propagated_errors) == 1
+        assert message in str(propagated_errors[0])
         assert cleanup_finished.is_set()
         assert len(mesh.get("waiting")._outbox) == 0
 
