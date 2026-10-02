@@ -139,12 +139,23 @@ class ScriptContext:
             asyncio.create_task(self._execute(k, name, s, timeout))
             for k, name, s in steps
         ]
+        results = asyncio.gather(*tasks)
         try:
-            return list(await asyncio.gather(*tasks))
+            # Own cancellation so repeated caller cancellation cannot interrupt
+            # a request's asynchronous cleanup by cancelling its task again.
+            return list(await asyncio.shield(results))
         except BaseException:
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            cleanup = asyncio.gather(*tasks, return_exceptions=True)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    pass
+            # Retrieve the original gather's outcome even if its shield was
+            # cancelled before gather finished; preserve the original error.
+            results.exception()
             raise
 
     async def spawn(
