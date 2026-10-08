@@ -98,6 +98,22 @@ unique critical incidents. `PASS` requires every expected fixture metric to
 match. The fixture is intentionally small and exact; it is a behavioral proof,
 not a throughput, token, latency, or cost benchmark.
 
+## Decision-model gating
+
+Use a decision model for ambiguous work admission while SGP enforces the policy
+and traces the route. A new source-checkout example runs without credentials:
+
+```bash
+python examples/decision_gating.py
+```
+
+It exercises priority bypass, uncertain judgments, provider failure, and a
+traced rejection. An explicit `--live` option calls Jev on synthetic alerts;
+the default fixture makes no network calls. See the
+[integration and comparison guide](docs/decision-gating.md). The fixture
+establishes policy behavior; model quality, calibration, and savings require
+a separate live evaluation.
+
 ## Stable core
 
 Production integrations should import the compatibility-focused API from
@@ -879,3 +895,4 @@ mypy src/
 ## License
 
 Apache 2.0
+
