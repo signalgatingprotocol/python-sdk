@@ -9,7 +9,7 @@ import pytest
 
 @pytest.mark.parametrize(
     "filename",
-    ["agent_team.py", "scripted_workflow.py"],
+    ["agent_team.py", "scripted_workflow.py", "decision_gating.py"],
 )
 def test_workflow_examples_do_not_run_when_loaded_as_modules(
     filename: str,
@@ -36,3 +36,4 @@ def test_workflow_examples_do_not_run_when_loaded_as_modules(
     assert result.stdout == ""
     assert result.stderr == ""
     assert list(tmp_path.iterdir()) == []
+
