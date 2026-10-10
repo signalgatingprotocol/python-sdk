@@ -6,6 +6,26 @@ documented stable core may still change during the `0.x` series.
 
 ## Unreleased
 
+### Added
+
+- Fail-closed tool authorization (`signal_gating.security`): per-tool risk
+  classification (READ / DRAFT / SEND / DESTRUCTIVE, UNKNOWN gates as
+  DESTRUCTIVE), a default-deny policy engine with approver callbacks,
+  append-only audit trails, and dry-run mode. `PolicyEngine.as_gate()`
+  wires enforcement directly into SGP gate composition.
+- MCP annotation distrust (`audit_tool`, `scan_source`): verifies server
+  self-declared hints against observed behavior; fails tools that lie.
+- Policy as code (`signal_gating.policy`): declarative YAML policies with
+  first-match-wins rules, versioning, and dry-run validation.
+- Agent Skills compatibility (`signal_gating.skills`): export and load
+  skills per the open standard, with risk classification on install.
+  Ships the `sgp-control` skill.
+- Executable attack scenarios (`docs/attack-scenarios.md`): five documented
+  attack classes, all blocked by default policy (5/5 verified).
+- Benchmarks: 2.3us p50 gating overhead per evaluation; 5/5 attack block rate.
+- `ToolSpec.risk` field and `risk=` parameter on `Agent.tool()`: explicit
+  risk declarations at registration time; undeclared tools default to UNKNOWN.
+
 ### Fixed
 
 - Dead-letter replay now retains the failed signal and all later signals when
