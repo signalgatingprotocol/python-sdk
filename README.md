@@ -114,6 +114,58 @@ the default fixture makes no network calls. See the
 establishes policy behavior; model quality, calibration, and savings require
 a separate live evaluation.
 
+## Fail-closed tool authorization
+
+Every agent framework in 2026 ships permissive tool defaults. MCP defines
+no per-tool ACL. SGP now ships the control plane they left out:
+`signal_gating.security` is a fail-closed authorization layer for
+agentic tool use.
+
+```python
+from signal_gating.security import PolicyEngine, RiskLevel, ToolRisk
+
+engine = PolicyEngine(max_auto_approve=RiskLevel.READ)
+engine.register("read_file", ToolRisk(RiskLevel.READ, ("read-like verb",), 0.9))
+
+# Wire it in as an SGP gate: every ToolCallSignal is evaluated.
+worker = Agent("worker", gates=[engine.as_gate("worker")])
+
+engine.evaluate("read_file")        # allow: READ auto-approves
+engine.evaluate("delete_database")  # deny: unknown tool, default deny
+```
+
+The two rules:
+
+1. **Unknown means DESTRUCTIVE.** Tools are classified READ / DRAFT /
+   SEND / DESTRUCTIVE. Anything unclassified gates as DESTRUCTIVE and
+   never auto-executes.
+2. **Denial is the default.** Approval is explicit, per tool, audited.
+   Every decision lands in an append-only audit trail.
+
+Also included:
+
+- **MCP annotation distrust** (`audit_tool`): servers self-declare
+  `readOnlyHint` / `destructiveHint`; the audit compares the claim
+  against statically observed behavior and fails tools that lie.
+  The Agentjacking class proved annotations are not a trust signal.
+- **Policy as code** (`signal_gating.policy`): declarative YAML
+  policies, first-match-wins rules, versioning, dry-run mode for
+  validating against production traffic before enforcing.
+- **Agent Skills compatibility** (`signal_gating.skills`): export SGP
+  tool surfaces as skills, load installed skills with risk
+  classification. Includes the `sgp-control` skill text.
+- **Executable attack scenarios** (`docs/attack-scenarios.md`):
+  prompt injection via tool output, MCP privilege escalation, data
+  exfiltration, tool squatting, unclassified auto-execution.
+  All five blocked by default policy:
+  `PYTHONPATH=src python benchmarks/bench_attack_block.py`
+- **Benchmarks**: gating overhead is 2.3us p50 per evaluation,
+  effectively free next to a 200-2000ms LLM round trip.
+
+```bash
+python examples/secure_agent.py
+```
+
 ## Stable core
 
 Production integrations should import the compatibility-focused API from
