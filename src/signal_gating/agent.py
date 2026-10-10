@@ -18,6 +18,7 @@ from signal_gating._immutable import deep_thaw
 from signal_gating.channel import Channel, PriorityChannel
 from signal_gating.errors import AgentError
 from signal_gating.gate import Gate
+from signal_gating.security.risk import RiskLevel
 from signal_gating.signal import Signal
 from signal_gating.tracing import Tracer
 
@@ -67,12 +68,18 @@ class ToolSpec:
     When an agent registers a tool, it becomes discoverable and callable by
     other agents through the mesh. Bridges signal-based communication and
     structured function calling for LLM-based agents.
+
+    The ``risk`` field classifies the tool for the fail-closed authorization
+    layer (see ``signal_gating.security``). Tools registered without an
+    explicit risk default to ``RiskLevel.UNKNOWN``, which gates as
+    DESTRUCTIVE: unclassified tools never auto-execute.
     """
 
     name: str
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
     fn: ToolFn | None = field(default=None, repr=False)
+    risk: RiskLevel = RiskLevel.UNKNOWN
     binding_id: str = field(
         default_factory=lambda: uuid4().hex,
         init=False,
@@ -885,6 +892,7 @@ class Agent:
         self,
         name: str | None = None,
         description: str = "",
+        risk: RiskLevel | None = None,
     ) -> Callable[[ToolFn], ToolFn]:
         """Register a function as a tool that other agents can discover and call.
 
@@ -909,6 +917,9 @@ class Agent:
         Args:
             name: Tool name (defaults to function name).
             description: Human-readable description of what the tool does.
+            risk: Explicit risk classification. When omitted, the tool is
+                classified as RiskLevel.UNKNOWN, which gates as DESTRUCTIVE
+                under fail-closed policy. Declare it.
 
         Returns:
             Decorator that registers the function as a tool.
@@ -947,6 +958,7 @@ class Agent:
                 description=description or (fn.__doc__ or "").strip(),
                 parameters=params,
                 fn=fn,
+                risk=risk if risk is not None else RiskLevel.UNKNOWN,
             )
             agent._tools[tool_name] = spec
 
