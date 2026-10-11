@@ -36,6 +36,11 @@ from signal_gating.security.redteam import (
     run_all,
     run_scenario,
 )
+from signal_gating.security.jev import (
+    JevRiskClassifier,
+    MIN_CONFIDENCE,
+    classify_with_jev,
+)
 from signal_gating.security.risk import (
     RiskLevel,
     ToolRisk,
@@ -51,6 +56,8 @@ __all__ = [
     "AuditReport",
     "Decision",
     "DeclaredHints",
+    "JevRiskClassifier",
+    "MIN_CONFIDENCE",
     "ObservedBehavior",
     "PolicyEngine",
     "RiskLevel",
@@ -59,6 +66,7 @@ __all__ = [
     "all_scenarios",
     "audit_tool",
     "classify_tool",
+    "classify_with_jev",
     "describe_policy",
     "effective_level",
     "evaluate",
