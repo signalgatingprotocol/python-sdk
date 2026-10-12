@@ -122,6 +122,7 @@ no per-tool ACL. SGP now ships the control plane they left out:
 agentic tool use.
 
 ```python
+from signal_gating import Agent
 from signal_gating.security import PolicyEngine, RiskLevel, ToolRisk
 
 engine = PolicyEngine(max_auto_approve=RiskLevel.READ)
