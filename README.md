@@ -17,7 +17,7 @@ The first PyPI release has not been published yet. Install the current alpha
 from the verified commit used for the `0.1.0` release candidate:
 
 ```bash
-pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@ad5bed99e3c636d3cbcaf0cb3542d2fae076de90"
+pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
 ```
 
 After the first release, the stable install command will be
@@ -26,13 +26,13 @@ After the first release, the stable install command will be
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@ad5bed99e3c636d3cbcaf0cb3542d2fae076de90"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@ad5bed99e3c636d3cbcaf0cb3542d2fae076de90"
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
 ```
 
 The pinned commit makes installs reproducible. See [CHANGELOG.md](CHANGELOG.md)
@@ -641,7 +641,7 @@ log for signal-carrying mesh events.
 OpenAI-compatible server. Install the extra:
 
 ```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
 ```
 
 ```python
