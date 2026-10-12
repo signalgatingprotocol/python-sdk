@@ -8,3 +8,12 @@ build/
 .ruff_cache/
 *.egg
 .venv/
+
+# Secrets and credentials: never commit keys or local environment files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+secrets/

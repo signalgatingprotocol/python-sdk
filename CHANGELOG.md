@@ -13,6 +13,12 @@ documented stable core may still change during the `0.x` series.
   DESTRUCTIVE), a default-deny policy engine with approver callbacks,
   append-only audit trails, and dry-run mode. `PolicyEngine.as_gate()`
   wires enforcement directly into SGP gate composition.
+- Jev risk classifier (`JevRiskClassifier`): an optional decision-model
+  classifier for tool risk. It reads `TYPESAFE_API_KEY`, returns calibrated
+  probabilities as typed results, and fails closed: below 0.7 confidence, or
+  on any error, the tool is UNKNOWN and gates as DESTRUCTIVE. It runs at
+  registration time only, never per call; `fallback_to_heuristic=True`
+  opts into the regex classifier when Jev is unreachable.
 - MCP annotation distrust (`audit_tool`, `scan_source`): verifies server
   self-declared hints against observed behavior; fails tools that lie.
 - Policy as code (`signal_gating.policy`): declarative YAML policies with
@@ -25,11 +31,17 @@ documented stable core may still change during the `0.x` series.
 - Benchmarks: 2.3us p50 gating overhead per evaluation; 5/5 attack block rate.
 - `ToolSpec.risk` field and `risk=` parameter on `Agent.tool()`: explicit
   risk declarations at registration time; undeclared tools default to UNKNOWN.
+- `SECURITY.md`: supported versions, private vulnerability reporting, and
+  the security scope of the SDK.
 
 ### Fixed
 
 - Dead-letter replay now retains the failed signal and all later signals when
   a destination rejects delivery, so a partial replay cannot discard work.
+- The security layer now passes the project's own quality gates in strict
+  mode (`ruff check .` and `mypy src/` are green on `main`), and the `dev`
+  extra includes `types-PyYAML` so the policy loader type-checks. No runtime
+  behavior changed.
 
 ## 0.1.0 - release candidate
 
