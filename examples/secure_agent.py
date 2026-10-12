@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import asyncio
 
-from signal_gating.agent import Agent, ToolCallSignal
+from signal_gating.agent import Agent
 from signal_gating.mesh import Mesh
 from signal_gating.security import (
-    Decision,
     PolicyEngine,
     RiskLevel,
     ToolRisk,

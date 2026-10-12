@@ -16,7 +16,7 @@ Unclassified tools never slip through.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 
 
@@ -62,7 +62,11 @@ class ToolRisk:
 _READ_SIGNALS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(p, re.IGNORECASE), reason)
     for p, reason in [
-        (r"\b(get|fetch|read|load|list|search|query|describe|show|view|lookup|check|validate|parse|inspect)\b", "read-like verb"),
+        (
+            r"\b(get|fetch|read|load|list|search|query|describe|show|view"
+            r"|lookup|check|validate|parse|inspect)\b",
+            "read-like verb",
+        ),
         (r"\b(readonly|read.only|immutable|pure)\b", "declared read-only"),
     ]
 )
@@ -70,7 +74,10 @@ _READ_SIGNALS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 _DESTRUCTIVE_SIGNALS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(p, re.IGNORECASE), reason)
     for p, reason in [
-        (r"\b(delete|remove|destroy|drop|purge|wipe|truncate|kill|terminate)\b", "destructive verb"),
+        (
+            r"\b(delete|remove|destroy|drop|purge|wipe|truncate|kill|terminate)\b",
+            "destructive verb",
+        ),
         (r"\b(exec|execute|eval|system|popen|subprocess|shell|spawn)\b", "code execution"),
         (r"\b(chmod|chown|sudo|su\b|setuid|privilege|escalat)\b", "privilege operation"),
         (r"\b(payment|charge|transfer|withdraw|refund|invoice|billing)\b", "money movement"),
@@ -81,7 +88,10 @@ _DESTRUCTIVE_SIGNALS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 _SEND_SIGNALS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(p, re.IGNORECASE), reason)
     for p, reason in [
-        (r"\b(send|post|publish|notify|email|sms|tweet|webhook|broadcast)\b", "outbound communication verb"),
+        (
+            r"\b(send|post|publish|notify|email|sms|tweet|webhook|broadcast)\b",
+            "outbound communication verb",
+        ),
         (r"\b(requests?\.(post|put|delete)|httpx|urllib|fetch\(|axios)\b", "network call"),
         (r"\b(slack|discord|telegram|twilio|ses|sns)\b", "messaging integration"),
     ]

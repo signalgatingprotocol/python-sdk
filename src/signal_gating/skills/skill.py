@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from signal_gating.security.risk import RiskLevel, ToolRisk, classify_tool
+from signal_gating.security.risk import RiskLevel, classify_tool
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 
@@ -142,10 +142,12 @@ def export_skill(
     return dest
 
 
-CONTROL_SKILL_MD = """---
-name: sgp-control
-description: Fail-closed tool authorization for AI agents. Use when an agent needs to call tools with risk-proportional gating.
----
+CONTROL_SKILL_MD = (
+    "---\n"
+    "name: sgp-control\n"
+    "description: Fail-closed tool authorization for AI agents. "
+    "Use when an agent needs to call tools with risk-proportional gating.\n"
+    """---
 
 # sgp-control
 
@@ -188,3 +190,4 @@ rules:
     require_approval: true
 ```
 """
+)

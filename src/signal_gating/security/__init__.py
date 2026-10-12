@@ -29,17 +29,17 @@ from signal_gating.security.enforcement import (
     PolicyEngine,
     evaluate,
 )
+from signal_gating.security.jev import (
+    MIN_CONFIDENCE,
+    JevRiskClassifier,
+    classify_with_jev,
+)
 from signal_gating.security.redteam import (
     AttackScenario,
     ScenarioResult,
     all_scenarios,
     run_all,
     run_scenario,
-)
-from signal_gating.security.jev import (
-    JevRiskClassifier,
-    MIN_CONFIDENCE,
-    classify_with_jev,
 )
 from signal_gating.security.risk import (
     RiskLevel,

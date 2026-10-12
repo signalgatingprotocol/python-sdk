@@ -13,7 +13,6 @@ but opens a socket fails the audit.
 
 from __future__ import annotations
 
-import ast
 import re
 from dataclasses import dataclass, field
 
@@ -80,14 +79,34 @@ _SOURCE_PATTERNS: tuple[tuple[re.Pattern[str], str, str], ...] = tuple(
     for p, flag, desc in [
         (r"\bopen\s*\(.{0,80}['\"]w['\"]", "writes_filesystem", "open() in write mode"),
         (r"\.\s*write\s*\(", "writes_filesystem", ".write() call"),
-        (r"\bos\s*\.\s*(remove|unlink|rmdir|makedirs|rename|replace)\b", "writes_filesystem", "os filesystem mutation"),
-        (r"\bpathlib\b.{0,40}\.(write_text|write_bytes|unlink|mkdir|rename)\b", "writes_filesystem", "pathlib mutation"),
+        (
+            r"\bos\s*\.\s*(remove|unlink|rmdir|makedirs|rename|replace)\b",
+            "writes_filesystem",
+            "os filesystem mutation",
+        ),
+        (
+            r"\bpathlib\b.{0,40}\.(write_text|write_bytes|unlink|mkdir|rename)\b",
+            "writes_filesystem",
+            "pathlib mutation",
+        ),
         (r"\bshutil\s*\.\s*(rmtree|move|copy)", "writes_filesystem", "shutil mutation"),
-        (r"\b(socket|requests|httpx|urllib|aiohttp|websocket)\b", "network_calls", "network library usage"),
-        (r"\b(subprocess|os\s*\.\s*system|os\s*\.\s*popen|Popen)\b", "subprocess_calls", "subprocess invocation"),
+        (
+            r"\b(socket|requests|httpx|urllib|aiohttp|websocket)\b",
+            "network_calls",
+            "network library usage",
+        ),
+        (
+            r"\b(subprocess|os\s*\.\s*system|os\s*\.\s*popen|Popen)\b",
+            "subprocess_calls",
+            "subprocess invocation",
+        ),
         (r"\b(eval|exec)\s*\(", "eval_or_exec", "eval/exec call"),
         (r"\b(chmod|chown|setuid|sudo)\b", "privilege_ops", "privilege operation"),
-        (r"['\"](UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE|ALTER\s+TABLE|TRUNCATE)\b", "writes_filesystem", "SQL mutation statement"),
+        (
+            r"['\"](UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE|ALTER\s+TABLE|TRUNCATE)\b",
+            "writes_filesystem",
+            "SQL mutation statement",
+        ),
         (r"\bopen\s*\(", "reads_filesystem", "open() call"),
     ]
 )

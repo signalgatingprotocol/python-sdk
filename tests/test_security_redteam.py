@@ -22,7 +22,6 @@ def test_all_scenarios_blocked():
 
 
 def test_individual_scenarios():
-    engine = _engine()
     for scenario in all_scenarios():
         result = run_scenario(scenario.id, _engine())
         assert result.blocked, scenario.id

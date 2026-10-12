@@ -20,11 +20,16 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from signal_gating.security.risk import RiskLevel, ToolRisk, effective_level
+
+if TYPE_CHECKING:
+    from signal_gating.gate import Gate
+    from signal_gating.signal import Signal
 
 
 class Decision(str, Enum):
@@ -188,7 +193,7 @@ class PolicyEngine:
         n = sum(1 for r in self._records if r.decision in gated)
         return n / len(self._records)
 
-    def as_gate(self, agent_name: str = ""):
+    def as_gate(self, agent_name: str = "") -> Gate:
         """Return an SGP ``Gate`` enforcing this engine on tool calls.
 
         Attach it to an agent's gate list and every inbound
@@ -203,7 +208,7 @@ class PolicyEngine:
 
         engine = self
 
-        def _check(signal) -> bool:
+        def _check(signal: Signal) -> bool:
             if isinstance(signal, ToolCallSignal):
                 decision = engine.evaluate(signal.tool_name, agent_name=agent_name)
                 return decision in (Decision.ALLOW, Decision.WOULD_ALLOW)

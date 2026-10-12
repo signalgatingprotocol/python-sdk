@@ -22,11 +22,10 @@ regressed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from signal_gating.security.audit import (
     DeclaredHints,
-    ObservedBehavior,
     audit_tool,
     scan_source,
 )
