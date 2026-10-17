@@ -6,8 +6,24 @@ documented stable core may still change during the `0.x` series.
 
 ## Unreleased
 
+## 0.1.0 - release candidate
+
+The first public alpha establishes the SDK's signal-routing model and a stable
+integration surface for early adopters.
+
 ### Added
 
+- Typed, immutable signals with metadata, priority, correlation, and evolution.
+- Composable gates for filtering, transformation, deduplication, timing,
+  resilience, batching, and conditional routing.
+- Managed agents and meshes with lifecycle hooks, request/reply, content-based
+  routing, supervision, graceful draining, and observable delivery receipts.
+- Trajectory recording and replay, durable recovery, agent pools, teams,
+  taskboards, scripted workflows, and focused improvement loops.
+- Optional OpenAI-compatible LLM agents and OpenTelemetry export integrations.
+- A deterministic incident-triage example that demonstrates 75% handler-load
+  reduction while preserving every unique critical incident in its fixture,
+  runnable from an installed package with `signal-gating-demo`.
 - Fail-closed tool authorization (`signal_gating.security`): per-tool risk
   classification (READ / DRAFT / SEND / DESTRUCTIVE, UNKNOWN gates as
   DESTRUCTIVE), a default-deny policy engine with approver callbacks,
@@ -42,25 +58,6 @@ documented stable core may still change during the `0.x` series.
   mode (`ruff check .` and `mypy src/` are green on `main`), and the `dev`
   extra includes `types-PyYAML` so the policy loader type-checks. No runtime
   behavior changed.
-
-## 0.1.0 - release candidate
-
-The first public alpha establishes the SDK's signal-routing model and a stable
-integration surface for early adopters.
-
-### Added
-
-- Typed, immutable signals with metadata, priority, correlation, and evolution.
-- Composable gates for filtering, transformation, deduplication, timing,
-  resilience, batching, and conditional routing.
-- Managed agents and meshes with lifecycle hooks, request/reply, content-based
-  routing, supervision, graceful draining, and observable delivery receipts.
-- Trajectory recording and replay, durable recovery, agent pools, teams,
-  taskboards, scripted workflows, and focused improvement loops.
-- Optional OpenAI-compatible LLM agents and OpenTelemetry export integrations.
-- A deterministic incident-triage example that demonstrates 75% handler-load
-  reduction while preserving every unique critical incident in its fixture,
-  runnable from an installed package with `signal-gating-demo`.
 
 ### Stability
 
