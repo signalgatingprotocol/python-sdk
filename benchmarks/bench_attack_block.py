@@ -1,7 +1,7 @@
-"""Benchmark: attack-scenario block rate.
+"""Run five synthetic policy and source-audit fixtures.
 
-Runs every documented attack scenario against the default fail-closed
-policy engine and reports the block rate. Expected: 5/5.
+Expected: five scripted checks pass. This does not execute adversarial
+agents or establish protection against an attack class.
 
 Run: PYTHONPATH=src python benchmarks/bench_attack_block.py
 """
@@ -23,20 +23,20 @@ def main() -> None:
     scenarios = all_scenarios()
     results = run_all(engine)
 
-    print(f"attack scenarios: {len(scenarios)}")
+    print(f"synthetic policy fixtures: {len(scenarios)}")
     blocked = 0
     for scenario, result in zip(scenarios, results):
-        mark = "BLOCKED" if result.blocked else "NOT BLOCKED"
+        mark = "PASS" if result.blocked else "FAIL"
         print(f"  [{mark}] {scenario.id}")
         print(f"           {result.detail}")
         blocked += result.blocked
 
     print()
-    print(f"block rate: {blocked}/{len(scenarios)}")
+    print(f"fixture checks passed: {blocked}/{len(scenarios)}")
     if blocked == len(scenarios):
-        print("Verdict: every documented attack class is stopped by default policy.")
+        print("All scripted expectations passed; adversarial effectiveness is unmeasured.")
     else:
-        print("Verdict: REGRESSION. The control plane has a hole.")
+        print("REGRESSION: at least one scripted policy expectation failed.")
         sys.exit(1)
 
 

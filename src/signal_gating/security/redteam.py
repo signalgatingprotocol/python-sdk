@@ -1,23 +1,12 @@
-"""Executable attack scenarios: proof that the enforcement layer blocks them.
+"""Synthetic policy and source-audit fixtures inspired by attack scenarios.
 
-Each scenario models a real attack class documented against agentic AI
-systems in 2026:
+The fixtures directly evaluate registered or unknown tool names and scan
+hardcoded source strings. They do not execute adversarial agents, injected
+tool output, MCP servers, or actual exfiltration.
 
-1. PROMPT_INJECTION_VIA_TOOL_OUTPUT: a tool returns attacker-controlled
-   text containing instructions. The agent's next turn follows them.
-2. MCP_PRIVILEGE_ESCALATION: an MCP server declares readOnlyHint on a tool
-   that actually writes, smuggling a destructive capability past review.
-3. DATA_EXFILTRATION: an innocent-looking tool (e.g. "summarize document")
-   exfiltrates content to an attacker endpoint via a hidden network call.
-4. TOOL_SQUATTING: a malicious tool registers under the name of a trusted
-   tool after the trusted one is removed (binding-id confusion).
-5. APPROVAL_FATIGUE_FLOOD: an attacker floods the approver with benign
-   requests so a malicious one slips through unexamined.
-
-``run_scenario`` executes the attack against a ``PolicyEngine`` and
-reports whether it was blocked. These double as regression tests:
-if a scenario ever reports ``blocked=False``, the control plane has
-regressed.
+``ScenarioResult.blocked`` retains its public name for compatibility. Here it
+means the fixture's denial or audit expectation passed, not that protection
+against an entire attack class has been established.
 """
 
 from __future__ import annotations
@@ -109,11 +98,9 @@ def all_scenarios() -> list[AttackScenario]:
 
 
 def run_scenario(scenario_id: str, engine: PolicyEngine) -> ScenarioResult:
-    """Execute one attack scenario against the engine. Returns the verdict."""
+    """Run one scripted policy or source-audit check."""
     if scenario_id == "prompt-injection-via-tool-output":
-        # The injected instruction targets the email tool. The email tool is
-        # SEND: gated. The attack dies at the approval boundary even though
-        # the injection itself succeeded upstream.
+        # Check the SEND ceiling directly; no injected text or agent runs here.
         engine.register(
             "send_email",
             ToolRisk(RiskLevel.SEND, ("outbound communication verb",), 0.9),
@@ -126,7 +113,7 @@ def run_scenario(scenario_id: str, engine: PolicyEngine) -> ScenarioResult:
         blocked = decision in (Decision.DENY, Decision.REQUIRE_APPROVAL)
         return ScenarioResult(
             scenario_id, blocked, decision.value,
-            "injected instruction reached the email tool; the SEND gate held",
+            "direct SEND policy evaluation required approval or denied",
         )
 
     if scenario_id == "mcp-privilege-escalation":
@@ -161,16 +148,12 @@ def run_scenario(scenario_id: str, engine: PolicyEngine) -> ScenarioResult:
         )
 
     if scenario_id == "tool-squatting":
-        # SGP binds tools by binding_id; a re-registered same-name tool
-        # carries a different binding_id and the call is rejected at the
-        # ToolCallSignal handler (existing behavior, verified in tests).
-        # The policy layer adds: the squatting tool is unregistered, so even
-        # a binding check bypass still hits default-deny.
+        # Check an unregistered name. Binding replacement is not exercised here.
         decision = engine.evaluate("deploy", agent_name="assistant")
         blocked = decision is Decision.DENY
         return ScenarioResult(
             scenario_id, blocked, decision.value,
-            "squatted tool is unknown to the policy registry: default deny",
+            "unregistered deploy name denied; binding replacement not exercised",
         )
 
     if scenario_id == "unclassified-tool-execution":

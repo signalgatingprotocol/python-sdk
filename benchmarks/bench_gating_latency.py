@@ -51,9 +51,9 @@ def main() -> None:
     print(f"  allow path: p50={p50:.1f}us p99={p99:.1f}us over {n} samples")
     print(f"  gated path: p50={gp50:.1f}us over {n} samples")
     print()
-    print("For context: a single LLM tool-call round trip is 200-2000ms.")
-    print(f"Gating overhead is ~{p50 / 1_000_000:.4f}% of a 500ms call.")
-    print("Verdict: the control plane is free.")
+    print("Scope: in-memory policy evaluation only.")
+    print("Excludes model classification, approval, durable audit writes, and tool execution.")
+    print("Measure end-to-end cost and latency separately.")
 
 
 if __name__ == "__main__":
