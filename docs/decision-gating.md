@@ -53,7 +53,7 @@ Unknown work must not disappear, but low-priority events can still be
 misclassified confidently. Typed outputs constrain format, not truth. The
 fixture does not establish production incident recall or safe suppression.
 
-## The comparison worth publishing
+## How to compare
 
 Freeze a representative, independently labeled alert set before tuning. Split
 calibration from holdout evaluation. Compare the ungated handler, deterministic

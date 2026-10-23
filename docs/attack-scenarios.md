@@ -6,7 +6,7 @@ Every scenario below is executable. Run them:
 PYTHONPATH=src python benchmarks/bench_attack_block.py
 ```
 
-Block rate against default fail-closed policy: **5/5**.
+Block rate against default fail-closed policy: 5/5.
 
 ---
 
@@ -19,14 +19,14 @@ data, but the downstream email tool treats the injected instruction
 as intent.
 
 **Why most frameworks fail.** The injection happens upstream of the
-tool call. Output sanitization is a losing game: attackers iterate
-faster than filters.
+tool call. Output sanitization does not hold: attackers change their inputs
+faster than filters are updated.
 
 **How SGP blocks it.** The injected instruction targets `send_email`,
 which is classified SEND. SEND exceeds the READ auto-approve ceiling,
 so the call requires approval or denies. The injection succeeded;
-the exfiltration died at the authorization boundary. Control the
-capability, not the content.
+the exfiltration was stopped at the authorization check. The gate
+controls what the tool is allowed to do, not what the content says.
 
 ```python
 engine.register("send_email", ToolRisk(RiskLevel.SEND, ("outbound",), 0.9))
@@ -124,12 +124,10 @@ assert denied == 40
 
 ---
 
-## The principle
+## The two rules
 
 Every scenario above is stopped by the same two rules:
 
 1. Unknown means DESTRUCTIVE. Unclassified tools never execute.
 2. Denial is the default. Approval is explicit, per tool, audited.
 
-Frameworks that invert either rule are not missing a feature.
-They are missing the control plane.
