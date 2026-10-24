@@ -36,7 +36,8 @@ integration surface for early adopters.
   registration time only, never per call; `fallback_to_heuristic=True`
   opts into the regex classifier when Jev is unreachable.
 - MCP annotation distrust (`audit_tool`, `scan_source`): verifies server
-  self-declared hints against observed behavior; fails tools that lie.
+  self-declared hints against observed behavior; fails tools where the two
+  do not match.
 - Policy as code (`signal_gating.policy`): declarative YAML policies with
   first-match-wins rules, versioning, and dry-run validation.
 - Agent Skills compatibility (`signal_gating.skills`): export and load
