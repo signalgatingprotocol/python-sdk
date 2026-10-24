@@ -144,10 +144,10 @@ engine.evaluate("delete_database")  # deny: unknown tool, default deny
 
 The two rules:
 
-1. **Unknown means DESTRUCTIVE.** Tools are classified READ / DRAFT /
+1. Unknown means DESTRUCTIVE. Tools are classified READ / DRAFT /
    SEND / DESTRUCTIVE. Anything unclassified gates as DESTRUCTIVE and
    never auto-executes.
-2. **Denial is the default.** Approval is explicit, per tool, audited.
+2. Denial is the default. Approval is explicit, per tool, audited.
    Every decision lands in an append-only audit trail.
 
 ### How it flows
@@ -409,7 +409,7 @@ async with mesh:
 # Clean context exit waits for all pending and in-flight signals to complete.
 ```
 
-**Interceptors**: mesh-level cross-cutting concerns (auth, logging, metrics):
+**Interceptors**: mesh-level hooks that run on every delivery (auth, logging, metrics):
 
 ```python
 def audit_log(signal, source, target):
@@ -447,7 +447,7 @@ mesh.declare_capabilities(coder, "code_generation", "debugging")
 agents = mesh.find_capable("analysis")
 ```
 
-**Scatter/Gather**: the fundamental multi-agent coordination pattern:
+**Scatter/Gather**: send work to several agents and collect the responses:
 
 ```python
 # Send work to N agents in parallel, collect all responses
@@ -651,8 +651,8 @@ log for signal-carrying mesh events.
 
 ### LLM-backed agents (Hermes)
 
-`LLMAgent` gives an agent an OpenAI-compatible brain. Nous Hermes, or any
-OpenAI-compatible server. Install the extra:
+`LLMAgent` connects an agent to an OpenAI-compatible model server: Nous
+Hermes, or any OpenAI-compatible server. Install the extra:
 
 ```bash
 pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
@@ -886,8 +886,7 @@ structured `intercepted` and `edge_rejected` receipts for blocked attempts.
 
 ### Wire format & durability
 
-A protocol that only lives inside one process is a library. Signals serialize to
-a self-describing JSON envelope and reconstruct as their **original subclass** —
+Signals serialize to a self-describing JSON envelope and reconstruct as their **original subclass** —
 the foundation for persistence, durable replay, and crossing process or network
 boundaries. Subclasses register themselves automatically when their defining
 module is imported; no manual registration boilerplate:
@@ -1008,7 +1007,7 @@ flowchart TB
     exp --> core
 ```
 
-Two planes, one runtime:
+The signal plane and the control plane run in the same runtime:
 
 ```mermaid
 flowchart LR
