@@ -1,5 +1,7 @@
 # SGP Python SDK
 
+Typed signals, composable gates, and observable work admission for Python agents.
+
 Multi-agent systems degrade when every event reaches every agent: context fills
 with noise, stale information displaces relevant state, and one bad output can
 cascade through the system. SGP puts a controlled, observable routing layer
@@ -8,6 +10,11 @@ decide what passes, agents process admitted work, and meshes define the network.
 
 SGP complements tool and agent-communication protocols such as MCP and A2A; it
 controls which signals flow through an agent system and records what happened.
+
+Development is focused on maintenance and verified correctness. Further
+framework or protocol expansion must meet the [outcome-evidence gates](https://github.com/signalgatingprotocol/community/issues/6).
+The current fixtures demonstrate routing behavior; they do not establish an
+advantage over simple rules, production task quality, or inference savings.
 
 ## Install
 
@@ -114,10 +121,12 @@ a separate live evaluation.
 
 ## Fail-closed tool authorization
 
-Every agent framework in 2026 ships permissive tool defaults. MCP defines
-no per-tool ACL. SGP now ships the control plane they left out:
-`signal_gating.security` is a fail-closed authorization layer for
-agentic tool use.
+`signal_gating.security` provides an opt-in, default-deny tool-risk policy
+and approval callback for calls mediated by its gate. Existing MCP SDKs and
+agent frameworks also provide authorization and guardrail hooks; SGP's policy
+must be evaluated alongside those controls, not treated as a missing ecosystem
+security boundary. See [MCP per-operation authorization](https://ts.sdk.modelcontextprotocol.io/v2/serving/authorization#enforce-per-operation-scopes)
+and [OpenAI Agents SDK guardrails](https://openai.github.io/openai-agents-python/guardrails/).
 
 ```python
 from signal_gating import Agent
@@ -159,8 +168,11 @@ flowchart LR
     GATE --> AUDIT
 ```
 
-Classification happens once at registration. Enforcement runs per call at
-2.3us p50. The classifier never sits on the hot path.
+Classification happens at registration. Enforcement runs per call. Approval
+callbacks receive the actual tool arguments through a thawed deep copy.
+Mutable built-in values are isolated from the executing call; custom objects
+follow Python's `deepcopy` semantics. The registry's risk category alone does
+not authorize access to a particular resource or tenant.
 
 ### Risk classification: heuristic or Jev
 
@@ -169,16 +181,15 @@ regex signals over the tool name, description, and source. Anything it
 cannot place is UNKNOWN. Explicit `risk=` declarations on registration
 always win.
 
-For calibrated confidence, swap in the Jev classifier. Jev is a decision
-model that returns typed answers with calibrated probabilities instead of
-generated text, which is exactly what risk classification needs:
+For a model-based classification, swap in the optional Jev classifier. Its
+returned confidence has not been calibrated on an SGP tool-risk holdout:
 
 ```python
 from signal_gating.security import JevRiskClassifier, PolicyEngine, RiskLevel
 
 classifier = JevRiskClassifier()  # reads TYPESAFE_API_KEY
 risk = classifier.classify("send_email", "Send an email via SES")
-# risk.level is SEND, risk.confidence is Jev's calibrated probability
+# risk.level is the predicted category; risk.confidence is the returned score
 
 engine = PolicyEngine(max_auto_approve=RiskLevel.READ)
 engine.register("send_email", risk)
@@ -186,8 +197,8 @@ engine.register("send_email", risk)
 
 Rules that never change, regardless of classifier:
 
-- Jev runs at registration time, not per tool call. The 2.3us
-  enforcement overhead is untouched.
+- Jev runs at registration time, not per tool call. Its network latency and
+  cost are separate from the engine's per-call evaluation.
 - Below 0.7 confidence, or on any failure (timeout, HTTP error,
   unparseable answer), the result is UNKNOWN, which gates as
   DESTRUCTIVE. A classifier that cannot answer never grants permission.
@@ -197,22 +208,27 @@ Rules that never change, regardless of classifier:
 Also included:
 
 - **MCP annotation distrust** (`audit_tool`): servers self-declare
-  `readOnlyHint` / `destructiveHint`; the audit compares the claim
-  against statically observed behavior and fails tools where the two do not match.
-  The Agentjacking class proved annotations are not a trust signal.
+  `readOnlyHint` / `destructiveHint`; heuristic source scanning flags possible
+  mismatches. A clean scan does not certify behavior, and a network operation
+  can be a legitimate read. Review findings against the actual tool contract.
 - **Policy as code** (`signal_gating.policy`): declarative YAML
-  policies, first-match-wins rules, versioning, dry-run mode for
-  validating against production traffic before enforcing.
+  policies, first-match-wins rules, versioning, and would-allow/would-deny
+  decision labels. Dry-run labels do not guarantee non-enforcing delivery.
 - **Agent Skills compatibility** (`signal_gating.skills`): export SGP
   tool surfaces as skills, load installed skills with risk
   classification. Includes the `sgp-control` skill text.
-- **Executable attack scenarios** (`docs/attack-scenarios.md`):
-  prompt injection via tool output, MCP privilege escalation, data
-  exfiltration, tool squatting, unclassified auto-execution.
-  All five blocked by default policy:
+- **Synthetic policy scenarios** (`docs/attack-scenarios.md`): direct policy
+  evaluations and static-source checks for five illustrative cases. They do
+  not run adversarial agents or establish attack-class protection:
   `PYTHONPATH=src python benchmarks/bench_attack_block.py`
-- **Benchmarks**: gating overhead is 2.3us p50 per evaluation,
-  small next to a 200-2000ms LLM round trip.
+- **Microbenchmark**: `benchmarks/bench_gating_latency.py` measures registry
+  evaluation with an in-memory audit list. It excludes model classification,
+  approval, durable audit writes, tool execution, and end-to-end latency.
+
+This policy is not a sandbox, a prompt-injection detector, or a replacement
+for scoped credentials and trusted enforcement at the resource boundary.
+Measure forbidden effects and legitimate task completion together before
+making security claims. See [SECURITY.md](SECURITY.md) for the mediation boundary.
 
 ```bash
 python examples/secure_agent.py
@@ -1023,4 +1039,3 @@ mypy src/
 ## License
 
 Apache 2.0
-

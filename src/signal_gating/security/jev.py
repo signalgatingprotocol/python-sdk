@@ -1,10 +1,9 @@
 """Jev-backed risk classification.
 
-Replaces the fabricated heuristic confidences in ``classify_tool`` with
-calibrated probabilities from TypeSafe AI's Jev decision model. Jev returns
-typed answers (Choice, Noul, Score) with calibrated confidence instead of
-generated text, which is exactly what risk classification needs: a verdict,
-not prose.
+Uses the category and confidence returned by TypeSafe AI's Jev decision
+model instead of the fixed heuristic scores in ``classify_tool``. Calibration
+and risk-classification accuracy have not been measured on an SGP holdout;
+typed answers and a confidence threshold do not establish correctness.
 
 Design rules:
 

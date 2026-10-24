@@ -20,11 +20,13 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from signal_gating._immutable import deep_thaw
 from signal_gating.security.risk import RiskLevel, ToolRisk, effective_level
 
 if TYPE_CHECKING:
@@ -119,10 +121,12 @@ class PolicyEngine:
             )
 
         if self.approver is not None and not self.dry_run:
+            # Copy only for an approval callback, including mutable leaves.
+            # Custom objects retain their __deepcopy__ hook's copy semantics.
             approved = self.approver(
                 ApprovalRequest(
                     tool_name=tool_name,
-                    arguments=arguments or {},
+                    arguments=deepcopy(arguments) if arguments is not None else {},
                     risk=risk,
                     agent_name=agent_name,
                     reason=(
@@ -210,7 +214,11 @@ class PolicyEngine:
 
         def _check(signal: Signal) -> bool:
             if isinstance(signal, ToolCallSignal):
-                decision = engine.evaluate(signal.tool_name, agent_name=agent_name)
+                decision = engine.evaluate(
+                    signal.tool_name,
+                    arguments=deep_thaw(signal.arguments),
+                    agent_name=agent_name,
+                )
                 return decision in (Decision.ALLOW, Decision.WOULD_ALLOW)
             return True
 
