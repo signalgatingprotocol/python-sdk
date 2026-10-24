@@ -4,6 +4,7 @@ SGP is a typed signal-routing SDK. Development is focused on maintenance and
 verified correctness. Preserve the compatibility API in `signal_gating.core`.
 Read `README.md` for public behavior and `SECURITY.md` for the mediation boundary.
 For CI repair or recurring cleanup, use `.github/skills/sdk-maintenance/SKILL.md`.
+For release preparation, use `.github/skills/sdk-release/SKILL.md`.
 
 ## Working rules
 
