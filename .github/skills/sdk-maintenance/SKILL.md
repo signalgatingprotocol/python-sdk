@@ -29,8 +29,8 @@ issues. Outside Actions, use the current user's task and local Git history.
    Stay within 10 files and a 100 KB patch. Do not change security policies,
    package manifests, workflow files, scripts, or agent instructions. Do not
    merge, publish, contact people, or access another repository.
-5. Run `ruff check .`, `mypy src/`, `pytest -q`, `python -m build`, and
-   `python -m twine check dist/*`. Never weaken checks to get green. Do not
+5. Run `make check package`, the shared local and Actions verification recipe.
+   Never weaken checks to get green. Do not
    claim production savings, model quality, or security protection from fixtures.
 6. Leave the change in the working tree. Do not commit or create a PR in Actions.
    The workflow validates the patch in a fresh runner before publishing it.

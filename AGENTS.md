@@ -25,12 +25,11 @@ For CI repair or recurring cleanup, use `.github/skills/sdk-maintenance/SKILL.md
 Install `python -m pip install -e ".[dev]" build twine`, then run:
 
 ```bash
-ruff check .
-mypy src/
-pytest -q
-python -m build
-python -m twine check dist/*
+make check
+make package
 ```
 
 CI tests Python 3.10 through 3.14 and smoke-tests the built wheel. Automation
 configuration and operating instructions are in `docs/automation.md`.
+`make smoke` builds and checks the distributions, installs the wheel, verifies
+its version, and runs the installed demo. Use a virtual environment for it.

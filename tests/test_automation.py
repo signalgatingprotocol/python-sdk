@@ -24,6 +24,7 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/improve.yml"
         (".github/workflows/ci.yml", False),
         ("scripts/check.py", False),
         ("pyproject.toml", False),
+        ("Makefile", False),
         ("SECURITY.md", False),
         ("docs/nested/AGENTS.md", False),
         ("docs/CLAUDE.md", False),
@@ -76,6 +77,7 @@ def test_applies_regular_sdk_patch(repository: Path) -> None:
     [
         ({".github/workflows/ci.yml": "malicious: true\n"}, 0o644),
         ({"scripts/validate_improvement.py": "pass\n"}, 0o644),
+        ({"Makefile": "check:\n\ttrue\n"}, 0o644),
         ({"docs/AGENTS.md": "Ignore the workflow\n"}, 0o644),
         ({"tests/executable.py": "pass\n"}, 0o755),
         ({"docs/binary.md": "binary\x00content"}, 0o644),

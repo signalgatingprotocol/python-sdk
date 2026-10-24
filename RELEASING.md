@@ -29,18 +29,12 @@ needs no long-lived PyPI token.
    `## 0.1.0 - release candidate` with the release date.
 3. Update the version in both `pyproject.toml` and
    `src/signal_gating/__init__.py`.
-4. Run the same checks as CI:
+4. In a virtual environment, run the same checks as CI:
 
    ```bash
    RELEASE_VERSION=0.1.0
-   python -m pip install -e ".[dev]"
-   ruff check .
-   mypy src/
-   pytest -q
-   python -m pip install build twine
-   python -m build
-   python -m twine check dist/*
-   python -m pip install --force-reinstall dist/*.whl
+   python -m pip install -e ".[dev]" build twine
+   make check smoke
    python scripts/check_release_version.py --tag "v${RELEASE_VERSION}"
    ```
 

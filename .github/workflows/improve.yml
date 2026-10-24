@@ -171,14 +171,7 @@ jobs:
         if: steps.patch.outputs.changed == 'true'
         run: |
           python -m pip install -e ".[dev]" build twine
-          ruff check .
-          mypy src/
-          pytest -q
-          python -m build
-          python -m twine check dist/*
-          python -m pip install --force-reinstall dist/*.whl
-          python scripts/check_release_version.py
-          signal-gating-demo
+          make check smoke
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.patch.outputs.changed == 'true'
         with:

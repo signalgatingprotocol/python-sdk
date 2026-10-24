@@ -1030,11 +1030,13 @@ policy in the mesh.
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pytest
-ruff check .
-mypy src/
+python -m pip install -e ".[dev]" build twine
+make check
+make package
 ```
+
+Use a virtual environment. `make smoke` also installs the built wheel and runs
+its version check and demo. These targets are shared with CI and agent maintenance.
 
 ## License
 

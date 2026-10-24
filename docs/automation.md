@@ -4,6 +4,10 @@ One GitHub Actions workflow handles failed main CI, weekly simplification,
 and maintainer-directed tasks. It uses the official Codex action and the same
 [maintenance skill](../.github/skills/sdk-maintenance/SKILL.md) local agents use.
 No custom agent service, session database, or provider wrapper is required.
+The Makefile owns the checks: `make check` runs lint, types, and tests;
+`make package` builds and validates distributions; `make smoke` also installs
+the wheel and exercises its version and demo. CI, releases, and improvement
+runs call those same targets. The proposal allowlist protects the Makefile.
 
 ## Enable
 

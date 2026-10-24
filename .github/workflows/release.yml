@@ -20,11 +20,8 @@ jobs:
         with:
           python-version: "3.14"
       - run: python -m pip install build twine
-      - run: python -m build
-      - run: python -m twine check dist/*
       - name: Verify installed release version
         run: |
-          python -m pip install --force-reinstall dist/*.whl
+          make smoke
           python scripts/check_release_version.py --tag "${GITHUB_REF_NAME}"
-          signal-gating-demo
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
