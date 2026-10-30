@@ -7,7 +7,7 @@ description: Repair Python SDK bugs or failed CI, and consolidate demonstrated d
 
 Read `AGENTS.md`, the relevant public behavior in `README.md`, and `SECURITY.md`
 when changing mediated tool calls. Preserve `signal_gating.core` compatibility.
-The README's outcome-evidence gate applies to framework expansion.
+The README's rule for framework expansion applies: expansion must show evidence that it improves an outcome.
 
 Check Git status, recent commits, and open PRs before editing. Preserve unrelated
 work and skip repairs already completed or proposed. For a CI failure, inspect

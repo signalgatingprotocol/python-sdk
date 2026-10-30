@@ -1,4 +1,4 @@
-# Decision models as work-admission gates
+# Decision models that decide which work is let through
 
 Use a small decision model to judge an ambiguous event, then let SGP enforce
 the routing policy and trace what happened. The example uses Jev's Noul

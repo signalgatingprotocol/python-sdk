@@ -1,6 +1,6 @@
 # SGP Python SDK
 
-Typed signals, composable gates, and observable work admission for Python agents.
+Typed signals, composable gates, and a record of which signals were let through, for Python agents.
 
 Multi-agent systems degrade when every event reaches every agent: context fills
 with noise, stale information displaces relevant state, and one bad output can
@@ -12,7 +12,7 @@ SGP complements tool and agent-communication protocols such as MCP and A2A; it
 controls which signals flow through an agent system and records what happened.
 
 Development is focused on maintenance and verified correctness. Further
-framework or protocol expansion must meet the [outcome-evidence gates](https://github.com/signalgatingprotocol/community/issues/6).
+framework or protocol expansion must show evidence that it improves an outcome, as required in [the linked issue](https://github.com/signalgatingprotocol/community/issues/6).
 The current fixtures demonstrate routing behavior; they do not establish an
 advantage over simple rules, production task quality, or inference savings.
 
@@ -105,7 +105,7 @@ not a throughput, token, latency, or cost benchmark.
 
 ## Decision-model gating
 
-Use a decision model for ambiguous work admission while SGP enforces the policy
+Use a decision model when it is unclear whether work should be let through, while SGP enforces the policy
 and traces the route. A new source-checkout example runs without credentials:
 
 ```bash
@@ -169,7 +169,8 @@ flowchart LR
 ```
 
 Classification happens at registration. Enforcement runs per call. Approval
-callbacks receive the actual tool arguments through a thawed deep copy.
+callbacks receive a deep copy of the actual tool arguments, and they can
+change the copy.
 Mutable built-in values are isolated from the executing call; custom objects
 follow Python's `deepcopy` semantics. The registry's risk category alone does
 not authorize access to a particular resource or tenant.
@@ -308,7 +309,7 @@ fresh_only = Gate.ttl(30)  # Drop signals older than 30 seconds
 # Debounce: wait for silence before passing, to tame noisy signal sources
 stable = Gate.debounce(0.5)  # Pass only after 500ms of quiet
 
-# Conditional branching: the agent-native if/else for signal flow
+# Conditional branching: choose a gate based on the signal
 gate = Gate.when(
     lambda s: s.priority >= 8,
     then=Gate.transform(enrich_urgent),
@@ -551,9 +552,9 @@ removed. A failed or cancelled scale-up stops and unregisters every staged
 worker before propagating the error. Cancellation during scale-down completes
 retirement cleanup before `CancelledError` reaches the caller.
 
-### Tool Calling: Agent-Native RPC
+### Tool Calling: RPC between agents
 
-Agents can expose tools that other agents (or LLMs) discover and invoke. This is the bridge between signal-based communication and structured function calling:
+Agents can expose tools that other agents (or LLMs) discover and invoke. This connects signal-based communication with structured function calling:
 
 ```python
 from signal_gating import Agent, Mesh, ToolSpec
@@ -839,7 +840,7 @@ recorder.export_jsonl("runs.jsonl")  # one Receipt per line
 
 Each `Receipt` carries `event_kind`, `action`, the signal's lineage
 (`trace_id` / `parent_id`), routing (`source` -> `target`), typed domain
-`payload`, event `metadata`, and a `digest` (sha256) — an integrity checksum
+`payload`, event `metadata`, and a `digest` (sha256), an integrity checksum
 that `receipt.verify()` uses to catch accidental corruption (truncated writes,
 bit-rot) before replay. The digest is keyless, so it is not a cryptographic
 signature; to make a persisted trajectory tamper-evident against a motivated
@@ -886,7 +887,7 @@ structured `intercepted` and `edge_rejected` receipts for blocked attempts.
 
 ### Wire format & durability
 
-Signals serialize to a self-describing JSON envelope and reconstruct as their **original subclass** —
+Signals serialize to a self-describing JSON envelope and reconstruct as their **original subclass**:
 the foundation for persistence, durable replay, and crossing process or network
 boundaries. Subclasses register themselves automatically when their defining
 module is imported; no manual registration boilerplate:
@@ -903,14 +904,14 @@ assert type(restored) is TaskSignal
 assert restored == sig                  # faithful: id, trace_id, timestamp, fields
 ```
 
-`model_dump()` is lossy in the way that matters — it gives you a `dict` with no
-way back to `TaskSignal`. The registry closes that loop. Pin a stable wire name
+`model_dump()` is lossy in the way that matters: it gives you a `dict` with no
+way back to `TaskSignal`. The registry provides that way back. Pin a stable wire name
 across refactors with `__signal_type__ = "task.v2"`, or register an alias with
 `register_signal`. Unknown types raise `UnknownSignalType`; pass `strict=False`
 to get a best-effort base `Signal` with the payload preserved in `metadata`.
 
 This makes recovery durable. Persist the dead-letter queue on shutdown, then
-reload and replay after a crash or redeploy — signals come back as their real
+reload and replay after a crash or redeploy: signals come back as their real
 types and dispatch to the same handlers:
 
 ```python
@@ -924,7 +925,7 @@ await agent.dead_letters.replay(agent.inbox)
 
 ### Teams
 
-A `Team` coordinates long-lived peer agents over a shared `TaskBoard` — a
+A `Team` coordinates long-lived peer agents over a shared `TaskBoard`, a
 durable task ledger folded from signal events, with hash-chained JSONL
 persistence and transition policy expressed as ordinary `Gate`s. Members carry
 exactly one obligation: handle `TaskAssigned` and reply a `TaskResult`. The
@@ -959,7 +960,7 @@ automatically. See `examples/agent_team.py`.
 
 A `Script` moves the plan into code: a coroutine you write owns the loop and
 the branching, and the runtime contributes bounded concurrency, an agent
-budget, and resume — every completed step is checkpointed under a
+budget, and resume: every completed step is checkpointed under a
 content-addressed key, so an interrupted run reruns only unfinished work:
 
 ```python
@@ -981,8 +982,8 @@ the error returns; completed checkpoints remain available for resume. A
 request already delivered to an agent may still have external side effects,
 so handlers must be safe to retry when that matters.
 
-`ctx.spawn(factory, signal)` runs ephemeral agents — added, started, asked one
-checkpointed request, then removed — so a script can use dozens of agents
+`ctx.spawn(factory, signal)` runs ephemeral agents, added, started, asked one
+checkpointed request, then removed, so a script can use dozens of agents
 without preregistering them. Unrelated to `mesh.workflow()`, which is a
 one-shot step chain. See `examples/scripted_workflow.py`.
 

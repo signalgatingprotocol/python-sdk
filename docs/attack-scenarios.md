@@ -38,8 +38,8 @@ the configured ceiling can be allowed without an approval callback; higher
 risk calls require one. Risk categories are not a complete principal,
 resource, argument, or tenant authorization model.
 
-When using `engine.as_gate()`, an approval callback receives the actual
-tool arguments through a thawed deep copy. Mutable built-in values are isolated
+When using `engine.as_gate()`, an approval callback receives a deep copy of the actual
+tool arguments, and it can change the copy. Mutable built-in values are isolated
 from the executing call; custom objects follow Python's `deepcopy` semantics.
 An argument-sensitive policy must inspect the values it is approving; merely
 registering a tool name is insufficient.
