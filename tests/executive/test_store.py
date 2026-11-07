@@ -870,3 +870,41 @@ def test_embedded_constraint_promotion_requires_owning_goal_cas(store, explicit_
     assert rebuild(store.events()) == store.view()
     with Store.open_readonly(store.root) as snapshot:
         assert snapshot.view() == store.view()
+
+
+@pytest.mark.parametrize("explicit_records", [False, True])
+def test_embedded_criterion_promotion_requires_owning_goal_cas(store, explicit_records):
+    from signal_gating.executive.reducers import rebuild, reduce_event
+
+    from .factories import criterion
+
+    original = criterion()
+    revised = original.model_copy(update={"revision": 2, "description": "Revised"})
+    store.commit(batch(records=(owner(), goal(criteria=(original,)))))
+    store.commit(
+        batch(
+            events=(event(id="e" * 32),),
+            records=(goal(revision=2, criteria=(revised,)),),
+            expected_revisions=(Ref(id=GOAL_ID),),
+        )
+    )
+    promotion = event(
+        id="f" * 32,
+        event_type="state.changed",
+        payload={"records": [revised.model_dump(mode="json")]},
+    )
+    before = store.view()
+    reduce_event(before, promotion.model_copy(update={"sequence": before.sequence + 1}))
+    with pytest.raises(ConflictError) as error:
+        store.commit(
+            CommitBatch(events=(promotion,), records=(revised,) if explicit_records else ())
+        )
+    assert error.value.code == "missing_promotion_read"
+    assert store.view() == before
+    store.commit(
+        CommitBatch(events=(promotion,), expected_revisions=(Ref(id=GOAL_ID, revision=2),))
+    )
+    assert next(r for r in store.view().records if r.id == revised.id) == revised
+    assert rebuild(store.events()) == store.view()
+    with Store.open_readonly(store.root) as snapshot:
+        assert snapshot.view() == store.view()

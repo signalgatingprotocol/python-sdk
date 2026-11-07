@@ -432,30 +432,34 @@ def reduce_event(state: StateView, event: JournalEvent) -> StateView:
             # Promotion changes representation, not logical identity/history.
             # Snapshot before all writes so post-image order cannot invent an
             # eligible embedded revision inside this same event.
-            embedded_constraints = tuple(
+            embedded_definitions = tuple(
                 c
                 for record in records.values()
                 if isinstance(record, Goal)
-                for c in record.constraints
+                for c in (*record.constraints, *record.criteria)
             )
             for item in updates:
                 if isinstance(item, JournalEvent):
                     _fail("invalid_event", "Journal events cannot be materialized as records")
                 previous = records.get(item.id)
                 if previous is None:
-                    if item.revision != 1:
-                        matches = tuple(c for c in embedded_constraints if c.id == item.id)
-                        if (
-                            not isinstance(item, Constraint)
+                    matches = tuple(c for c in embedded_definitions if c.id == item.id)
+                    if (
+                        isinstance(item, Criterion) and matches and any(c != item for c in matches)
+                    ) or (
+                        item.revision != 1
+                        and (
+                            not isinstance(item, (Constraint, Criterion))
                             or not matches
                             or any(c != item for c in matches)
-                        ):
-                            _fail(
-                                "invalid_revision",
-                                "New records start at revision one; promotion preserves "
-                                "an existing embedded constraint exactly",
-                                item.id,
-                            )
+                        )
+                    ):
+                        _fail(
+                            "invalid_revision",
+                            "New records start at revision one; promotion preserves "
+                            "an existing embedded definition exactly",
+                            item.id,
+                        )
                 else:
                     if (
                         item.kind != previous.kind

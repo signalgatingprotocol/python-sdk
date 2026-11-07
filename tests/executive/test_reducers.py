@@ -659,3 +659,51 @@ def test_constraint_promotion_cannot_borrow_revision_from_same_event(goal_first)
     with pytest.raises(InvalidTransition) as error:
         reduce_event(before, changed(*writes, sequence=2))
     assert error.value.code == "invalid_revision"
+
+
+@pytest.mark.parametrize("criterion_first", [True, False])
+def test_exact_embedded_criterion_promotion_preserves_revision(criterion_first):
+    original = criterion()
+    revised = original.model_copy(update={"revision": 2, "description": "Revised criterion"})
+    first = initial(criteria=(original,))
+    second = changed(goal(revision=2, criteria=(revised,)), sequence=2)
+    before = rebuild((first, second))
+    replacement = goal(revision=3, criteria=())
+    writes = (revised, replacement) if criterion_first else (replacement, revised)
+    promotion = changed(*writes, sequence=3)
+    after = reduce_event(before, promotion)
+    assert get(after, revised.id) == revised
+    assert rebuild((first, second, promotion)) == after
+
+
+@pytest.mark.parametrize(
+    "updates", [{"description": "Fabricated"}, {"id": "f" * 32}, {"revision": 3}]
+)
+def test_criterion_promotion_rejects_nonidentical_preimage(updates):
+    embedded = criterion(revision=2)
+    before = reduce_event(StateView(), initial(criteria=(embedded,)))
+    with pytest.raises(InvalidTransition) as error:
+        reduce_event(before, changed(embedded.model_copy(update=updates), sequence=2))
+    assert error.value.code == "invalid_revision"
+
+
+@pytest.mark.parametrize("goal_first", [True, False])
+def test_criterion_promotion_cannot_borrow_revision_from_same_event(goal_first):
+    original = criterion()
+    before = reduce_event(StateView(), initial(criteria=(original,)))
+    revised = original.model_copy(update={"revision": 2})
+    revised_goal = goal(revision=2, criteria=(revised,))
+    writes = (revised_goal, revised) if goal_first else (revised, revised_goal)
+    with pytest.raises(InvalidTransition) as error:
+        reduce_event(before, changed(*writes, sequence=2))
+    assert error.value.code == "invalid_revision"
+
+
+def test_revision_one_criterion_promotion_requires_exact_preimage():
+    embedded = criterion()
+    before = reduce_event(StateView(), initial(criteria=(embedded,)))
+    with pytest.raises(InvalidTransition) as error:
+        reduce_event(
+            before, changed(embedded.model_copy(update={"description": "Fabricated"}), sequence=2)
+        )
+    assert error.value.code == "invalid_revision"

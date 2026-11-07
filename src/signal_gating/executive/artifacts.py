@@ -297,12 +297,16 @@ class ArtifactStore:
             subject=Ref(id=current.id, revision=current.revision, kind="artifact"),
             payload={},
         )
+        from .memory import invalidate_dependents, reference
+        from .reducers import reduce_event
+
+        before = self.store.view()
+        after = reduce_event(before, event.model_copy(update={"sequence": before.sequence + 1}))
+        cascade = invalidate_dependents(after, (reference(current),))
         committed = self.store.commit(
             CommitBatch(
-                events=(event,),
-                expected_revisions=(
-                    Ref(id=current.id, revision=current.revision, kind="artifact"),
-                ),
+                events=(event, *cascade),
+                expected_revisions=tuple(reference(record) for record in before.records),
             )
         )
         self.collect_orphans()

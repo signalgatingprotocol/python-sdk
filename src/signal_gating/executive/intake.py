@@ -228,6 +228,27 @@ class Intake:
                 after = reduce_event(
                     after, event.model_copy(update={"sequence": state.sequence + offset})
                 )
+            if isinstance(item, (ReviseGoal, ResolveConflict)):
+                from .memory import invalidate_dependents
+
+                before_records = {r.id: r for r in state.records}
+                changed_refs = tuple(
+                    reference(r)
+                    for r in after.records
+                    if isinstance(r, (Goal, Belief))
+                    and r.id in before_records
+                    and r != before_records[r.id]
+                )
+                retired_criteria = tuple(
+                    reference(c)
+                    for old in state.records
+                    if isinstance(old, Goal) and any(ref.id == old.id for ref in changed_refs)
+                    for c in old.criteria
+                )
+                events = (
+                    *events,
+                    *invalidate_dependents(after, (*changed_refs, *retired_criteria)),
+                )
             return self._finish(
                 item, principal, state, now, policy, events=events, digest=digest, identity=identity
             )
@@ -353,6 +374,29 @@ class Intake:
         expected = getattr(command, "expected_revision", None)
         if expected is not None and (target is None or target.revision != expected):
             raise ConflictError("stale_command", "Command target revision changed")
+        if (
+            isinstance(command, ReviseGoal)
+            and isinstance(target, Goal)
+            and target.status == "completed"
+        ):
+            # Reopening must precede ordinary correction/conflict transitions.
+            # All events still commit atomically against the original CAS reads.
+            from .memory import invalidate_dependents
+
+            reopening = invalidate_dependents(state, (reference(target),))
+            reopened = state
+            for event in reopening:
+                reopened = reduce_event(
+                    reopened, event.model_copy(update={"sequence": reopened.sequence + 1})
+                )
+            current_goal = next(r for r in reopened.records if r.id == target.id)
+            corrected, policy = self._command(
+                command.model_copy(update={"expected_revision": current_goal.revision}),
+                principal,
+                reopened,
+                now,
+            )
+            return (*reopening, *corrected), policy
         writes: list[PersistentRecord] = []
         if isinstance(command, CreateGoal):
             target = command.goal
@@ -429,6 +473,12 @@ class Intake:
                 for field in ("outcome", "constraints", "criteria", "limits", "worker_id")
                 if getattr(command, field) is not None
             }
+            if command.criteria is not None:
+                # Retain exact removed definitions for historical finding refs.
+                remaining = {c.id for c in command.criteria}
+                writes.extend(
+                    c for c in target.criteria if c.id not in remaining and c.id not in records
+                )
             target = target.model_copy(update={"revision": target.revision + 1, **changes})
             writes.append(target)
             self._fence(target, state, writes)
