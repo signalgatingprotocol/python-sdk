@@ -421,6 +421,7 @@ class ArtifactRef(Record):
     retention_class: Literal["persistent", "ephemeral", "audit"] = "persistent"
     size_bytes: NonNegativeInt
     shared_with: tuple[Identifier, ...] = ()
+    valid: bool = True
 
 
 class ExecutiveSignal(Record):

@@ -335,10 +335,14 @@ class Store:
         with self._read():
             return _outbox(self._connection)
 
-    def commit(self, batch: CommitBatch) -> tuple[JournalEvent, ...]:
+    def check_writable(self) -> None:
+        """Refuse closed, fork-inherited and snapshot writers before external staging."""
         self._check_open()
         if self._readonly:
             raise StoreError("readonly_store", "A snapshot cannot commit executive state")
+
+    def commit(self, batch: CommitBatch) -> tuple[JournalEvent, ...]:
+        self.check_writable()
         records = batch.records + batch.receipts + batch.signals
         if not batch.events and (records or batch.inbox_acknowledgments or batch.outbox):
             raise StoreError("missing_events", "Authoritative writes require journal events")

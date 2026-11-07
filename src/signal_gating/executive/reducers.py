@@ -3,7 +3,8 @@
 Wire v1: state.changed carries {records: [complete persistent post-images]};
 controls goal.paused/resumed/cancelled carry {}; completion.invalidated carries
 {record_ids: [IDs], reason: str}; audit.recorded carries {reason_code: str,
-details: object}. Unknown formats fail closed. IDs/times are supplied, never made
+details: object}; artifact_invalidated carries {} and targets a current valid
+artifact. Unknown formats fail closed. IDs/times are supplied, never made
 here. Atomic creates are validated against the whole resulting event bundle.
 """
 
@@ -111,7 +112,7 @@ def _dependency_satisfied(record: Record, records: Mapping[str, PersistentRecord
     if isinstance(record, Belief):
         return record.epistemic_status == "supported"
     if isinstance(record, ArtifactRef):
-        return True
+        return record.valid
     if isinstance(record, Criterion):
         return any(
             isinstance(r, VerificationResult)
@@ -456,6 +457,24 @@ def reduce_event(state: StateView, event: JournalEvent) -> StateView:
                             "Pause, resume and cancel require explicit goal control events",
                             item.id,
                         )
+                    if isinstance(item, ArtifactRef) and isinstance(previous, ArtifactRef):
+                        immutable = (
+                            "digest",
+                            "storage_location",
+                            "media_type",
+                            "origin",
+                            "scope",
+                            "size_bytes",
+                            "valid",
+                        )
+                        if any(
+                            getattr(item, name) != getattr(previous, name) for name in immutable
+                        ):
+                            _fail(
+                                "invalid_transition",
+                                "Artifact identity is immutable; validity requires invalidation",
+                                item.id,
+                            )
                     if hasattr(item, "status"):
                         validate_transition(previous, item.status)
                     if isinstance(item, TaskFrame) and isinstance(previous, TaskFrame):
@@ -474,6 +493,22 @@ def reduce_event(state: StateView, event: JournalEvent) -> StateView:
             if payload:
                 _fail("invalid_event", "Goal controls have an empty payload")
             _control(records, event)
+        elif event.event_type == "artifact_invalidated":
+            artifact = records.get(event.subject.id)
+            if payload:
+                _fail("invalid_event", "Artifact invalidation has an empty payload")
+            if (
+                not isinstance(artifact, ArtifactRef)
+                or not artifact.valid
+                or event.subject.revision != artifact.revision
+                or event.subject.kind not in {"record", "artifact"}
+            ):
+                _fail(
+                    "invalid_transition",
+                    "Invalidation requires a current valid artifact",
+                    event.subject.id,
+                )
+            records[artifact.id] = _replace(artifact, valid=False)
         elif event.event_type == "completion.invalidated":
             if (
                 set(payload) != {"record_ids", "reason"}
