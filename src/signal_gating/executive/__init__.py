@@ -3,6 +3,7 @@
 Importing this package requires no optional model provider dependency.
 """
 
+from .authority import Authority, RuleRegistry
 from .config import (
     ArgvCheck,
     KernelConfig,
@@ -21,6 +22,7 @@ from .errors import (
     InvalidTransition,
     StoreError,
 )
+from .intake import Intake
 from .messages import (
     ActionIntent,
     AttachEvidence,
@@ -93,6 +95,9 @@ from .records import (
 )
 
 __all__ = [
+    "Authority",
+    "RuleRegistry",
+    "Intake",
     "Record",
     "Ref",
     "Scope",

@@ -76,7 +76,11 @@ def test_every_command_and_proposal_tag_roundtrips():
         messages.PauseGoal(goal_id=goal().id, expected_revision=1),
         messages.ResumeGoal(goal_id=goal().id, expected_revision=1),
         messages.CancelGoal(goal_id=goal().id, expected_revision=1),
-        messages.ResolveConflict(belief_ids=("1" * 32,), explanation="checked"),
+        messages.ResolveConflict(
+            belief_ids=("1" * 32,),
+            conflicting_revisions=(records.Ref(id="1" * 32),),
+            explanation="checked",
+        ),
         messages.DecideAction(
             action_id=action().id,
             expected_revision=1,

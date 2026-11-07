@@ -82,10 +82,44 @@ class CancelGoal(GoalControl):
 
 class ResolveConflict(CommandBase):
     kind: Literal["resolve_conflict"] = "resolve_conflict"
-    belief_ids: tuple[Identifier, ...] = Field(min_length=1)
+    belief_ids: tuple[Identifier, ...] = ()
     accepted_belief_id: Identifier | None = None
+    goal_id: Identifier | None = None
+    expected_goal_revision: PositiveInt | None = None
+    conflicting_revisions: tuple[Ref, ...] = ()
+    resolved_constraints: tuple[Constraint, ...] | None = None
     evidence: tuple[Ref, ...] = ()
     explanation: NonEmpty
+
+    @model_validator(mode="after")
+    def _resolution_mode(self) -> ResolveConflict:
+        refs = {ref.id for ref in self.conflicting_revisions}
+        if len(refs) != len(self.conflicting_revisions) or not refs:
+            raise ValueError("conflict resolution requires unique current revision references")
+        if self.goal_id is None:
+            if (
+                not self.belief_ids
+                or len(set(self.belief_ids)) != len(self.belief_ids)
+                or refs != set(self.belief_ids)
+            ):
+                raise ValueError("belief resolution must name all conflicting belief revisions")
+            if self.expected_goal_revision is not None or self.resolved_constraints is not None:
+                raise ValueError("belief and constraint resolution modes cannot be mixed")
+            if (
+                self.accepted_belief_id is not None
+                and self.accepted_belief_id not in self.belief_ids
+            ):
+                raise ValueError("accepted belief must belong to the conflict")
+        elif (
+            self.belief_ids
+            or self.accepted_belief_id is not None
+            or self.expected_goal_revision is None
+            or self.resolved_constraints is None
+        ):
+            raise ValueError(
+                "constraint resolution requires goal revision and replacement constraints only"
+            )
+        return self
 
 
 class DecideAction(CommandBase):
@@ -268,6 +302,9 @@ class OutboxEntry(Model):
 
 
 class CommitBatch(Model):
+    # Response metadata only. The coordinator commits first, then resolves this
+    # ID to the canonical stored receipt. Backpressure has no durable receipt.
+    response_receipt: DecisionReceipt | None = None
     events: tuple[JournalEvent, ...] = ()
     records: tuple[PersistentRecord, ...] = ()
     receipts: tuple[DecisionReceipt, ...] = ()
