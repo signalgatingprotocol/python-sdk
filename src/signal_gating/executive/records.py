@@ -406,6 +406,7 @@ class Reservation(Record):
     budget_id: Identifier
     subject_id: Identifier
     maximum: Limits
+    trusted_maximum_quote: bool = False
     usage: Usage = Field(default_factory=Usage)
     status: Literal["reserved", "settled", "uncertain", "released"] = "reserved"
     evidence: tuple[Ref, ...] = ()
