@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import signal as process_signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -611,3 +614,155 @@ def test_duplicate_outbox_keys_in_one_batch_do_not_silently_overwrite(store: Sto
         )
     assert store.events() == ()
     assert store.outbox() == ()
+
+
+def test_fork_survivor_does_not_keep_dead_writer_ownership(tmp_path: Path) -> None:
+    root = tmp_path / "fork-survivor"
+    read_fd, write_fd = os.pipe()
+    code = """from pathlib import Path
+import os, signal, sys
+from signal_gating.executive.store import Store
+store = Store.open(Path(sys.argv[1]))
+child = os.fork()
+if child == 0:
+    os.close(1)
+    os.close(2)
+    os.read(int(sys.argv[2]), 1)
+    os._exit(0)
+print(child, flush=True)
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(root), str(read_fd)],
+            pass_fds=(read_fd,),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == -process_signal.SIGKILL, result.stderr
+        child_pid = int(result.stdout.strip())
+        os.kill(child_pid, 0)
+        with Store.open(root) as reopened:
+            assert reopened.view().sequence == 0
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_fork_cleanup_does_not_unlock_living_writer(tmp_path: Path) -> None:
+    code = """from pathlib import Path
+import os, sys
+from signal_gating.executive import StoreError
+from signal_gating.executive.store import Store
+store = Store.open(Path(sys.argv[1]))
+child = os.fork()
+if child == 0:
+    os._exit(0)
+os.waitpid(child, 0)
+try:
+    Store.open(Path(sys.argv[1]))
+except StoreError as exc:
+    assert exc.code == 'store_owned'
+else:
+    raise SystemExit('fork cleanup released the living parent ownership')
+store.close()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / "living-parent")],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("opener_kind", ["writer", "snapshot"])
+@pytest.mark.parametrize("uncheckpointed", [False, True])
+def test_future_wal_schema_rejected_without_source_mutation(
+    tmp_path: Path,
+    opener_kind: str,
+    uncheckpointed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = tmp_path / "preflight-temp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    root = tmp_path / "future-wal"
+    root.mkdir()
+    path = root / "executive.sqlite3"
+    database = sqlite3.connect(path)
+    try:
+        database.execute("PRAGMA journal_mode=WAL")
+        database.execute("PRAGMA wal_autocheckpoint=0")
+        database.execute("PRAGMA user_version=999")
+        if not uncheckpointed:
+            database.close()
+            assert not Path(str(path) + "-wal").exists()
+        else:
+            assert Path(str(path) + "-wal").stat().st_size > 0
+        before = {item.name: item.read_bytes() for item in root.iterdir()}
+        opener = Store.open if opener_kind == "writer" else Store.open_readonly
+        with pytest.raises(StoreError) as error:
+            opener(root)
+        assert error.value.code == "unsupported_schema"
+        assert {item.name: item.read_bytes() for item in root.iterdir()} == before
+        assert list(scratch.iterdir()) == []
+    finally:
+        database.close()
+
+
+def test_preflight_honors_supported_schema_committed_only_in_wal(tmp_path: Path) -> None:
+    root = tmp_path / "wal-schema-override"
+    with Store.open(root):
+        pass
+    path = root / "executive.sqlite3"
+    database = sqlite3.connect(path)
+    try:
+        database.execute("PRAGMA wal_autocheckpoint=0")
+        database.execute("PRAGMA user_version=999")
+        database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert int.from_bytes(path.read_bytes()[60:64], "big") == 999
+        database.execute("PRAGMA user_version=2")
+        assert Path(str(path) + "-wal").stat().st_size > 0
+        with Store.open(root) as store:
+            assert store.commit(batch())[0].sequence == 1
+        with Store.open_readonly(root) as snapshot:
+            assert snapshot.view().records == (goal(),)
+    finally:
+        database.close()
+
+
+def test_unstable_preflight_is_bounded_and_cleans_temporary_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "changing-source"
+    with Store.open(root):
+        pass
+    scratch = tmp_path / "preflight-temp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    path = root / "executive.sqlite3"
+    database = sqlite3.connect(path)
+    real_copy = shutil.copyfile
+    copies = 0
+
+    def copy_while_source_changes(source: Path, destination: Path) -> str:
+        nonlocal copies
+        result = real_copy(source, destination)
+        if source == path:
+            copies += 1
+            database.execute(f"PRAGMA user_version={1 if copies % 2 else 2}")
+        return str(result)
+
+    try:
+        database.execute("PRAGMA wal_autocheckpoint=0")
+        monkeypatch.setattr(shutil, "copyfile", copy_while_source_changes)
+        with pytest.raises(StoreError) as error:
+            Store.open(root)
+        assert error.value.code == "unstable_snapshot"
+        assert 0 < copies <= 3
+        assert list(scratch.iterdir()) == []
+    finally:
+        database.close()

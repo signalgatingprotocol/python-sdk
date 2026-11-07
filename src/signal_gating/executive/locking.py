@@ -6,8 +6,22 @@ import os
 import sys
 from pathlib import Path
 from types import ModuleType
+from weakref import WeakSet
 
 from .errors import StoreError
+
+_LOCKS: WeakSet[OwnershipLock] = WeakSet()
+
+
+def _close_inherited_locks() -> None:
+    # flock follows the shared open-file description across fork. Merely refusing
+    # to use an inherited Store does not release that child's ownership reference.
+    for ownership in tuple(_LOCKS):
+        ownership.close()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_inherited_locks)
 
 
 def require_writer_platform() -> None:
@@ -22,6 +36,7 @@ class OwnershipLock:
         self._descriptor: int | None = descriptor
         self._locking = locking
         self._pid = os.getpid()
+        _LOCKS.add(self)
 
     @classmethod
     def acquire(cls, root: Path) -> OwnershipLock:

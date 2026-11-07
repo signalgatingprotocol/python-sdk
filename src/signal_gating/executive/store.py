@@ -10,10 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import TracebackType
 from typing import TypeVar
 
@@ -34,6 +36,7 @@ from .records import (
 
 DATABASE_NAME = "executive.sqlite3"
 BUSY_TIMEOUT_MS = 1000
+_PREFLIGHT_ATTEMPTS = 3
 _RECORD_ADAPTER: TypeAdapter[PersistentRecord] = TypeAdapter(PersistentRecord)
 _EVENT_ADAPTER = TypeAdapter(JournalEvent)
 _ACK_ADAPTER = TypeAdapter(InboxAcknowledgment)
@@ -158,6 +161,48 @@ def _connect_readonly(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _fingerprint(path: Path) -> tuple[int, int, int, int, int] | None:
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return None
+    # Reads may update atime. Only identity/content-change metadata participates.
+    return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+
+def _preflight(path: Path) -> None:
+    """Validate a stable DB/WAL copy without letting SQLite touch source sidecars.
+
+    SQLite mode=ro may create WAL/SHM files or change SHM read marks. Run it only
+    on a private temporary copy until compatibility is established. Copy the WAL
+    as well as the main file: committed schema/history can exist only in WAL.
+    Local-filesystem metadata detects concurrent append/checkpoint/replacement;
+    unstable sources fail closed after bounded retries. Hostile writers capable
+    of defeating filesystem metadata remain outside the host trust boundary.
+    """
+    sources = (path, Path(str(path) + "-wal"))
+    for _ in range(_PREFLIGHT_ATTEMPTS):
+        before = tuple(_fingerprint(source) for source in sources)
+        with TemporaryDirectory(prefix="sgp-preflight-") as temporary:
+            target = Path(temporary) / path.name
+            try:
+                for source, fingerprint in zip(sources, before):
+                    if fingerprint is not None:
+                        shutil.copyfile(source, Path(temporary) / source.name)
+            except FileNotFoundError:
+                # Checkpoint/rename raced the copy; do not interpret a mixture.
+                continue
+            if before[0] is None or before != tuple(_fingerprint(source) for source in sources):
+                continue
+            connection = _connect_readonly(target)
+            try:
+                _validate(connection)
+            finally:
+                connection.close()
+            return
+    raise StoreError("unstable_snapshot", "Executive database changed during preflight snapshot")
+
+
 class Store:
     """Own one writer or a pinned read-only snapshot; close explicitly."""
 
@@ -187,11 +232,7 @@ class Store:
             # Unsupported schema/envelope versions fail before lock, WAL, DDL,
             # or data writes. The owned connection checks the version again.
             if path.exists():
-                preflight = _connect_readonly(path)
-                try:
-                    _validate(preflight)
-                finally:
-                    preflight.close()
+                _preflight(path)
             root.mkdir(parents=True, exist_ok=True, mode=0o700)
             ownership = OwnershipLock.acquire(root)
             connection = sqlite3.connect(
@@ -223,6 +264,7 @@ class Store:
         root = root.resolve()
         connection = None
         try:
+            _preflight(root / DATABASE_NAME)
             connection = _connect_readonly(root / DATABASE_NAME)
             if _validate(connection) != SCHEMA_VERSION:
                 raise StoreError("migration_required", "Open a writer to migrate this store first")
