@@ -571,3 +571,45 @@ def test_missing_parent_budget_and_shared_principal_references_are_rejected(inde
     )
     with pytest.raises(InvalidTransition):
         rebuild([initial(extras[index])])
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_invalidation_checks_dependencies_after_reopening_whole_bundle(tmp_path: Path, reverse):
+    dependent_id = "a" * 32
+    dependent = frame(
+        id=dependent_id,
+        status="completed",
+        dependencies=(Ref(id=TASK_ID, kind="task"),),
+    )
+    start = initial(dependent, task=frame(status="completed"))
+    identifiers = [TASK_ID, dependent_id]
+    invalidation = event(
+        "completion.invalidated",
+        sequence=2,
+        payload={
+            "record_ids": identifiers[::-1] if reverse else identifiers,
+            "reason": "evidence_retracted",
+        },
+    )
+    state = rebuild([start, invalidation])
+    assert (get(state, TASK_ID).status, get(state, TASK_ID).revision) == ("ready", 2)
+    assert (get(state, dependent_id).status, get(state, dependent_id).revision) == ("blocked", 2)
+    assert get(state, dependent_id).wake_condition == WakeCondition(
+        kind="dependency_change",
+        refs=(Ref(id=TASK_ID, kind="task"),),
+        reason_code="completion_invalidated",
+    )
+    root = tmp_path / "store"
+    with Store.open(root) as store:
+        store.commit(CommitBatch(events=(start,)))
+        store.commit(
+            CommitBatch(
+                events=(invalidation,),
+                expected_revisions=(Ref(id=TASK_ID), Ref(id=dependent_id)),
+            )
+        )
+        assert store.view() == state
+        assert rebuild(store.events()) == state
+    with Store.open_readonly(root) as snapshot:
+        assert snapshot.view() == state
+        assert rebuild(snapshot.events()) == state

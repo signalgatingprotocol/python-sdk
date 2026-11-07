@@ -503,6 +503,8 @@ def reduce_event(state: StateView, event: JournalEvent) -> StateView:
                 invalidated = records[identifier]
                 if isinstance(invalidated, Goal):
                     records[identifier] = _replace(invalidated, status="active")
+            # Reopen the entire bundle before testing dependencies. A dependent
+            # must see an invalidated prerequisite's new state in either ID order.
             for identifier in identifiers:
                 invalidated = records[identifier]
                 if isinstance(invalidated, (TaskFrame, Commitment)):
@@ -510,22 +512,25 @@ def reduce_event(state: StateView, event: JournalEvent) -> StateView:
                     status = (
                         "ready" if getattr(goal_record, "status", None) == "active" else "suspended"
                     )
-                    if (
-                        isinstance(invalidated, TaskFrame)
-                        and status == "ready"
-                        and not _eligible(invalidated, records)
-                    ):
-                        records[identifier] = _replace(
-                            invalidated,
-                            status="blocked",
-                            wake_condition=WakeCondition(
+                    records[identifier] = _replace(invalidated, status=status)
+            for identifier in identifiers:
+                reopened = records[identifier]
+                if (
+                    isinstance(reopened, TaskFrame)
+                    and reopened.status == "ready"
+                    and not _eligible(reopened, records)
+                ):
+                    # Eligibility belongs to this same event's one revision.
+                    records[identifier] = reopened.model_copy(
+                        update={
+                            "status": "blocked",
+                            "wake_condition": WakeCondition(
                                 kind="dependency_change",
-                                refs=invalidated.dependencies,
+                                refs=reopened.dependencies,
                                 reason_code="completion_invalidated",
                             ),
-                        )
-                    else:
-                        records[identifier] = _replace(invalidated, status=status)
+                        }
+                    )
         elif event.event_type == "audit.recorded":
             if (
                 set(payload) != {"reason_code", "details"}
