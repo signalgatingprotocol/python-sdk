@@ -373,6 +373,15 @@ class Intake:
                     subgoal=target.outcome,
                 ),
             )
+            initial_work = (*commitments, *tasks)
+            initial_ids = (target.id, *(work.id for work in initial_work))
+            if len(set(initial_ids)) != len(initial_ids) or any(
+                work.id in records or work.revision != 1 for work in initial_work
+            ):
+                raise ConflictError(
+                    "invalid_initial_work",
+                    "Initial work requires fresh distinct IDs and revision 1",
+                )
             if any(c.goal_id != target.id for c in commitments) or any(
                 t.goal_id != target.id or t.status != "ready" for t in tasks
             ):

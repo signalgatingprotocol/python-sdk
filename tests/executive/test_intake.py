@@ -384,6 +384,121 @@ def test_create_goal_has_initial_work_and_replays_after_reopen(store):
         assert snapshot.view() == store.view()
 
 
+@pytest.mark.parametrize("revision", [1, 2])
+def test_create_goal_cannot_reuse_another_owners_initial_work(store, revision):
+    from signal_gating.executive import Commitment, CreateGoal
+
+    from .factories import COMMITMENT_ID, frame
+
+    second_owner = owner(id="e" * 32, name="Second owner")
+    commitment = Commitment(id=COMMITMENT_ID, goal_id=GOAL_ID, responsible_principal_id=OWNER_ID)
+    task = frame()
+    originals = (commitment, task)
+    store.commit(
+        CommitBatch(
+            events=(
+                JournalEvent(
+                    sequence=1,
+                    event_type="state.changed",
+                    producer_id="fixture",
+                    principal_id=OWNER_ID,
+                    subject=Ref(id=second_owner.id),
+                    payload={
+                        "records": [r.model_dump(mode="json") for r in (second_owner, *originals)]
+                    },
+                ),
+            )
+        )
+    )
+    target = goal(id="f" * 32, owner_id=second_owner.id, criteria=())
+    batch = Intake(store).accept(
+        CreateGoal(
+            goal=target,
+            commitments=(
+                commitment.model_copy(update={"goal_id": target.id, "revision": revision}),
+            ),
+            tasks=(task.model_copy(update={"goal_id": target.id, "revision": revision}),),
+        ),
+        principal=second_owner,
+        state=store.view(),
+    )
+    store.commit(batch)
+    assert batch.response_receipt.disposition == "deny"
+    assert batch.response_receipt.reason_code == "invalid_initial_work"
+    current = {r.id: r for r in store.view().records}
+    assert target.id not in current
+    assert current[GOAL_ID] == goal()
+    assert all(current[r.id] == r for r in originals)
+    assert current[batch.response_receipt.id] == batch.response_receipt
+    with Store.open_readonly(store.root) as snapshot:
+        assert snapshot.view() == store.view()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "commitment_revision",
+        "task_revision",
+        "duplicate_commitments",
+        "duplicate_tasks",
+        "goal_commitment_id",
+        "goal_task_id",
+        "commitment_task_id",
+    ],
+)
+def test_create_goal_requires_revision_one_and_unique_initial_work_ids(store, invalid):
+    from signal_gating.executive import Commitment, CreateGoal
+
+    from .factories import COMMITMENT_ID, frame
+
+    target = goal(id="f" * 32, criteria=())
+    commitment = Commitment(id=COMMITMENT_ID, goal_id=target.id, responsible_principal_id=OWNER_ID)
+    task = frame(goal_id=target.id)
+    if invalid == "commitment_revision":
+        commitment = commitment.model_copy(update={"revision": 2})
+    elif invalid == "task_revision":
+        task = task.model_copy(update={"revision": 2})
+    elif invalid == "goal_commitment_id":
+        commitment = commitment.model_copy(update={"id": target.id})
+        task = task.model_copy(update={"commitment_id": target.id})
+    elif invalid == "goal_task_id":
+        task = task.model_copy(update={"id": target.id})
+    elif invalid == "commitment_task_id":
+        task = task.model_copy(update={"id": commitment.id})
+    before = store.view()
+    receipt = accept(
+        store,
+        CreateGoal(
+            goal=target,
+            commitments=(commitment,) * (2 if invalid == "duplicate_commitments" else 1),
+            tasks=(task,) * (2 if invalid == "duplicate_tasks" else 1),
+        ),
+    )
+    assert receipt.disposition == "deny"
+    assert receipt.reason_code == "invalid_initial_work"
+    current = {r.id: r for r in store.view().records}
+    assert all(current[r.id] == r for r in before.records)
+    assert target.id not in current
+    assert commitment.id not in current
+    assert task.id not in current
+
+
+def test_create_goal_accepts_fresh_explicit_initial_work(store):
+    from signal_gating.executive import Commitment, CreateGoal
+
+    from .factories import COMMITMENT_ID, frame
+
+    target = goal(id="f" * 32, criteria=())
+    commitment = Commitment(id=COMMITMENT_ID, goal_id=target.id, responsible_principal_id=OWNER_ID)
+    task = frame(goal_id=target.id)
+    receipt = accept(store, CreateGoal(goal=target, commitments=(commitment,), tasks=(task,)))
+    assert receipt.disposition == "accept"
+    current = {r.id: r for r in store.view().records}
+    assert all(current[r.id] == r for r in (target, commitment, task))
+    with Store.open_readonly(store.root) as snapshot:
+        assert snapshot.view() == store.view()
+
+
 def test_pause_receipt_and_cascade_are_one_atomic_batch(store):
     import sqlite3
 
