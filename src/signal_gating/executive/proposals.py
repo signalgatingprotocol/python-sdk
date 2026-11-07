@@ -55,8 +55,10 @@ class ProposalValidator:
         *,
         memory: MemoryPolicy | None = None,
         staged_drafts: Mapping[str, ArtifactRef] | None = None,
+        worker_principals: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
+        self.worker_principals = MappingProxyType(dict(worker_principals or {}))
         self.clock = clock
         self.memory = memory or MemoryPolicy(clock=clock)
         self.staged_drafts = MappingProxyType(dict(staged_drafts or {}))
@@ -421,6 +423,14 @@ class ProposalValidator:
                             task_id=task.id,
                             capability_id=capability.id,
                             binding_version=capability.binding_version,
+                            binding_id=capability.binding_id,
+                            episode_id=episode.id,
+                            worker_id=episode.worker_id,
+                            origin_principal_id=self.worker_principals.get(episode.worker_id),
+                            accepted_task_revision=task.revision + 1,
+                            accepted_episode_revision=episode.revision + 1,
+                            accepted_fencing_token=task.fencing_token,
+                            expires_at=episode.deadline,
                             arguments_digest=hashlib.sha256(
                                 json.dumps(
                                     proposal.model_dump(mode="json")["arguments"],
@@ -576,12 +586,51 @@ class ProposalValidator:
                     "revision": task.revision + 1,
                     "status": "verifying" if completion else "suspended",
                     "fencing_token": task.fencing_token + (0 if completion else 1),
+                    "pending_action_ids": tuple(
+                        dict.fromkeys(
+                            (
+                                *task.pending_action_ids,
+                                *(
+                                    p.id
+                                    for p in resolved.proposals
+                                    if isinstance(p, ActionIntent) and p.required
+                                ),
+                            )
+                        )
+                    ),
                     "resume_brief": resolved.resume_brief,
                     "wake_condition": resolved.blocker
                     if resolved.stop_reason == "blocked"
                     else None,
                 }
             )
+            for identifier, item in tuple(writes.items()):
+                if isinstance(item, ActionRecord):
+                    accepted_task = writes[task.id]
+                    accepted_episode = writes[episode.id]
+                    assert isinstance(accepted_task, TaskFrame)
+                    assert isinstance(accepted_episode, Episode)
+                    writes[identifier] = item.model_copy(
+                        update={
+                            "accepted_fencing_token": accepted_task.fencing_token,
+                            "read_set": tuple(
+                                reference(accepted_task)
+                                if r.id == task.id
+                                else reference(accepted_episode)
+                                if r.id == episode.id
+                                else r
+                                for r in dict.fromkeys(
+                                    (
+                                        *item.read_set,
+                                        *mandatory,
+                                        reference(context),
+                                        reference(episode),
+                                        *task.dependencies,
+                                    )
+                                )
+                            ),
+                        }
+                    )
             events = (changed(tuple(writes.values()), reference(episode)),)
             after = reduce_event(
                 state, events[0].model_copy(update={"sequence": state.sequence + 1})

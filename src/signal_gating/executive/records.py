@@ -460,6 +460,8 @@ class CapabilitySpec(Model):
     id: NonEmpty
     binding_version: NonEmpty
     description: str = ""
+    # Operator registration identity changes even if a version string is reused.
+    binding_id: Identifier | None = None
     input_schema: JsonObject
     effect_class: Literal["read_only", "reversible", "consequential", "human_only"]
     resource_scope_rules: tuple[NonEmpty, ...] = ()
@@ -485,6 +487,17 @@ class ActionRecord(Record):
     task_id: Identifier
     capability_id: NonEmpty
     binding_version: NonEmpty
+    binding_id: Identifier | None = None
+    # Trusted acceptance lineage, never inferred from a worker name or payload role.
+    episode_id: Identifier | None = None
+    worker_id: NonEmpty | None = None
+    origin_principal_id: Identifier | None = None
+    accepted_task_revision: PositiveInt | None = None
+    accepted_episode_revision: PositiveInt | None = None
+    accepted_fencing_token: NonNegativeInt | None = None
+    dispatched_at: Timestamp | None = None
+    dispatch_attempts: NonNegativeInt = 0
+    prior_reservation_ids: tuple[Identifier, ...] = ()
     arguments_digest: Digest
     arguments: JsonObject = Field(default_factory=dict)
     arguments_ref: Ref | None = None
