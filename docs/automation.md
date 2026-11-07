@@ -1,12 +1,15 @@
 # Skills and workflows
 
 Use the existing agent session for reasoning and GitHub Actions for repeatable
-checks. Two portable skills capture the repository-specific procedures:
+checks. Three portable skills capture the repository-specific procedures:
 
 - [SDK maintenance](../.github/skills/sdk-maintenance/SKILL.md): reproduce a bug
   or CI failure, make the smallest repair, and preserve the learning in a test.
 - [SDK release](../.github/skills/sdk-release/SKILL.md): prepare a consistent
   version, verify built distributions, and follow the existing release process.
+- [SDK delivery](../.github/skills/sdk-delivery/SKILL.md): isolate intended
+  commits, open PRs, verify current CI and review requirements, and complete
+  authorized merges while preserving unrelated work.
 
 `AGENTS.md` routes agents to these skills. Each uses the standard `SKILL.md`
 format and can be read by an existing coding agent without a separate service.
