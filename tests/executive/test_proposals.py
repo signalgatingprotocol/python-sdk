@@ -431,3 +431,66 @@ def test_contradictory_supported_claims_inside_one_bundle_are_both_disputed(runn
     assert {r.epistemic_status for r in store.view().records if isinstance(r, Belief)} == {
         "disputed"
     }
+
+
+@pytest.mark.parametrize("dependent_first", [False, True])
+@pytest.mark.parametrize("transitive", [False, True])
+def test_simultaneous_belief_revisions_reject_withdrawn_support_in_either_order(
+    running, dependent_first, transitive
+):
+    store, episode, reads = running
+    source_artifact = artifact()
+    source = Belief(
+        id="a" * 32,
+        created_at=NOW,
+        claim="Source is checked",
+        scope=source_artifact.scope,
+        evidence=(ref(source_artifact),),
+        epistemic_status="supported",
+    )
+    intermediate = Belief(
+        id="b" * 32,
+        created_at=NOW,
+        claim="Dependent is checked",
+        scope=source.scope,
+        evidence=(ref(source),),
+        epistemic_status="supported",
+    )
+    dependent = (
+        Belief(
+            id="e" * 32,
+            created_at=NOW,
+            claim="Transitive dependent is checked",
+            scope=source.scope,
+            evidence=(ref(intermediate),),
+            epistemic_status="supported",
+        )
+        if transitive
+        else intermediate
+    )
+    seed = (source_artifact, source, intermediate) + ((dependent,) if transitive else ())
+    store.commit(CommitBatch(events=(event(seed),)))
+    before = store.view()
+    withdraw = proposal(
+        read_set=(*reads, ref(source)),
+        belief=source.model_copy(update={"revision": 2, "evidence": ()}),
+    )
+    retain = proposal(
+        id="f" * 32,
+        read_set=(*reads, ref(dependent)),
+        belief=dependent.model_copy(update={"revision": 2}),
+    )
+    proposals = (retain, withdraw) if dependent_first else (withdraw, retain)
+    memory = MemoryPolicy(
+        evidence_validators={OWNER_ID: lambda change, state: True}, clock=lambda: NOW
+    )
+    batch = validator(memory=memory).validate(result(*proposals), episode, before)
+    assert batch.response_receipt.disposition == "stale"
+    assert batch.response_receipt.reason_code == "stale_dependency"
+    store.commit(batch)
+    # Rejection may journal its receipt but must preserve every pre-batch record.
+    current = {record.id: record for record in store.view().records}
+    assert all(current[record.id] == record for record in before.records)
+    assert rebuild(store.events()) == store.view()
+    with Store.open_readonly(store.root) as snapshot:
+        assert snapshot.view() == store.view()

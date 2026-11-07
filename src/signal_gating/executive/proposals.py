@@ -511,6 +511,49 @@ class ProposalValidator:
                                 }
                             )
                         )
+            # A simultaneous revision can withdraw support that passed against
+            # pre-batch state. Check every proposed support chain against final
+            # post-images, including unchanged intermediate beliefs.
+            candidates.update(writes)
+            candidate_state = StateView(records=tuple(candidates.values()))
+            for support_change in resolved.proposals:
+                if not isinstance(support_change, BeliefChange):
+                    continue
+                supported = writes[support_change.belief.id]
+                if not isinstance(supported, Belief) or supported.epistemic_status != "supported":
+                    continue
+                final_policy = self.memory.evaluate(
+                    support_change.model_copy(update={"belief": supported}), candidate_state
+                )
+                if final_policy.disposition not in {"admit", "revise", "dispute"}:
+                    raise InvalidTransition("stale_dependency", "Bundle withdrew belief support")
+                pending = [supported]
+                checked: set[str] = set()
+                while pending:
+                    supported_input = pending.pop()
+                    if supported_input.id in checked:
+                        continue
+                    checked.add(supported_input.id)
+                    for support_ref in supported_input.evidence:
+                        dependency = candidates.get(support_ref.id)
+                        if (
+                            dependency is None
+                            or dependency.revision != support_ref.revision
+                            or (
+                                support_ref.kind != "record" and support_ref.kind != dependency.kind
+                            )
+                            or isinstance(dependency, Belief)
+                            and dependency.epistemic_status != "supported"
+                            or isinstance(dependency, ArtifactRef)
+                            and not dependency.valid
+                        ):
+                            raise InvalidTransition(
+                                "stale_dependency", "Bundle withdrew belief support"
+                            )
+                        if dependency.id in records:
+                            require(reference(records[dependency.id]))
+                        if isinstance(dependency, Belief):
+                            pending.append(dependency)
             # No worker status can finish a task, fulfill a criterion or dispatch.
             writes[episode.id] = episode.model_copy(
                 update={"revision": episode.revision + 1, "status": "accepted"}
