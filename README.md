@@ -214,7 +214,9 @@ Also included:
   can be a legitimate read. Review findings against the actual tool contract.
 - **Policy as code** (`signal_gating.policy`): declarative YAML
   policies, first-match-wins rules, versioning, and would-allow/would-deny
-  decision labels. Dry-run labels do not guarantee non-enforcing delivery.
+  decision labels. A `require_approval` rule invokes `engine.approver` even
+  below the auto-approve ceiling; without a callback, the call stays blocked.
+  Dry-run labels do not guarantee non-enforcing delivery.
 - **Agent Skills compatibility** (`signal_gating.skills`): export SGP
   tool surfaces as skills, load installed skills with risk
   classification. Includes the `sgp-control` skill text.
