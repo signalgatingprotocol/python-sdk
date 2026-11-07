@@ -169,6 +169,10 @@ class BudgetPolicy:
     ) -> CommitBatch:
         chain = _chain(state, budget_id)
         subject_id = subject_id or budget_id
+        if subject_id == reservation_id:
+            raise BudgetError(
+                "invalid_reservation_subject", "Reservation requires a separate subject binding"
+            )
         if limits.currency != chain[0].limits.currency:
             raise BudgetError("currency_mismatch", "Reservation currency differs from budget")
         if self.strict_money and (limits.cost_microunits is None or not trusted_maximum_quote):

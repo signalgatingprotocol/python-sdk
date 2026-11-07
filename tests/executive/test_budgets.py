@@ -567,3 +567,22 @@ def test_nonstrict_untrusted_finite_estimate_remains_unknown_liability(store):
     )
     with pytest.raises(BudgetError):
         policy.resolve_usage(command, store.view())
+
+
+def test_reservation_cannot_bind_itself_as_subject(store):
+    before = store.view()
+    identifier = uuid4().hex
+    with pytest.raises(BudgetError) as rejected:
+        batch = BudgetPolicy().reserve(
+            before,
+            LEFT,
+            maxima(calls=1),
+            identifier,
+            subject_id=identifier,
+            trusted_maximum_quote=True,
+        )
+        # The real reducer previously accepted this self-reference, because
+        # the reservation was visible in its own resulting post-image bundle.
+        store.commit(batch)
+    assert rejected.value.code == "invalid_reservation_subject"
+    assert store.view() == before
