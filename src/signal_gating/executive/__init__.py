@@ -18,6 +18,7 @@ from .errors import (
     ContextBudgetError,
     ContractError,
     ExecutiveError,
+    InvalidTransition,
     StoreError,
 )
 from .messages import (
@@ -167,6 +168,7 @@ __all__ = [
     "ExecutiveError",
     "ContractError",
     "ConflictError",
+    "InvalidTransition",
     "AuthorityError",
     "BudgetError",
     "ContextBudgetError",

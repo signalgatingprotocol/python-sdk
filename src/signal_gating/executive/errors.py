@@ -21,6 +21,10 @@ class ConflictError(ExecutiveError):
     """A duplicate identity or changed revision conflicts with a write."""
 
 
+class InvalidTransition(ConflictError):  # noqa: N818 - public lifecycle contract name
+    """An event violates a lifecycle or replay invariant."""
+
+
 class AuthorityError(ExecutiveError):
     """The authenticated principal lacks authority."""
 

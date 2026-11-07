@@ -21,7 +21,7 @@ from typing import TypeVar
 
 from pydantic import TypeAdapter, ValidationError
 
-from .errors import ConflictError, StoreError
+from .errors import ConflictError, InvalidTransition, StoreError
 from .locking import OwnershipLock, require_writer_platform
 from .messages import CommitBatch, InboxAcknowledgment, OutboxEntry
 from .migrations import SCHEMA_VERSION, migrate, schema_version
@@ -33,6 +33,7 @@ from .records import (
     PersistentRecord,
     StateView,
 )
+from .reducers import rebuild, reduce_event
 
 DATABASE_NAME = "executive.sqlite3"
 BUSY_TIMEOUT_MS = 1000
@@ -141,8 +142,14 @@ def _validate(connection: sqlite3.Connection) -> int:
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise StoreError("corrupt_store", "Executive database contains invalid references")
     if version:
-        _events(connection)
-        _records(connection)
+        events = _events(connection)
+        records = _records(connection)
+        try:
+            reconstructed = rebuild(events)
+        except InvalidTransition as exc:
+            raise StoreError("invalid_journal", "Executive journal cannot be replayed") from exc
+        if reconstructed.records != records:
+            raise StoreError("corrupt_store", "Materialized state disagrees with the journal")
     if version >= 2:
         _outbox(connection)
         _acknowledgments(connection)
@@ -380,6 +387,29 @@ class Store:
                 item.model_copy(update={"sequence": sequence + index})
                 for index, item in enumerate(batch.events, 1)
             )
+            reduced = StateView(sequence=sequence, records=tuple(current.values()))
+            for item in assigned:
+                reduced = reduce_event(reduced, item)
+            derived = tuple(
+                record for record in reduced.records if current.get(record.id) != record
+            )
+            if records and {record.id: record for record in records} != {
+                record.id: record for record in derived
+            }:
+                raise InvalidTransition(
+                    "materialization_mismatch", "Caller writes disagree with journal reduction"
+                )
+            # Derived cascades are ordinary authoritative writes: require CAS for
+            # every existing changed record, just as for caller-supplied writes.
+            for record in derived:
+                previous = current.get(record.id)
+                if previous is not None and record.id not in expected:
+                    raise ConflictError(
+                        "invalid_revision",
+                        "Derived writes require a CAS read set",
+                        record_id=record.id,
+                    )
+            records = derived
             for item in assigned:
                 payload = canonical_json(item)
                 self._connection.execute(

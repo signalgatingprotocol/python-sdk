@@ -17,7 +17,9 @@ import pytest
 from pydantic import ValidationError
 
 from signal_gating.executive import (
+    Budget,
     CommitBatch,
+    Commitment,
     ConflictError,
     DecisionReceipt,
     InboxAcknowledgment,
@@ -26,11 +28,12 @@ from signal_gating.executive import (
     OutboxEntry,
     Ref,
     Reservation,
+    Scope,
     StoreError,
 )
 from signal_gating.executive.store import Store
 
-from .factories import GOAL_ID, NOW, OWNER_ID, action, goal, owner, signal
+from .factories import COMMITMENT_ID, GOAL_ID, NOW, OWNER_ID, action, frame, goal, owner, signal
 
 
 def event(**overrides: object) -> JournalEvent:
@@ -39,18 +42,59 @@ def event(**overrides: object) -> JournalEvent:
             "id": "d" * 32,
             "created_at": NOW,
             "sequence": 1,
-            "event_type": "goal.created",
+            "event_type": "audit.recorded",
             "producer_id": "fixture",
             "principal_id": OWNER_ID,
             "subject": Ref(id=GOAL_ID),
-            "payload": {"z": 1, "a": {"z": "雪", "a": 2}},
+            "payload": {
+                "reason_code": "storage_test",
+                "details": {"z": 1, "a": {"z": "雪", "a": 2}},
+            },
             **overrides,
         }
     )
 
 
 def batch(**overrides: object) -> CommitBatch:
-    return CommitBatch.model_validate({"events": (event(),), "records": (goal(),), **overrides})
+    """Store fixtures carry the exact typed writes in canonical journal events."""
+    values = {"events": (event(),), "records": (owner(), goal()), **overrides}
+    records = list(values["records"])
+    identifiers = {r.id for r in records}
+    if any(r.kind == "goal" and r.revision == 1 for r in records) and OWNER_ID not in identifiers:
+        records.append(owner())
+    if any(r.kind == "action" for r in records):
+        records.extend(
+            (
+                Commitment(
+                    id=COMMITMENT_ID,
+                    created_at=NOW,
+                    goal_id=GOAL_ID,
+                    responsible_principal_id=OWNER_ID,
+                ),
+                frame(),
+            )
+        )
+    if any(r.kind == "reservation" for r in records):
+        records.append(
+            Budget(
+                id="0" * 32, created_at=NOW, scope=Scope(goal_id=GOAL_ID), limits=Limits(calls=1)
+            )
+        )
+    values["records"] = tuple(records)
+    writes = (*records, *values.get("receipts", ()), *values.get("signals", ()))
+    events = tuple(values["events"])
+    if writes and events:
+        events = (
+            events[0].model_copy(
+                update={
+                    "event_type": "state.changed",
+                    "payload": {"records": [r.model_dump(mode="json") for r in writes]},
+                }
+            ),
+            *events[1:],
+        )
+    values["events"] = events
+    return CommitBatch.model_validate(values)
 
 
 @pytest.fixture
@@ -99,7 +143,7 @@ def test_complete_batch_is_atomic_and_survives_reopen(tmp_path: Path) -> None:
     store.close()
     with Store.open(root) as reopened:
         assert reopened.view() == before
-        assert len(before.records) == 6
+        assert len(before.records) == 9
         assert reopened.events() == committed
         assert reopened.acknowledgment(OWNER_ID, "operator", "command-1") == acknowledgment
         assert reopened.acknowledgment(OWNER_ID, "operator", "absent") is None
@@ -223,7 +267,9 @@ def test_canonical_json_and_checksum_detect_corruption(store: Store) -> None:
             allow_nan=False,
         )
         assert checksum == hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        db.execute("UPDATE journal SET payload = replace(payload, 'goal.created', 'goal.changed')")
+        db.execute(
+            "UPDATE journal SET payload = replace(payload, 'state.changed', 'state.corrupted')"
+        )
     with pytest.raises(StoreError, match="checksum"):
         store.events()
 
@@ -270,8 +316,8 @@ def test_future_schema_is_rejected_before_mutation(tmp_path: Path) -> None:
 def test_migration_preserves_interpretable_event_bytes(tmp_path: Path) -> None:
     root = tmp_path / "legacy"
     root.mkdir()
-    raw = event().model_dump_json()
-    record = goal().model_dump_json()
+    raw = batch().events[0].model_dump_json()
+    records = batch().records
     with sqlite3.connect(root / "executive.sqlite3") as db:
         db.execute(
             "CREATE TABLE journal(sequence INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, "
@@ -286,14 +332,16 @@ def test_migration_preserves_interpretable_event_bytes(tmp_path: Path) -> None:
             "INSERT INTO journal VALUES(1,?,?,?)",
             (event().id, raw, hashlib.sha256(raw.encode()).hexdigest()),
         )
-        db.execute(
-            "INSERT INTO records VALUES(?,?,?,?,?)",
-            (GOAL_ID, "goal", 1, record, hashlib.sha256(record.encode()).hexdigest()),
-        )
+        for record in records:
+            encoded = record.model_dump_json()
+            db.execute(
+                "INSERT INTO records VALUES(?,?,?,?,?)",
+                (record.id, record.kind, 1, encoded, hashlib.sha256(encoded.encode()).hexdigest()),
+            )
         db.execute("PRAGMA user_version=1")
     with Store.open(root) as store:
-        assert store.events() == (event(),)
-        assert store.view().records == (goal(),)
+        assert store.events() == batch().events
+        assert store.view().records == batch().records
         assert store.outbox() == ()
         assert store.commit(batch(events=(event(id="e" * 32),), records=()))[0].sequence == 2
     with sqlite3.connect(root / "executive.sqlite3") as db:
@@ -465,12 +513,25 @@ def test_failed_migration_rolls_back_schema_and_releases_lock(tmp_path: Path) ->
             "INSERT INTO records VALUES(?,?,?,?,?)",
             ("a" * 32, "signal", 1, duplicate, hashlib.sha256(duplicate.encode()).hexdigest()),
         )
+        # Keep replay consistent so this specifically exercises migration's
+        # unique signal-index backfill, rather than the replay preflight gate.
+        duplicate_event = event(
+            id="e" * 32,
+            sequence=2,
+            event_type="state.changed",
+            payload={"records": [json.loads(duplicate)]},
+        ).model_dump_json()
+        db.execute(
+            "INSERT INTO journal VALUES(2,?,?,?)",
+            ("e" * 32, duplicate_event, hashlib.sha256(duplicate_event.encode()).hexdigest()),
+        )
     with pytest.raises(StoreError):
         Store.open(root)
     with sqlite3.connect(path) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 1
         assert db.execute("SELECT 1 FROM sqlite_master WHERE name='signal_keys'").fetchone() is None
         db.execute("DELETE FROM records WHERE id=?", ("a" * 32,))
+        db.execute("DELETE FROM journal WHERE sequence=2")
     with Store.open(root) as migrated:
         with pytest.raises(ConflictError):
             migrated.commit(
@@ -498,8 +559,8 @@ os.kill(os.getpid(), signal.SIGKILL)
     )
     assert result.returncode == -process_signal.SIGKILL, result.stderr
     with Store.open(root) as store:
-        assert store.events() == (event(),)
-        assert store.view().records == (goal(),)
+        assert store.events() == batch().events
+        assert store.view().records == batch().records
 
 
 def test_readonly_side_indexes_reject_envelope_identity_mismatch(tmp_path: Path) -> None:
@@ -728,7 +789,7 @@ def test_preflight_honors_supported_schema_committed_only_in_wal(tmp_path: Path)
         with Store.open(root) as store:
             assert store.commit(batch())[0].sequence == 1
         with Store.open_readonly(root) as snapshot:
-            assert snapshot.view().records == (goal(),)
+            assert snapshot.view().records == batch().records
     finally:
         database.close()
 
