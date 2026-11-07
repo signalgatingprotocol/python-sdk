@@ -12,6 +12,13 @@ from .config import (
     WorkerConfig,
     WorkspaceConfig,
 )
+from .context import (
+    ContextAssembler,
+    ContextBudgetInsufficient,
+    TokenCounter,
+    UTF8ByteCounter,
+    render_packet,
+)
 from .errors import (
     AuthorityError,
     BudgetError,
@@ -97,6 +104,11 @@ from .records import (
 from .scheduler import AttentionPolicy, ScheduledItem, Scheduler, wake
 
 __all__ = [
+    "ContextAssembler",
+    "ContextBudgetInsufficient",
+    "TokenCounter",
+    "UTF8ByteCounter",
+    "render_packet",
     "AttentionPolicy",
     "ScheduledItem",
     "Scheduler",

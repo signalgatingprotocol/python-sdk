@@ -549,6 +549,9 @@ class PolicyDecision(Model):
 
 
 class ContextManifest(Model):
+    required_ids: tuple[Identifier, ...] = ()
+    visible_ids: tuple[Identifier, ...] = ()
+    context_token_limit: PositiveInt | None = None
     included: tuple[Ref, ...] = ()
     omitted: tuple[Ref, ...] = ()
     selection_reasons: tuple[NonEmpty, ...] = ()
@@ -576,6 +579,8 @@ class ContextPacket(Record):
     mandatory_read_set: tuple[Ref, ...] = ()
     manifest: ContextManifest
     rendered_input: str
+    rendered_artifact: ArtifactRef | None = None
+    worker_instructions: str | None = None
 
 
 class ArtifactDraft(Model):
