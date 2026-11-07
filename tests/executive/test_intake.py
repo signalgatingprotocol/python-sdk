@@ -695,3 +695,158 @@ def test_constraint_verdict_is_evaluated_once_before_mutating_goal_status(store)
     )
     assert receipt.reason_code == "constraint_conflict"
     assert calls == ["active"]
+
+
+def test_revised_conflicting_constraint_can_be_removed_with_replayable_history(store):
+    from signal_gating.executive import Constraint, PolicyDecision, ResolveConflict
+    from signal_gating.executive.authority import Authority, RuleRegistry
+    from signal_gating.executive.reducers import rebuild
+
+    constraint = Constraint(
+        description="Conflicting rule", enforcement="rule", enforcement_id="conflict"
+    )
+    authority = Authority(
+        rules=RuleRegistry(
+            {
+                "conflict": lambda _: PolicyDecision(
+                    gate="execution", disposition="deny", reason_code="constraint_conflict"
+                )
+            }
+        )
+    )
+    first = accept(
+        store,
+        ReviseGoal(goal_id=GOAL_ID, expected_revision=1, constraints=(constraint,)),
+        authority=authority,
+    )
+    assert first.reason_code == "constraint_conflict"
+    blocked = next(r for r in store.view().records if r.id == GOAL_ID)
+    revised = constraint.model_copy(update={"revision": 2, "description": "Still conflicting"})
+    second = accept(
+        store,
+        ResolveConflict(
+            goal_id=GOAL_ID,
+            expected_goal_revision=blocked.revision,
+            conflicting_revisions=(Ref(id=constraint.id),),
+            resolved_constraints=(revised,),
+            explanation="Revise the named conflict",
+        ),
+        authority=authority,
+    )
+    assert second.reason_code == "constraint_conflict"
+    blocked = next(r for r in store.view().records if r.id == GOAL_ID)
+    resolved = accept(
+        store,
+        ResolveConflict(
+            goal_id=GOAL_ID,
+            expected_goal_revision=blocked.revision,
+            conflicting_revisions=(Ref(id=constraint.id, revision=2),),
+            resolved_constraints=(),
+            explanation="Remove revised conflict",
+        ),
+        authority=authority,
+    )
+    assert resolved.disposition == "accept"
+    current = {r.id: r for r in store.view().records}
+    assert current[GOAL_ID].status == "active"
+    assert current[GOAL_ID].constraints == ()
+    assert current[constraint.id] == revised
+    assert Ref(id=constraint.id, revision=2) in second.state_revisions
+    assert rebuild(store.events()) == store.view()
+    with Store.open_readonly(store.root) as snapshot:
+        assert snapshot.view() == store.view()
+
+
+def test_paused_goal_accepts_conflicting_correction_and_resolution_without_resuming(store):
+    from signal_gating.executive import (
+        Commitment,
+        Constraint,
+        PolicyDecision,
+        ResolveConflict,
+        ResumeGoal,
+    )
+    from signal_gating.executive.authority import Authority, RuleRegistry
+    from signal_gating.executive.reducers import rebuild
+
+    from .factories import COMMITMENT_ID, frame
+
+    commitment = Commitment(id=COMMITMENT_ID, goal_id=GOAL_ID, responsible_principal_id=OWNER_ID)
+    task = frame()
+    store.commit(
+        CommitBatch(
+            events=(
+                JournalEvent(
+                    sequence=1,
+                    event_type="state.changed",
+                    producer_id="fixture",
+                    principal_id=OWNER_ID,
+                    subject=Ref(id=task.id),
+                    payload={"records": [r.model_dump(mode="json") for r in (commitment, task)]},
+                ),
+            )
+        )
+    )
+    assert accept(store, PauseGoal(goal_id=GOAL_ID, expected_revision=1)).disposition == "accept"
+    paused = {r.id: r for r in store.view().records}
+    constraint = Constraint(
+        description="New conflict while paused", enforcement="rule", enforcement_id="conflict"
+    )
+    authority = Authority(
+        rules=RuleRegistry(
+            {
+                "conflict": lambda _: PolicyDecision(
+                    gate="execution", disposition="deny", reason_code="constraint_conflict"
+                )
+            }
+        )
+    )
+    receipt = accept(
+        store,
+        ReviseGoal(
+            goal_id=GOAL_ID, expected_revision=paused[GOAL_ID].revision, constraints=(constraint,)
+        ),
+        authority=authority,
+    )
+    assert receipt.reason_code == "constraint_conflict"
+    corrected = {r.id: r for r in store.view().records}
+    assert corrected[GOAL_ID].status == "paused"
+    assert Ref(id=constraint.id) in receipt.state_revisions
+    assert corrected[task.id].status not in ("ready", "running")
+    assert corrected[task.id].fencing_token > paused[task.id].fencing_token
+    assert corrected[task.id].wake_condition.reason_code == "constraint_conflict"
+    assert (
+        accept(
+            store,
+            ResumeGoal(goal_id=GOAL_ID, expected_revision=corrected[GOAL_ID].revision),
+            authority=authority,
+        ).reason_code
+        == "constraint_conflict_unresolved"
+    )
+    resolved = accept(
+        store,
+        ResolveConflict(
+            goal_id=GOAL_ID,
+            expected_goal_revision=corrected[GOAL_ID].revision,
+            conflicting_revisions=(Ref(id=constraint.id),),
+            resolved_constraints=(),
+            explanation="Remove named conflict without resuming",
+        ),
+        authority=authority,
+    )
+    assert resolved.disposition == "accept"
+    current = {r.id: r for r in store.view().records}
+    assert current[GOAL_ID].status == "paused"
+    assert current[task.id].status == "suspended"
+    assert current[task.id].wake_condition is None
+    assert rebuild(store.events()) == store.view()
+    with Store.open_readonly(store.root) as snapshot:
+        assert snapshot.view() == store.view()
+    assert (
+        accept(
+            store,
+            ResumeGoal(goal_id=GOAL_ID, expected_revision=current[GOAL_ID].revision),
+            authority=authority,
+        ).disposition
+        == "accept"
+    )
+    assert next(r for r in store.view().records if r.id == task.id).status == "ready"

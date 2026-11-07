@@ -827,3 +827,46 @@ def test_unstable_preflight_is_bounded_and_cleans_temporary_snapshots(
         assert list(scratch.iterdir()) == []
     finally:
         database.close()
+
+
+@pytest.mark.parametrize("explicit_records", [False, True])
+def test_embedded_constraint_promotion_requires_owning_goal_cas(store, explicit_records):
+    from signal_gating.executive import Constraint
+    from signal_gating.executive.reducers import rebuild, reduce_event
+
+    original = Constraint(description="Original embedded constraint")
+    revised = original.model_copy(
+        update={"revision": 2, "description": "Revised embedded constraint"}
+    )
+    store.commit(batch(records=(owner(), goal(constraints=(original,)))))
+    store.commit(
+        batch(
+            events=(event(id="e" * 32),),
+            records=(goal(revision=2, constraints=(revised,)),),
+            expected_revisions=(Ref(id=GOAL_ID),),
+        )
+    )
+    promotion = event(
+        id="f" * 32,
+        event_type="state.changed",
+        payload={"records": [revised.model_dump(mode="json")]},
+    )
+    before = store.view()
+    # Promotion is a valid representation change, with no invented revision 1.
+    reduce_event(before, promotion.model_copy(update={"sequence": before.sequence + 1}))
+    with pytest.raises(ConflictError) as error:
+        store.commit(
+            CommitBatch(events=(promotion,), records=(revised,) if explicit_records else ())
+        )
+    assert error.value.code == "missing_promotion_read"
+    assert store.view() == before
+    committed = store.commit(
+        CommitBatch(
+            events=(promotion,), expected_revisions=(Ref(id=GOAL_ID, revision=2, kind="goal"),)
+        )
+    )
+    assert committed
+    assert next(r for r in store.view().records if r.id == revised.id) == revised
+    assert rebuild(store.events()) == store.view()
+    with Store.open_readonly(store.root) as snapshot:
+        assert snapshot.view() == store.view()

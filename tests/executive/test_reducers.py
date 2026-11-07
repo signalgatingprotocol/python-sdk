@@ -613,3 +613,49 @@ def test_invalidation_checks_dependencies_after_reopening_whole_bundle(tmp_path:
     with Store.open_readonly(root) as snapshot:
         assert snapshot.view() == state
         assert rebuild(snapshot.events()) == state
+
+
+@pytest.mark.parametrize("constraint_first", [True, False])
+def test_exact_embedded_constraint_promotion_preserves_revision_and_replay(constraint_first):
+    from signal_gating.executive import Constraint
+
+    original = Constraint(description="Original rule")
+    revised = original.model_copy(update={"revision": 2, "description": "Revised rule"})
+    first = initial(constraints=(original,))
+    second = changed(goal(revision=2, constraints=(revised,)), sequence=2)
+    before = rebuild((first, second))
+    retired_goal = goal(revision=3, constraints=())
+    writes = (revised, retired_goal) if constraint_first else (retired_goal, revised)
+    promotion = changed(*writes, sequence=3)
+    after = reduce_event(before, promotion)
+    assert get(after, original.id) == revised
+    assert get(after, GOAL_ID).constraints == ()
+    assert rebuild((first, second, promotion)) == after
+
+
+@pytest.mark.parametrize(
+    "change", [{"description": "Changed during promotion"}, {"id": "f" * 32}, {"revision": 3}]
+)
+def test_constraint_promotion_rejects_mismatched_or_unrelated_postimages(change):
+    from signal_gating.executive import Constraint
+
+    embedded = Constraint(description="Embedded rule", revision=2)
+    before = reduce_event(StateView(), initial(constraints=(embedded,)))
+    with pytest.raises(InvalidTransition) as error:
+        reduce_event(before, changed(embedded.model_copy(update=change), sequence=2))
+    assert error.value.code == "invalid_revision"
+    assert get(before, GOAL_ID).constraints == (embedded,)
+
+
+@pytest.mark.parametrize("goal_first", [True, False])
+def test_constraint_promotion_cannot_borrow_revision_from_same_event(goal_first):
+    from signal_gating.executive import Constraint
+
+    original = Constraint(description="Original rule")
+    before = reduce_event(StateView(), initial(constraints=(original,)))
+    revised = original.model_copy(update={"revision": 2})
+    updated_goal = goal(revision=2, constraints=(revised,))
+    writes = (updated_goal, revised) if goal_first else (revised, updated_goal)
+    with pytest.raises(InvalidTransition) as error:
+        reduce_event(before, changed(*writes, sequence=2))
+    assert error.value.code == "invalid_revision"

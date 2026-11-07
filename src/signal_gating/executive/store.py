@@ -26,8 +26,10 @@ from .locking import OwnershipLock, require_writer_platform
 from .messages import CommitBatch, InboxAcknowledgment, OutboxEntry
 from .migrations import SCHEMA_VERSION, migrate, schema_version
 from .records import (
+    Constraint,
     DecisionReceipt,
     ExecutiveSignal,
+    Goal,
     JournalEvent,
     Model,
     PersistentRecord,
@@ -371,7 +373,13 @@ class Store:
             for record in records:
                 previous = current.get(record.id)
                 if previous is None:
-                    valid = record.revision == 1
+                    valid = record.revision == 1 or (
+                        isinstance(record, Constraint)
+                        and any(
+                            isinstance(goal, Goal) and record in goal.constraints
+                            for goal in current.values()
+                        )
+                    )
                 else:
                     valid = (
                         record.id in expected
@@ -407,6 +415,22 @@ class Store:
             # every existing changed record, just as for caller-supplied writes.
             for record in derived:
                 previous = current.get(record.id)
+                if previous is None and isinstance(record, Constraint) and record.revision > 1:
+                    # An existing embedded identity may become standalone at
+                    # its unchanged revision. Fence the pre-batch owner too,
+                    # even if this event does not rewrite that Goal.
+                    owners = tuple(
+                        goal
+                        for goal in current.values()
+                        if isinstance(goal, Goal)
+                        and any(c.id == record.id for c in goal.constraints)
+                    )
+                    if not owners or any(goal.id not in expected for goal in owners):
+                        raise ConflictError(
+                            "missing_promotion_read",
+                            "Constraint promotion requires its owning goal CAS",
+                            record_id=record.id,
+                        )
                 if previous is not None and record.id not in expected:
                     raise ConflictError(
                         "invalid_revision",

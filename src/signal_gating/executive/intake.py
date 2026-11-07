@@ -656,7 +656,9 @@ class Intake:
             check = self.authority.check_constraints(target.constraints, {"goal": target})
             if check.reason_code == "constraint_conflict":
                 writes = [r for r in writes if r.id != target.id]
-                target = target.model_copy(update={"status": "blocked"})
+                target = target.model_copy(
+                    update={"status": "paused" if target.status == "paused" else "blocked"}
+                )
                 writes.append(target)
                 self._fence(target, state, writes, conflict_refs=check.evidence)
                 conflict_policy = decision(

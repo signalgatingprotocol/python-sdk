@@ -22,6 +22,7 @@ from .records import (
     Belief,
     Budget,
     Commitment,
+    Constraint,
     ContextPacket,
     Criterion,
     Episode,
@@ -428,13 +429,33 @@ def reduce_event(state: StateView, event: JournalEvent) -> StateView:
             updates = [_ADAPTER.validate_python(raw) for raw in payload["records"]]
             if len({r.id for r in updates}) != len(updates):
                 _fail("duplicate_record", "Event writes each record at most once")
+            # Promotion changes representation, not logical identity/history.
+            # Snapshot before all writes so post-image order cannot invent an
+            # eligible embedded revision inside this same event.
+            embedded_constraints = tuple(
+                c
+                for record in records.values()
+                if isinstance(record, Goal)
+                for c in record.constraints
+            )
             for item in updates:
                 if isinstance(item, JournalEvent):
                     _fail("invalid_event", "Journal events cannot be materialized as records")
                 previous = records.get(item.id)
                 if previous is None:
                     if item.revision != 1:
-                        _fail("invalid_revision", "New records start at revision one", item.id)
+                        matches = tuple(c for c in embedded_constraints if c.id == item.id)
+                        if (
+                            not isinstance(item, Constraint)
+                            or not matches
+                            or any(c != item for c in matches)
+                        ):
+                            _fail(
+                                "invalid_revision",
+                                "New records start at revision one; promotion preserves "
+                                "an existing embedded constraint exactly",
+                                item.id,
+                            )
                 else:
                     if (
                         item.kind != previous.kind
