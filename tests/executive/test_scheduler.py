@@ -109,8 +109,8 @@ def test_weighted_cursor_shared_by_actions_and_tasks_survives_restart(tmp_path):
         assert scheduler.plan(store.view(), NOW) == scheduler.plan(view, NOW)
 
 
-def test_deadline_aging_owner_priority_and_producer_urgency():
-    young = frame(id="a" * 32, priority=999, urgent=True)
+def test_deadline_aging_and_advisory_task_priority():
+    young = frame(id="a" * 32, priority=999)
     old = frame(id="b" * 32, created_at=NOW - timedelta(seconds=120))
     deadline = frame(id="c" * 32, deadline=NOW + timedelta(seconds=30))
     scheduler = Scheduler(KernelConfig(max_active_episodes=3))
@@ -543,3 +543,98 @@ def test_same_facts_new_revision_does_not_reset_failure_allowance(tmp_path):
         store.commit(scheduler.record_failure(store.view(), task.id, "same", NOW))
         persisted = next(r for r in store.view().records if r.id == task.id)
         assert persisted.status == "blocked" and persisted.failure_count == 2
+
+
+def test_owner_intake_designates_urgent_work_without_a_deadline(tmp_path):
+    from signal_gating.executive import CreateGoal
+
+    with Store.open(tmp_path / "state") as store:
+        store.commit(CommitBatch(events=(changed(StateView(), owner()),)))
+        commitment = Commitment(
+            id=COMMITMENT_ID,
+            created_at=NOW,
+            goal_id=GOAL_ID,
+            responsible_principal_id=OWNER_ID,
+        )
+        urgent = frame(urgent=True)
+        ordinary = frame(id="a" * 32)
+        intake = Intake(store, clock=lambda: NOW)
+        accepted = intake.accept(
+            CreateGoal(goal=goal(), commitments=(commitment,), tasks=(urgent, ordinary)),
+            principal=owner(),
+            state=store.view(),
+        )
+        assert accepted.response_receipt.disposition == "accept"
+        store.commit(accepted)
+        persisted = next(r for r in store.view().records if r.id == urgent.id)
+        assert persisted.urgent and persisted.deadline is None
+        plan = Scheduler().plan(store.view(), NOW)
+        assert [(item.id, item.work_class) for item in plan] == [
+            (urgent.id, "urgent"),
+            (ordinary.id, "ordinary"),
+        ]
+        assert rebuild(store.events()) == store.view()
+
+
+def test_ordinary_enqueue_order_precedes_advisory_task_priority():
+    older = frame(id="a" * 32, priority=0, created_at=NOW - timedelta(seconds=20))
+    newer = frame(id="b" * 32, priority=999, created_at=NOW - timedelta(seconds=10))
+    assert Scheduler().select(state(older, newer), NOW) == (older.id, newer.id)
+
+
+@pytest.mark.parametrize(
+    "support",
+    ["criterion_inputs", "criterion_required_evidence", "finding_read_set", "finding_evidence"],
+)
+@pytest.mark.parametrize("status", ["ready", "suspended"])
+def test_criterion_support_expiration_fences_selection_and_wake(tmp_path, support, status):
+    from signal_gating.executive import VerificationResult
+
+    belief = Belief(
+        id="a" * 32,
+        created_at=NOW,
+        claim="Temporarily checked support",
+        scope=Scope(goal_id=GOAL_ID),
+        epistemic_status="supported",
+        valid_until=NOW + timedelta(seconds=10),
+    )
+    support_ref = Ref(id=belief.id, kind="belief")
+    criterion = goal().criteria[0]
+    if support.startswith("criterion_"):
+        field = support.removeprefix("criterion_")
+        criterion = criterion.model_copy(update={field: (support_ref,)})
+    finding = VerificationResult(
+        id="b" * 32,
+        created_at=NOW,
+        criterion_id=criterion.id,
+        verifier_id=criterion.verifier_id,
+        disposition="accept",
+        reason_code="checked",
+        **(
+            {support.removeprefix("finding_"): (support_ref,)}
+            if support.startswith("finding_")
+            else {}
+        ),
+    )
+    task = frame(status=status, dependencies=(Ref(id=criterion.id, kind="criterion"),))
+    initial = state(task, belief, finding)
+    initial = initial.model_copy(
+        update={
+            "records": tuple(
+                r.model_copy(update={"criteria": (criterion,)}) if r.kind == "goal" else r
+                for r in initial.records
+            )
+        }
+    )
+    with Store.open(tmp_path / "state") as store:
+        store.commit(CommitBatch(events=(changed(StateView(), *initial.records),)))
+        view = store.view()
+        if status == "ready":
+            assert Scheduler().select(view, NOW) == (task.id,)
+            assert Scheduler().select(view, NOW + timedelta(seconds=11)) == ()
+        else:
+            assert wake(view, None, NOW)
+            assert wake(view, None, NOW + timedelta(seconds=11)) == ()
+        assert rebuild(store.events()) == view
+        with Store.open_readonly(store.root) as snapshot:
+            assert snapshot.view() == view

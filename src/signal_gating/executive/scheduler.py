@@ -26,6 +26,7 @@ from .records import (
     ActionRecord,
     Belief,
     Budget,
+    Criterion,
     DecisionReceipt,
     Episode,
     ExecutiveSignal,
@@ -41,6 +42,7 @@ from .records import (
     SchedulerState,
     StateView,
     TaskFrame,
+    VerificationResult,
     WakeCondition,
     utc_now,
 )
@@ -323,7 +325,7 @@ class Scheduler:
                 ScheduledItem(id=item.id, kind="action", work_class="reconcile")
             )
 
-        def rank(pair: tuple[TaskFrame, Goal]) -> tuple[int, datetime, int, datetime, str]:
+        def rank(pair: tuple[TaskFrame, Goal]) -> tuple[int, datetime, datetime, str]:
             task, goal = pair
             since = task.eligible_since or task.created_at
             age = min(
@@ -338,11 +340,11 @@ class Scheduler:
             )
             deadlines = [d for d in (task.deadline, goal.deadline) if d is not None]
             deadline = min(deadlines) if deadlines else datetime.max.replace(tzinfo=now.tzinfo)
-            return (-(goal.priority + age), deadline, -task.priority, since, task.id)
+            return (-(goal.priority + age), deadline, since, task.id)
 
         for task, goal in sorted(tasks, key=rank):
             deadlines = [d for d in (task.deadline, goal.deadline) if d is not None]
-            urgent = bool(
+            urgent = task.urgent or bool(
                 deadlines
                 and min(deadlines)
                 <= now + timedelta(seconds=self.config.scheduler.urgent_deadline_seconds)
@@ -550,7 +552,17 @@ def _event_records(state: StateView, event: JournalEvent | None) -> tuple[Persis
 
 
 def _fresh(task: TaskFrame, indexed: Mapping[str, Record], now: datetime) -> bool:
-    """Temporal checks supplement the reducer's clock-free lifecycle checks."""
+    """Walk current belief/criterion/finding support for temporal validity.
+
+    The reducer owns lifecycle/dependency satisfaction. This clock-aware walk
+    follows the accepted finding as well as its criterion definition, including
+    finding-only evidence, without recursing on cyclic support references.
+    """
+    accepting = {
+        item.criterion_id: item
+        for item in indexed.values()
+        if isinstance(item, VerificationResult) and item.disposition == "accept"
+    }
     pending = list(task.dependencies)
     seen: set[str] = set()
     while pending:
@@ -565,6 +577,13 @@ def _fresh(task: TaskFrame, indexed: Mapping[str, Record], now: datetime) -> boo
             ):
                 return False
             pending.extend(item.evidence)
+        elif isinstance(item, Criterion):
+            pending.extend((*item.inputs, *item.required_evidence))
+            finding = accepting.get(item.id)
+            if finding is not None:
+                pending.append(reference(finding))
+        elif isinstance(item, VerificationResult) and item.disposition == "accept":
+            pending.extend((*item.read_set, *item.evidence))
     return True
 
 
