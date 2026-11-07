@@ -77,7 +77,11 @@ class AuditRecord:
 
 
 class PolicyEngine:
-    """Fail-closed tool-call authorization."""
+    """Fail-closed tool-call authorization.
+
+    Approval callbacks must return True or False. Other return types are
+    denied and audited.
+    """
 
     def __init__(
         self,
@@ -147,6 +151,13 @@ class PolicyEngine:
                     reason=reason,
                 )
             )
+            if type(approved) is not bool:
+                return self._record(
+                    tool_name, agent_name, risk.level,
+                    Decision.DENY,
+                    f"approval callback returned {type(approved).__name__}; "
+                    "return True or False",
+                )
             if approved:
                 return self._record(
                     tool_name, agent_name, risk.level,

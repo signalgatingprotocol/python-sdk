@@ -5,6 +5,8 @@ verified correctness. Preserve the compatibility API in `signal_gating.core`.
 Read `README.md` for public behavior and `SECURITY.md` for the mediation boundary.
 For CI repair or recurring cleanup, use `.github/skills/sdk-maintenance/SKILL.md`.
 For release preparation, use `.github/skills/sdk-release/SKILL.md`.
+For commits, pull requests, CI monitoring, and merges, use
+`.github/skills/sdk-delivery/SKILL.md`.
 
 ## Working rules
 

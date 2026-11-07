@@ -23,6 +23,22 @@ The smoke target builds and checks distributions, installs the wheel, verifies
 its version, and runs the installed console demo. Use the existing release
 workflow for authorized publication; retain its `pypi` environment and OIDC.
 
+## Installation evidence
+
+Apply these checks when changing README install commands or verifying a release:
+
+- Match advertised behavior to the revision the commands install. While PyPI
+  publication is pending, use a full, tested Git commit hash and keep base and
+  optional-extra commands consistent. Label behavior outside that snapshot as
+  unreleased until the install reference includes it.
+- Run the documented base command in a fresh virtual environment outside the
+  checkout. Verify the installed version and, for a Git install, the commit in
+  the distribution's `direct_url.json`. A checkout import can mask an old or
+  incomplete installed package.
+- Run the README Quick Start and installed demo. Resolve optional-extra
+  commands as well; report a dry run as dependency-resolution evidence, and
+  distinguish it from runtime or live-provider testing.
+
 Report the candidate commit, version, verification results, and any missing
 publisher configuration. After an authorized publication, follow the clean
 environment installation check in `RELEASING.md` before claiming it succeeded.
