@@ -494,3 +494,62 @@ def test_simultaneous_belief_revisions_reject_withdrawn_support_in_either_order(
     assert rebuild(store.events()) == store.view()
     with Store.open_readonly(store.root) as snapshot:
         assert snapshot.view() == store.view()
+
+
+@pytest.mark.parametrize("kind", ["criterion", "constraint"])
+@pytest.mark.parametrize("stale", [False, True])
+def test_embedded_support_evidence_uses_current_version_and_owning_goal_cas(running, kind, stale):
+    from signal_gating.executive import Constraint
+
+    from .factories import criterion
+
+    store, episode, _ = running
+    definition = (
+        criterion(revision=2)
+        if kind == "criterion"
+        else Constraint(description="Preserve the required input", revision=2)
+    )
+    updated_goal = goal(
+        revision=2,
+        **{"criteria": (definition,)} if kind == "criterion" else {"constraints": (definition,)},
+    )
+    context = next(record for record in store.view().records if record.kind == "context_packet")
+    current_task = next(record for record in store.view().records if record.id == TASK_ID)
+    reads = (ref(updated_goal), ref(current_task), ref(definition))
+    context = context.model_copy(
+        update={"revision": 2, "goal": updated_goal, "mandatory_read_set": reads}
+    )
+    store.commit(
+        CommitBatch(
+            events=(event((updated_goal, context)),),
+            expected_revisions=(Ref(id=GOAL_ID), Ref(id=context.id)),
+        )
+    )
+    support_ref = Ref(
+        id=definition.id,
+        revision=1 if stale else 2,
+        kind="criterion" if kind == "criterion" else "record",
+    )
+    change = proposal(
+        read_set=reads,
+        belief=proposal().belief.model_copy(update={"evidence": (support_ref,)}),
+    )
+    memory = MemoryPolicy(
+        evidence_validators={OWNER_ID: lambda change, state: True}, clock=lambda: NOW
+    )
+    before = store.view()
+    batch = validator(memory=memory).validate(result(change), episode, before)
+    assert batch.response_receipt.disposition == ("stale" if stale else "accept")
+    assert ref(updated_goal) in batch.expected_revisions
+    assert all(read.id != definition.id for read in batch.expected_revisions)
+    store.commit(batch)
+    current = {record.id: record for record in store.view().records}
+    if stale:
+        assert batch.response_receipt.reason_code == "stale_dependency"
+        assert all(current[record.id] == record for record in before.records)
+    else:
+        assert current[change.belief.id].epistemic_status == "supported"
+        assert current[change.belief.id].evidence == (support_ref,)
+    assert rebuild(store.events()) == store.view()
+    with Store.open_readonly(store.root) as snapshot:
+        assert snapshot.view() == store.view()

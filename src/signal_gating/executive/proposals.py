@@ -516,6 +516,7 @@ class ProposalValidator:
             # post-images, including unchanged intermediate beliefs.
             candidates.update(writes)
             candidate_state = StateView(records=tuple(candidates.values()))
+            support_records = records_by_id(candidate_state)
             for support_change in resolved.proposals:
                 if not isinstance(support_change, BeliefChange):
                     continue
@@ -535,12 +536,13 @@ class ProposalValidator:
                         continue
                     checked.add(supported_input.id)
                     for support_ref in supported_input.evidence:
-                        dependency = candidates.get(support_ref.id)
+                        dependency = support_records.get(support_ref.id)
                         if (
                             dependency is None
                             or dependency.revision != support_ref.revision
                             or (
-                                support_ref.kind != "record" and support_ref.kind != dependency.kind
+                                support_ref.kind != "record"
+                                and support_ref.kind != getattr(dependency, "kind", "")
                             )
                             or isinstance(dependency, Belief)
                             and dependency.epistemic_status != "supported"
