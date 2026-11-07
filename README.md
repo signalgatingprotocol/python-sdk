@@ -18,26 +18,23 @@ advantage over simple rules, production task quality, or inference savings.
 
 ## Install
 
-The first PyPI release has not been published yet. Install the current alpha
-from the verified commit used for the `0.1.0` release candidate:
+The first PyPI release has not been published yet. Install the alpha from this
+tested commit, which includes the tool-approval fixes:
 
 ```bash
-pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
+pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@7a8592be7946857ad4b1e8b3b1c5039f57f9eddf"
 ```
-
-After the first release, the stable install command will be
-`pip install signal-gating`.
 
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@7a8592be7946857ad4b1e8b3b1c5039f57f9eddf"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@7a8592be7946857ad4b1e8b3b1c5039f57f9eddf"
 ```
 
 The pinned commit makes installs reproducible. See [CHANGELOG.md](CHANGELOG.md)
@@ -655,11 +652,8 @@ log for signal-carrying mesh events.
 ### LLM-backed agents (Hermes)
 
 `LLMAgent` connects an agent to an OpenAI-compatible model server: Nous
-Hermes, or any OpenAI-compatible server. Install the extra:
-
-```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
-```
+Hermes, or any OpenAI-compatible server. Install the [`llm` extra](#install)
+before running this example:
 
 ```python
 from signal_gating import Mesh, Signal
