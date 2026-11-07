@@ -586,3 +586,139 @@ def test_reservation_cannot_bind_itself_as_subject(store):
         store.commit(batch)
     assert rejected.value.code == "invalid_reservation_subject"
     assert store.view() == before
+
+
+def test_observed_after_final_settlement_blocks_sibling_ancestry_and_cannot_be_erased(store):
+    policy = BudgetPolicy(clock=lambda: NOW)
+    reservation_id = uuid4().hex
+    pending_id = uuid4().hex
+    maximum = maxima(calls=1, cost_microunits=1)
+    store.commit(
+        policy.reserve(store.view(), LEFT, maximum, reservation_id, trusted_maximum_quote=True)
+    )
+    store.commit(
+        policy.reserve(store.view(), RIGHT, maximum, pending_id, trusted_maximum_quote=True)
+    )
+    resolution = ResolveUsage(
+        reservation_id=reservation_id,
+        expected_revision=1,
+        accept_reserved_maximum=True,
+        explanation="Owner accepts maximum while usage is unresolved",
+    )
+    intake = Intake(store, clock=lambda: NOW, usage_resolver=policy.resolve_usage)
+    batch = intake.accept(resolution, principal=owner(), state=store.view())
+    assert batch.response_receipt.disposition == "accept"
+    store.commit(batch)
+    settled = get(store, reservation_id)
+    report = known(calls=1, cost_microunits=2)
+    store.commit(policy.observe_usage(store.view(), reservation_id, report))
+    assert get(store, reservation_id).usage == settled.usage
+    assert get(store, reservation_id).status == "settled"
+    assert get(store, reservation_id).observed_usage.cost_microunits == 2
+    assert get(store, LEFT).actual.cost_microunits == 2
+    assert get(store, ROOT).actual.cost_microunits == 2
+    assert get(store, ROOT).reserved.cost_microunits == 1
+    assert get(store, ROOT).accounting_uncertain and get(store, LEFT).accounting_uncertain
+    assert any(e.payload.get("reason_code") == "settlement_conflict" for e in store.events())
+    assert any(e.payload.get("reason_code") == "adapter_bound_exceeded" for e in store.events())
+    # Keep ordinary final-settlement immutability; observations are a distinct path.
+    with pytest.raises(BudgetError) as error:
+        policy.settle(store.view(), reservation_id, report)
+    assert error.value.code == "settlement_conflict"
+    for _ in range(2):
+        store.commit(policy.observe_usage(store.view(), reservation_id, report))
+        store.commit(policy.observe_usage(store.view(), reservation_id, known()))
+        assert get(store, ROOT).actual.cost_microunits == 2
+        assert get(store, reservation_id).observed_usage.cost_microunits == 2
+    assert store.view().records == rebuild(store.events()).records
+    with Store.open_readonly(store.root) as reopened:
+        for budget_id, candidate_id in (
+            (LEFT, uuid4().hex),
+            (ROOT, uuid4().hex),
+            (RIGHT, uuid4().hex),
+            (RIGHT, pending_id),
+        ):
+            with pytest.raises(BudgetError) as error:
+                policy.reserve(
+                    reopened.view(), budget_id, maximum, candidate_id, trusted_maximum_quote=True
+                )
+            assert error.value.code == "adapter_bound_exceeded"
+        reservation = get(reopened, reservation_id)
+        for usage in (known(), report):
+            command = ResolveUsage(
+                reservation_id=reservation_id,
+                expected_revision=reservation.revision,
+                usage=usage,
+                evidence=(Ref(id=GOAL_ID),),
+                explanation="A report cannot erase a measured breach",
+            )
+            with pytest.raises(BudgetError) as error:
+                policy.resolve_usage(command, reopened.view())
+            assert error.value.code == "adapter_bound_exceeded"
+
+
+def test_observation_conflict_below_bound_blocks_without_replacing_final_usage(store):
+    policy = BudgetPolicy(clock=lambda: NOW)
+    reservation = reserve(store, calls=2)
+    final = known(calls=1)
+    store.commit(policy.settle(store.view(), reservation.id, final))
+    store.commit(policy.observe_usage(store.view(), reservation.id, known(calls=2)))
+    assert get(store, reservation.id).usage == final
+    assert get(store, ROOT).actual.calls == 2
+    assert get(store, ROOT).accounting_uncertain
+    with pytest.raises(BudgetError) as error:
+        policy.reserve(
+            store.view(), RIGHT, maxima(calls=1), uuid4().hex, trusted_maximum_quote=True
+        )
+    assert error.value.code == "accounting_conflict"
+    command = ResolveUsage(
+        reservation_id=reservation.id,
+        expected_revision=get(store, reservation.id).revision,
+        accept_reserved_maximum=True,
+        explanation="Acceptance alone cannot resolve contradictory final reports",
+    )
+    with pytest.raises(BudgetError) as error:
+        policy.resolve_usage(command, store.view())
+    assert error.value.code == "accounting_conflict"
+
+
+def test_foreign_currency_observation_is_retained_and_blocks_without_fictional_conversion(store):
+    policy = BudgetPolicy(clock=lambda: NOW)
+    reservation = reserve(store, calls=1)
+    store.commit(policy.settle(store.view(), reservation.id, known(calls=1)))
+    report = known(calls=1, cost_microunits=20, currency="EUR")
+    store.commit(policy.observe_usage(store.view(), reservation.id, report))
+    assert get(store, ROOT).actual.cost_microunits == 0
+    assert get(store, ROOT).accounting_uncertain
+    assert get(store, reservation.id).accounting_conflict == "currency_mismatch"
+    conflicts = [e for e in store.events() if e.payload.get("reason_code") == "currency_mismatch"]
+    assert conflicts[-1].model_dump(mode="json")["payload"]["details"][
+        "observed_usage"
+    ] == report.model_dump(mode="json")
+    with pytest.raises(BudgetError) as error:
+        policy.reserve(
+            store.view(), RIGHT, maxima(calls=1), uuid4().hex, trusted_maximum_quote=True
+        )
+    assert error.value.code == "accounting_conflict"
+
+
+def test_owner_can_finalize_truthful_overage_without_erasing_or_unblocking_it(store):
+    policy = BudgetPolicy(clock=lambda: NOW)
+    reservation = reserve(store, calls=1)
+    store.commit(policy.settle(store.view(), reservation.id, Usage(status="unknown", calls=2)))
+    command = ResolveUsage(
+        reservation_id=reservation.id,
+        expected_revision=get(store, reservation.id).revision,
+        usage=known(calls=2),
+        evidence=(Ref(id=GOAL_ID),),
+        explanation="Finalize the measured overage without reducing it",
+    )
+    store.commit(policy.resolve_usage(command, store.view()))
+    assert get(store, reservation.id).status == "settled"
+    assert get(store, ROOT).actual.calls == 2
+    assert get(store, ROOT).accounting_uncertain
+    with pytest.raises(BudgetError) as error:
+        policy.reserve(
+            store.view(), RIGHT, maxima(calls=1), uuid4().hex, trusted_maximum_quote=True
+        )
+    assert error.value.code == "adapter_bound_exceeded"

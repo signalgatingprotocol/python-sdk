@@ -412,6 +412,9 @@ class Reservation(Record):
     maximum: Limits
     trusted_maximum_quote: bool = False
     usage: Usage = Field(default_factory=Usage)
+    # Preserve final settlement while retaining a later conservative measured floor.
+    observed_usage: Usage | None = None
+    accounting_conflict: NonEmpty | None = None
     status: Literal["reserved", "settled", "uncertain", "released"] = "reserved"
     evidence: tuple[Ref, ...] = ()
 

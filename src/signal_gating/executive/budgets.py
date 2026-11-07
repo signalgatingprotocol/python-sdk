@@ -78,18 +78,27 @@ def _bound(reservation: Reservation, name: str) -> int | float | None:
     return _quantity(reservation.maximum, name)
 
 
+def _accounted(reservation: Reservation, name: str) -> int | float | None:
+    """Conservative cumulative floor, without replacing a final settlement."""
+    quantities = [_quantity(reservation.usage, name)]
+    if reservation.observed_usage is not None:
+        quantities.append(_quantity(reservation.observed_usage, name))
+    present = [q for q in quantities if q is not None]
+    return max(present) if present else None
+
+
 def _overage(reservation: Reservation) -> bool:
     return any(
         _bound(reservation, name) is not None
-        and _quantity(reservation.usage, name) is not None
-        and cast(int | float, _quantity(reservation.usage, name))
+        and _accounted(reservation, name) is not None
+        and cast(int | float, _accounted(reservation, name))
         > cast(int | float, _bound(reservation, name))
         for name in _QUANTITIES
     )
 
 
 def _hold(reservation: Reservation, name: str) -> int | float | None:
-    used = _quantity(reservation.usage, name)
+    used = _accounted(reservation, name)
     if reservation.status in ("settled", "released") or (
         reservation.usage.status == "known" and used is not None
     ):
@@ -181,6 +190,12 @@ class BudgetPolicy:
             )
         if any(_overage(r) for b in chain for r in self._members(state, b.id)):
             raise BudgetError("adapter_bound_exceeded", "Adapter exceeded its promised bound")
+        if any(
+            r.accounting_conflict is not None for b in chain for r in self._members(state, b.id)
+        ):
+            raise BudgetError(
+                "accounting_conflict", "Unresolved observed usage blocks budget ancestry"
+            )
         previous = next((r for r in state.records if r.id == reservation_id), None)
         if previous is not None:
             if not isinstance(previous, Reservation) or (
@@ -240,8 +255,8 @@ class BudgetPolicy:
             held: dict[str, int | float | None] = {}
             actual: dict[str, int | float | None] = {}
             for name in _QUANTITIES:
-                old = _quantity(previous.usage, name) if previous else 0
-                new = _quantity(reservation.usage, name)
+                old = _accounted(previous, name) if previous else 0
+                new = _accounted(reservation, name)
                 balance = _quantity(budget.actual, name)
                 if balance is None:
                     raise BudgetError(
@@ -275,13 +290,17 @@ class BudgetPolicy:
                     )
             uncertain = any(
                 r.status == "uncertain"
+                or r.accounting_conflict is not None
                 or _overage(r)
                 or any(_hold(r, name) is None for name in _QUANTITIES)
                 for r in members
             )
             actual_status = "known"
             uncertain_statuses = {r.usage.status for r in members if r.status == "uncertain"}
-            if "unknown" in uncertain_statuses:
+            if (
+                any(r.accounting_conflict is not None for r in members)
+                or "unknown" in uncertain_statuses
+            ):
                 actual_status = "unknown"
             elif "estimated" in uncertain_statuses:
                 actual_status = "estimated"
@@ -307,6 +326,81 @@ class BudgetPolicy:
 
     def settle(self, state: StateView, reservation_id: str, usage: Usage) -> CommitBatch:
         return self._settle(state, reservation_id, usage)
+
+    def observe_usage(self, state: StateView, reservation_id: str, usage: Usage) -> CommitBatch:
+        """Retain measured usage even after an immutable final/owner settlement.
+
+        Ordinary settle still rejects conflicting finals. This observation path
+        preserves that settlement, journals the new report, raises its measured
+        accounting floor monotonically and durably blocks affected ancestry.
+        A bound violation remains a violation after any later owner resolution.
+        """
+        previous = _reservation(state, reservation_id)
+        reason = previous.accounting_conflict
+        if reason is None:
+            try:
+                return self.settle(state, reservation_id, usage)
+            except BudgetError as exc:
+                if exc.code not in {"settlement_conflict", "currency_mismatch"}:
+                    raise
+                reason = exc.code
+        chain = _chain(state, previous.budget_id)
+        observed = previous.observed_usage
+        quantities: dict[str, int | float | None] = {}
+        for name in _QUANTITIES:
+            old = _quantity(observed, name) if observed else None
+            # Foreign money cannot be added to a budget without a trusted FX
+            # conversion. Retain the exact raw report in the conflict audit;
+            # the unresolved conflict blocks all new admission in its ancestry.
+            new = (
+                None
+                if name == "cost_microunits" and usage.currency != previous.maximum.currency
+                else _quantity(usage, name)
+            )
+            values = [q for q in (old, new) if q is not None]
+            quantities[name] = max(values) if values else None
+        envelope = Usage.model_validate(
+            dict(
+                status="unknown",
+                currency=previous.maximum.currency,
+                source="conservative-conflicting-observations",
+                **quantities,
+            )
+        )
+        reservation = previous.model_copy(
+            update={
+                "revision": previous.revision + 1,
+                "observed_usage": envelope,
+                "accounting_conflict": reason,
+            }
+        )
+        updates = self._balances(state, chain, previous, reservation)
+        result = self._batch(state, chain, reservation, (*updates, reservation))
+        details = {
+            "reservation_id": reservation.id,
+            "previous_revision": previous.revision,
+            "prior_settlement": previous.usage.model_dump(mode="json"),
+            "observed_usage": usage.model_dump(mode="json"),
+        }
+        audit = result.events[0].model_copy(
+            update={
+                "id": uuid4().hex,
+                "event_type": "audit.recorded",
+                "payload": {"reason_code": reason, "details": details},
+            }
+        )
+        events = (*result.events, audit)
+        if _overage(reservation):
+            events = (
+                *events,
+                audit.model_copy(
+                    update={
+                        "id": uuid4().hex,
+                        "payload": {"reason_code": "adapter_bound_exceeded", "details": details},
+                    }
+                ),
+            )
+        return result.model_copy(update={"events": events})
 
     def _settle(
         self,
@@ -380,6 +474,24 @@ class BudgetPolicy:
         reservation = _reservation(state, command.reservation_id)
         if reservation.revision != command.expected_revision:
             raise BudgetError("stale_usage_resolution", "Reservation revision changed")
+        if _overage(reservation) and (
+            reservation.accounting_conflict is not None
+            or command.accept_reserved_maximum
+            or command.usage is None
+            or any(
+                _accounted(reservation, name) is not None
+                and cast(int | float, _accounted(reservation, name))
+                > cast(int | float, _quantity(command.usage, name))
+                for name in _QUANTITIES
+            )
+        ):
+            raise BudgetError(
+                "adapter_bound_exceeded", "Usage resolution cannot erase observed overage"
+            )
+        if reservation.accounting_conflict is not None:
+            raise BudgetError(
+                "accounting_conflict", "Usage resolution cannot erase conflicting observations"
+            )
         budget = _chain(state, reservation.budget_id)[0]
         records = {r.id: r for r in state.records}
         goal = records.get(budget.scope.goal_id or "")

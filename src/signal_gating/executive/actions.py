@@ -840,14 +840,21 @@ class Dispatcher:
             )
         # Preserve accounting for old attempts without overwriting a final outcome.
         policy = None
+        accounting_reason = None
         if issued.reservation_id:
-            try:
-                policy = self.budgets.settle(
-                    self.store.view(), issued.reservation_id, observation.usage
-                )
-            except ExecutiveError:
-                # Conflicting late accounting cannot erase earlier known overages.
-                policy = None
+            policy = self.budgets.observe_usage(
+                self.store.view(), issued.reservation_id, observation.usage
+            )
+            accounting_reason = next(
+                (
+                    str(event.payload["reason_code"])
+                    for event in policy.events
+                    if event.event_type == "audit.recorded"
+                    and event.payload.get("reason_code")
+                    in {"settlement_conflict", "currency_mismatch", "accounting_conflict"}
+                ),
+                None,
+            )
         terminal = current.status in {"succeeded", "failed"}
         older_attempt = issued.reservation_id != current.reservation_id
         outcome = observation.outcome
@@ -874,17 +881,25 @@ class Dispatcher:
             )
         return self._commit(
             current,
-            "accept" if outcome in {"succeeded", "failed"} and not older_attempt else "defer",
-            "late_attempt_observation"
-            if older_attempt
-            else "action_observed"
-            if not terminal
-            else "late_action_observation",
+            "require_review"
+            if accounting_reason
+            else "accept"
+            if outcome in {"succeeded", "failed"} and not older_attempt
+            else "defer",
+            accounting_reason
+            or (
+                "late_attempt_observation"
+                if older_attempt
+                else "action_observed"
+                if not terminal
+                else "late_action_observation"
+            ),
             writes=writes,
             policy=policy,
             details={
                 "outcome": observation.outcome,
                 "issued_revision": issued.revision,
+                "accounting_reason": accounting_reason,
                 "usage": observation.usage.model_dump(mode="json"),
                 "external_receipt": observation.external_receipt,
             },

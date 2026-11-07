@@ -1035,3 +1035,131 @@ async def test_schema_enum_does_not_confuse_boolean_with_integer(setup):
     receipt = await dispatcher.dispatch_one(ACTION)
     assert receipt.reason_code == "invalid_action_arguments"
     assert fake.execute_count == 0
+
+
+def accept_maximum(store, policy, reservation_id):
+    from signal_gating.executive import ResolveUsage
+
+    reservation = get(store, reservation_id)
+    command = ResolveUsage(
+        reservation_id=reservation_id,
+        expected_revision=reservation.revision,
+        accept_reserved_maximum=True,
+        explanation="Resolve the outstanding maximum explicitly",
+    )
+    intake = Intake(store, clock=lambda: NOW, usage_resolver=policy.resolve_usage)
+    batch = intake.accept(command, principal=owner(), state=store.view())
+    assert batch.response_receipt.disposition == "accept"
+    store.commit(batch)
+
+
+@pytest.mark.asyncio
+async def test_owner_maximum_cannot_hide_first_late_measured_overage(setup, monkeypatch):
+    from uuid import uuid4
+
+    from signal_gating.executive import BudgetError, ResolveUsage
+
+    store, fake, registry, dispatcher, register, current = setup
+    original = fake.observation
+    monkeypatch.setattr(
+        fake,
+        "observation",
+        lambda action: original(action).model_copy(
+            update={"usage": Usage.zero().model_copy(update={"calls": 1, "cost_microunits": 20})}
+        ),
+    )
+    fake.finish = asyncio.get_running_loop().create_future()
+    running = asyncio.create_task(dispatcher.dispatch_one(ACTION))
+    await fake.started.wait()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    reservation_id = get(store, ACTION).reservation_id
+    accept_maximum(store, dispatcher.budgets, reservation_id)
+    assert get(store, BUDGET).actual.cost_microunits == 1
+    assert not get(store, BUDGET).accounting_uncertain
+    fake.finish.set_result(None)
+    await dispatcher.late_observations_ready.wait()
+    issued, observation = dispatcher.take_late_observations()[0]
+    receipt = dispatcher.record_observation(issued, observation)
+    assert get(store, BUDGET).actual.cost_microunits == 20
+    assert get(store, BUDGET).accounting_uncertain
+    assert receipt.reason_code == "settlement_conflict"
+    assert receipt.disposition == "require_review"
+    assert get(store, ACTION).status == "succeeded"
+    assert get(store, reservation_id).usage.cost_microunits == 1
+    assert get(store, reservation_id).observed_usage.cost_microunits == 20
+    assert get(store, reservation_id).accounting_conflict == "settlement_conflict"
+    assert any(e.payload.get("reason_code") == "adapter_bound_exceeded" for e in store.events())
+    assert store.view().records == rebuild(store.events()).records
+    root = store.root
+    store.close()
+    with Store.open(root) as reopened:
+        policy = BudgetPolicy(clock=lambda: NOW)
+        with pytest.raises(BudgetError, match="bound"):
+            policy.reserve(reopened.view(), BUDGET, QUOTE, uuid4().hex, trusted_maximum_quote=True)
+        reservation = get(reopened, reservation_id)
+        command = ResolveUsage(
+            reservation_id=reservation_id,
+            expected_revision=reservation.revision,
+            accept_reserved_maximum=True,
+            explanation="Do not erase measured overage",
+        )
+        batch = Intake(reopened, clock=lambda: NOW, usage_resolver=policy.resolve_usage).accept(
+            command, principal=owner(), state=reopened.view()
+        )
+        assert batch.response_receipt.disposition == "deny"
+        assert batch.response_receipt.reason_code == "adapter_bound_exceeded"
+        reopened.commit(batch)
+        assert get(reopened, BUDGET).actual.cost_microunits == 20
+        assert get(reopened, BUDGET).accounting_uncertain
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "setup",
+    [
+        {
+            "reconciliation": "none",
+            "idempotency": "durable",
+            "idempotency_scope": "fake-tenant-action-key",
+            "idempotency_retention_seconds": 20,
+        }
+    ],
+    indirect=True,
+)
+async def test_owner_resolved_old_attempt_late_overage_preserves_newer_effect_lifecycle(setup):
+    from uuid import uuid4
+
+    from signal_gating.executive import BudgetError
+
+    store, fake, registry, dispatcher, register, current = setup
+    fake.failure = True
+    await dispatcher.dispatch_one(ACTION)
+    first = fake.observed[0]
+    accept_maximum(store, dispatcher.budgets, first.reservation_id)
+    await dispatcher.reconcile_one(ACTION)
+    second = fake.observed[1]
+    assert get(store, ACTION).status == "needs_human"
+    late = ActionObservation(
+        action_id=first.id,
+        expected_revision=first.revision,
+        outcome="succeeded",
+        usage=Usage.zero().model_copy(update={"calls": 1, "cost_microunits": 20}),
+    )
+    receipt = dispatcher.record_observation(first, late)
+    assert receipt.reason_code == "settlement_conflict"
+    assert receipt.disposition == "require_review"
+    assert get(store, ACTION).status == "needs_human"
+    assert get(store, ACTION).reservation_id == second.reservation_id
+    assert get(store, first.reservation_id).usage.cost_microunits == 1
+    assert get(store, first.reservation_id).observed_usage.cost_microunits == 20
+    assert get(store, second.reservation_id).status == "uncertain"
+    assert get(store, BUDGET).actual.cost_microunits == 20
+    assert get(store, BUDGET).reserved.cost_microunits == 1
+    with pytest.raises(BudgetError):
+        dispatcher.budgets.reserve(
+            store.view(), BUDGET, QUOTE, uuid4().hex, trusted_maximum_quote=True
+        )
+    assert store.view().records == rebuild(store.events()).records
+    assert fake.execute_count == 2
