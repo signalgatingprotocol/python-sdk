@@ -42,6 +42,100 @@ def test_send_allowed_when_approver_accepts():
     assert e.evaluate("send_email") is Decision.ALLOW
 
 
+class _NonBooleanApproval:
+    def __bool__(self):
+        raise AssertionError("approval results must not be coerced")
+
+    def __repr__(self):
+        raise AssertionError("approval results must not be disclosed")
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        pytest.param("deny", id="string"),
+        pytest.param(1, id="integer"),
+        pytest.param({"approved": False, "detail": "private-result"}, id="mapping"),
+        pytest.param(None, id="none"),
+        pytest.param(_NonBooleanApproval(), id="custom-object"),
+    ],
+)
+def test_non_boolean_approval_is_denied_and_audited(tmp_path, returned):
+    audit = tmp_path / "audit.jsonl"
+    requests = []
+
+    def approve(request):
+        requests.append(request)
+        return returned
+
+    engine = _engine(approver=approve, audit_path=audit)
+    engine.register("reviewed_tool", ToolRisk(RiskLevel.SEND))
+
+    assert engine.evaluate("reviewed_tool", {"value": "original"}, "worker") is Decision.DENY
+    assert len(requests) == 1
+    assert len(engine.records) == 1
+    record = engine.records[0]
+    assert record.tool_name == "reviewed_tool"
+    assert record.agent_name == "worker"
+    assert record.risk_level == "SEND"
+    assert record.decision == "deny"
+    assert type(returned).__name__ in record.reason
+    assert "return True or False" in record.reason
+    persisted = audit.read_text()
+    assert "private-result" not in persisted
+    assert [json.loads(line) for line in persisted.splitlines()] == [record.to_dict()]
+
+
+@pytest.mark.parametrize("policy_required", [False, True], ids=["risk-ceiling", "yaml-rule"])
+@pytest.mark.parametrize(
+    "returned",
+    [
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param("deny", id="string"),
+        pytest.param(1, id="integer"),
+        pytest.param({"approved": False}, id="mapping"),
+    ],
+)
+async def test_tool_execution_requires_boolean_approval(policy_required, returned):
+    from signal_gating.agent import ToolCallSignal
+    from signal_gating.core import Agent, Mesh
+    from signal_gating.policy.loader import engine_from_policy, load_policy_from_dict
+
+    risk = RiskLevel.READ if policy_required else RiskLevel.SEND
+    if policy_required:
+        policy = load_policy_from_dict({"rules": [{"require_approval": True}]})
+        engine = engine_from_policy(policy)
+    else:
+        engine = _engine()
+    requests = []
+    executed = []
+
+    def approve(request):
+        requests.append(request)
+        return returned
+
+    engine.approver = approve
+    engine.register("reviewed_tool", ToolRisk(risk))
+    worker = Agent("worker", gates=[engine.as_gate("worker")])
+
+    @worker.tool(risk=risk)
+    def reviewed_tool(value: str) -> None:
+        executed.append(value)
+
+    async with Mesh([worker]) as mesh:
+        await mesh.inject(
+            worker, ToolCallSignal(tool_name="reviewed_tool", arguments={"value": "original"})
+        )
+
+    assert len(requests) == 1
+    assert requests[0].arguments == {"value": "original"}
+    assert requests[0].agent_name == "worker"
+    assert executed == (["original"] if returned is True else [])
+    assert len(engine.records) == 1
+    assert engine.records[0].decision == ("allow" if returned is True else "deny")
+
+
 def test_dry_run_records_would_decisions(tmp_path):
     audit = tmp_path / "audit.jsonl"
     e = _engine(audit_path=audit, dry_run=True)
