@@ -79,22 +79,25 @@ def _json(value: object) -> str:
 
 
 def _material(record: Model) -> object:
-    """Lossless field projection: absent optionals/empty arrays have DTO defaults.
+    """Compact only typed DTO fields whose omission preserves their defaults.
 
-    Keep false, zero, status and all nonempty text, especially hard constraints.
-    Full original DTO snapshots remain in the persisted ContextPacket.
+    Traverse models and their typed containers, never arbitrary JSON mappings.
+    JsonObject fields (including schemas and action arguments) retain all nested
+    null/empty/false/zero values. Full DTO snapshots remain on ContextPacket.
     """
-
-    def compact(value: object) -> object:
-        if isinstance(value, dict):
-            return {
-                key: compact(item) for key, item in value.items() if item is not None and item != []
-            }
-        if isinstance(value, list):
-            return [compact(item) for item in value]
-        return value
-
-    return compact(record.model_dump(mode="json"))
+    material = record.model_dump(mode="json")
+    for name, field in type(record).model_fields.items():
+        value = getattr(record, name)
+        if (value is None and field.default is None) or (value == () and field.default == ()):
+            material.pop(name)
+        elif isinstance(value, Model):
+            material[name] = _material(value)
+        elif isinstance(value, (tuple, list)):
+            material[name] = [
+                _material(item) if isinstance(item, Model) else serialized
+                for item, serialized in zip(value, material[name])
+            ]
+    return material
 
 
 # Compact worker-facing projection v1. This is a field contract, not the full

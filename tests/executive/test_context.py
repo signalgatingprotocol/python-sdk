@@ -564,3 +564,87 @@ def test_grant_restrictions_and_versioned_capabilities_are_visible_without_autho
         assert not any(r.kind == "action" for r in store.view().records)
     finally:
         artifacts.release_staged((packet.rendered_artifact,))
+
+
+@pytest.mark.parametrize("boundary", ["capability_schema", "pending_arguments"])
+def test_opaque_json_survives_counted_rendering_and_persisted_messages(setup, boundary):
+    import hashlib
+
+    from signal_gating.executive import CapabilitySpec
+
+    from .factories import action
+
+    store, artifacts, task, _ = setup
+    schema = {
+        "type": "object",
+        "properties": {
+            "selector": {"const": None},
+            "fallback": {"enum": []},
+            "metadata": {"default": {}, "examples": [None, [], {}, False, 0]},
+            "nested": {"allOf": [{"const": []}, {"default": {"value": None}}]},
+        },
+        "required": [],
+        "additionalProperties": False,
+    }
+    arguments = {
+        "selector": None,
+        "fallback": [],
+        "metadata": {},
+        "enabled": False,
+        "count": 0,
+        "nested": {"value": None, "items": [], "object": {}, "values": [None, [], {}, False, 0]},
+    }
+    pending = action(
+        status="outcome_unknown",
+        arguments=arguments,
+        arguments_digest=hashlib.sha256(
+            json.dumps(
+                arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
+        ).hexdigest(),
+    )
+    grant = Grant(
+        issuer_id=OWNER_ID,
+        subject_id=OWNER_ID,
+        capabilities=("workspace.read",),
+        scope=Scope(owner_id=OWNER_ID, goal_id=GOAL_ID),
+        created_at=NOW,
+    )
+    capability = CapabilitySpec(
+        id="workspace.read",
+        binding_version="opaque-v1",
+        input_schema=schema,
+        effect_class="read_only",
+    )
+    store.commit(CommitBatch(events=(event((grant, pending)),)))
+    running, state = planned(store, task)
+    packet = assembler(artifacts, capabilities=(capability,)).build(
+        running, state, principal=owner()
+    )
+    try:
+        store.commit(
+            CommitBatch(
+                events=(event((packet.rendered_artifact,)),),
+                expected_revisions=tuple(reference(r) for r in store.view().records),
+            )
+        )
+        messages = render_packet(packet)
+        durable = json.loads(
+            artifacts.read(packet.rendered_artifact, principal=owner(), goal_id=GOAL_ID)
+        )
+        assert durable["messages"] == list(messages)
+        assert packet.manifest.input_tokens == UTF8ByteCounter().count(
+            json.dumps(messages, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        for material in (
+            json.loads(messages[1]["content"]),
+            json.loads(durable["messages"][1]["content"]),
+        ):
+            actual = (
+                material["trusted_authority"]["capabilities"][0]["input_schema"]
+                if boundary == "capability_schema"
+                else material["untrusted_evidence"]["pending_effects"][0]["arguments"]
+            )
+            assert actual == (schema if boundary == "capability_schema" else arguments)
+    finally:
+        artifacts.release_staged((packet.rendered_artifact,))
