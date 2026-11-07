@@ -344,6 +344,10 @@ class TaskFrame(Record):
     priority: NonNegativeInt = 0
     deadline: Timestamp | None = None
     urgent: bool = False
+    eligible_since: Timestamp | None = None
+    last_scheduled_at: Timestamp | None = None
+    failure_signature: Digest | None = None
+    failure_reason: NonEmpty | None = None
 
 
 class Grant(Record):
@@ -449,6 +453,7 @@ class DecisionReceipt(Record):
     reason_code: NonEmpty
     evidence: tuple[Ref, ...] = ()
     event_ids: tuple[Identifier, ...] = ()
+    wake_condition: WakeCondition | None = None
 
 
 class CapabilitySpec(Model):
@@ -631,6 +636,17 @@ class JournalEvent(Record):
     payload: JsonObject = Field(default_factory=dict)
 
 
+class SchedulerState(Record):
+    """One journalled fairness cursor and bounded control-backlog observation."""
+
+    kind: Literal["scheduler"] = "scheduler"
+    id: Literal["d3f108b20fa446218be896319d57243e"] = "d3f108b20fa446218be896319d57243e"
+    cursor: NonNegativeInt = 0
+    control_pending: NonNegativeInt = 0
+    control_since: Timestamp | None = None
+    overload_reported: bool = False
+
+
 PersistentRecord = Annotated[
     Principal
     | Goal
@@ -649,7 +665,8 @@ PersistentRecord = Annotated[
     | Criterion
     | VerificationResult
     | JournalEvent
-    | ContextPacket,
+    | ContextPacket
+    | SchedulerState,
     Field(discriminator="kind"),
 ]
 

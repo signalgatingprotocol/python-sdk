@@ -381,9 +381,20 @@ class ProposalValidator:
                         write(
                             child.model_copy(
                                 update={
+                                    # Worker scheduling hints cannot manufacture
+                                    # owner priority, deadlines, aging or retries.
+                                    "priority": task.priority,
+                                    "urgent": task.urgent,
+                                    "deadline": task.deadline,
+                                    "created_at": now,
+                                    "eligible_since": now,
+                                    "last_scheduled_at": None,
+                                    "failure_count": 0,
+                                    "failure_signature": None,
+                                    "failure_reason": None,
                                     "dependencies": tuple(
                                         dict.fromkeys((*task.dependencies, *child.dependencies))
-                                    )
+                                    ),
                                 }
                             )
                         )

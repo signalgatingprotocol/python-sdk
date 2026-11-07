@@ -232,16 +232,91 @@ def test_decomposition_cycle_rejects_all_members(running):
     assert not any(isinstance(r, Belief) for r in store.view().records)
 
 
-def test_decomposition_inherits_parent_scope_budget_and_dependencies(running):
-    store, episode, reads = running
-    child = frame(id="a" * 32)
-    decomposition = TaskDecomposition(
-        episode_id=EPISODE_ID, fencing_token=1, read_set=reads, tasks=(child,)
+@pytest.mark.parametrize("conflicting_budget", [False, True])
+def test_decomposition_inherits_parent_scope_budget_and_dependencies(running, conflicting_budget):
+    from signal_gating.executive import Budget, Limits, Scope
+    from signal_gating.executive.scheduler import Scheduler
+
+    store, episode, _ = running
+    current = {r.id: r for r in store.view().records}
+    belief = Belief(
+        id="d" * 32,
+        created_at=NOW,
+        claim="Parent input is checked",
+        scope=Scope(goal_id=GOAL_ID),
+        epistemic_status="supported",
     )
-    batch = validator().validate(result(decomposition), episode, store.view())
-    assert batch.response_receipt.disposition == "accept"
+    budget = Budget(
+        id="e" * 32, created_at=NOW, scope=Scope(goal_id=GOAL_ID), limits=Limits(calls=5)
+    )
+    parent = current[COMMITMENT_ID].model_copy(
+        update={"revision": 2, "budget_id": budget.id, "dependencies": (ref(belief),)}
+    )
+    task = current[TASK_ID].model_copy(
+        update={
+            "revision": 2,
+            "priority": 7,
+            "deadline": NOW + timedelta(seconds=90),
+            "dependencies": (ref(belief),),
+        }
+    )
+    reads = (ref(goal()), ref(task), ref(belief))
+    context = current[episode.context_packet_id].model_copy(
+        update={"revision": 2, "task": task, "mandatory_read_set": reads}
+    )
+    store.commit(
+        CommitBatch(
+            events=(event((belief, budget, parent, task, context)),),
+            expected_revisions=tuple(ref(r) for r in store.view().records),
+        )
+    )
+    child_commitment = Commitment(
+        id="b" * 32,
+        created_at=NOW,
+        goal_id=GOAL_ID,
+        responsible_principal_id=OWNER_ID,
+        budget_id="f" * 32 if conflicting_budget else None,
+    )
+    child = frame(
+        id="a" * 32,
+        commitment_id=child_commitment.id,
+        priority=999999,
+        urgent=True,
+        deadline=NOW,
+        eligible_since=NOW - timedelta(days=365),
+        failure_count=99,
+        failure_signature="a" * 64,
+        failure_reason="invented",
+    )
+    decomposition = TaskDecomposition(
+        episode_id=EPISODE_ID,
+        fencing_token=1,
+        read_set=reads,
+        tasks=(child,),
+        commitments=(child_commitment,),
+    )
+    before = store.view()
+    batch = validator().validate(result(decomposition), episode, before)
+    assert batch.response_receipt.disposition == ("reject" if conflicting_budget else "accept")
     store.commit(batch)
-    assert next(r for r in store.view().records if r.id == child.id).goal_id == GOAL_ID
+    after = {r.id: r for r in store.view().records}
+    if conflicting_budget:
+        assert batch.response_receipt.reason_code == "invalid_decomposition"
+        assert all(after[r.id] == r for r in before.records)
+    else:
+        persisted = after[child.id]
+        assert persisted.goal_id == GOAL_ID and persisted.dependencies == task.dependencies
+        assert (persisted.priority, persisted.urgent, persisted.deadline) == (
+            7,
+            False,
+            task.deadline,
+        )
+        assert persisted.eligible_since == NOW and persisted.failure_count == 0
+        assert persisted.failure_signature is None and persisted.failure_reason is None
+        assert after[child_commitment.id].budget_id == budget.id
+        assert after[child_commitment.id].dependencies == parent.dependencies
+        assert Scheduler().plan(store.view(), NOW)[0].work_class == "ordinary"
+    assert rebuild(store.events()) == store.view()
 
 
 def test_completion_claim_is_request_not_verification_success(running):
@@ -553,3 +628,20 @@ def test_embedded_support_evidence_uses_current_version_and_owning_goal_cas(runn
     assert rebuild(store.events()) == store.view()
     with Store.open_readonly(store.root) as snapshot:
         assert snapshot.view() == store.view()
+
+
+def test_worker_decomposition_cannot_manufacture_owner_scheduling_priority(running):
+    from signal_gating.executive.scheduler import Scheduler
+
+    store, episode, reads = running
+    child = frame(id="a" * 32, priority=999999, urgent=True, deadline=NOW)
+    decomposition = TaskDecomposition(
+        episode_id=EPISODE_ID, fencing_token=1, read_set=reads, tasks=(child,)
+    )
+    batch = validator().validate(result(decomposition), episode, store.view())
+    assert batch.response_receipt.disposition == "accept"
+    store.commit(batch)
+    persisted = next(r for r in store.view().records if r.id == child.id)
+    assert (persisted.priority, persisted.urgent, persisted.deadline) == (0, False, None)
+    assert Scheduler().plan(store.view(), NOW)[0].work_class == "ordinary"
+    assert rebuild(store.events()) == store.view()

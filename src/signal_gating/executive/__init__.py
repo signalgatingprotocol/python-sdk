@@ -85,6 +85,7 @@ from .records import (
     Ref,
     Reservation,
     RunSummary,
+    SchedulerState,
     Scope,
     StateView,
     TaskFrame,
@@ -93,8 +94,14 @@ from .records import (
     VerificationResult,
     WakeCondition,
 )
+from .scheduler import AttentionPolicy, ScheduledItem, Scheduler, wake
 
 __all__ = [
+    "AttentionPolicy",
+    "ScheduledItem",
+    "Scheduler",
+    "SchedulerState",
+    "wake",
     "Authority",
     "RuleRegistry",
     "Intake",
