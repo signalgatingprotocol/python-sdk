@@ -30,8 +30,10 @@ from .records import (
     Ref,
     Scope,
     TaskFrame,
+    Timestamp,
     Usage,
     WakeCondition,
+    utc_now,
 )
 
 
@@ -248,9 +250,28 @@ class EpisodeResult(Model):
         return self
 
 
+class InboxAcknowledgment(Model):
+    """Durable identity binding for an authenticated admitted input."""
+
+    principal_id: Identifier
+    producer_id: NonEmpty
+    external_id: NonEmpty
+    payload_digest: Digest
+    receipt_id: Identifier
+
+
+class OutboxEntry(Model):
+    """Queue metadata; the referenced ActionRecord owns the effect lifecycle."""
+
+    action_id: Identifier
+    available_at: Timestamp = Field(default_factory=utc_now)
+
+
 class CommitBatch(Model):
     events: tuple[JournalEvent, ...] = ()
     records: tuple[PersistentRecord, ...] = ()
     receipts: tuple[DecisionReceipt, ...] = ()
     expected_revisions: tuple[Ref, ...] = ()
     signals: tuple[ExecutiveSignal, ...] = ()
+    inbox_acknowledgments: tuple[InboxAcknowledgment, ...] = ()
+    outbox: tuple[OutboxEntry, ...] = ()
