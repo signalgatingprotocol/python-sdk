@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from types import MappingProxyType
 
+from signal_gating._immutable import deep_thaw
+
 from .memory import records_by_id
 from .messages import (
     ActionIntent,
@@ -47,6 +49,32 @@ from .records import (
 
 Rule = Callable[[Mapping[str, Record]], PolicyDecision]
 ResourceExtractor = Callable[[ActionIntent], Scope]
+
+
+def _proof_roots(
+    task: TaskFrame, reads: tuple[Ref, ...], indexed: Mapping[str, Record]
+) -> tuple[Ref, ...]:
+    """Definition/data reads fence versions; only accepted support implies proof.
+
+    Explicit task dependencies always retain satisfaction checks. Supplied unknown
+    beliefs and criterion definitions confer no authority just by being read.
+    """
+    return tuple(
+        dict.fromkeys(
+            (
+                *task.dependencies,
+                *(
+                    ref
+                    for ref in reads
+                    if (
+                        isinstance(item := indexed.get(ref.id), Belief)
+                        and item.epistemic_status == "supported"
+                    )
+                    or (isinstance(item, VerificationResult) and item.disposition == "accept")
+                ),
+            )
+        )
+    )
 
 
 def decision(disposition: str, reason: str, *, evidence: tuple[Ref, ...] = ()) -> PolicyDecision:
@@ -247,7 +275,7 @@ class Authority:
             episode_id=episode.id,
             fencing_token=episode.fencing_token,
             capability_id=action.capability_id,
-            arguments=action.arguments,
+            arguments=deep_thaw(action.arguments),
             scope=action.scope,
             read_set=action.read_set,
         )
@@ -329,7 +357,7 @@ class Authority:
         from .scheduler import _fresh
 
         indexed = records_by_id(state)
-        dependencies = tuple(dict.fromkeys((*task.dependencies, *intent.read_set)))
+        dependencies = _proof_roots(task, intent.read_set, indexed)
         if not _fresh(task.model_copy(update={"dependencies": dependencies}), indexed, now):
             return decision("stale", "expired_action_support")
         from .reducers import _dependency_satisfied

@@ -201,6 +201,9 @@ class Criterion(Record):
     verifier_id: NonEmpty
     inputs: tuple[Ref, ...] = ()
     acceptance_rule: NonEmpty
+    # Owner-declared local-check binding; workers cannot choose a smaller input set.
+    check_id: NonEmpty | None = None
+    workspace_inputs: tuple[NonEmpty, ...] = ()
     required_evidence: tuple[Ref, ...] = ()
     required: bool = True
 

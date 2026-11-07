@@ -124,6 +124,7 @@ def setup(tmp_path, request):
             reconciliation="lookup",
         )
         options = dict(getattr(request, "param", {}))
+        arguments = options.pop("_arguments", {"path": "data/file.txt"})
         support_path = options.pop("_support_path", None)
         constraint = options.pop("_constraint", False)
         spec = spec.model_copy(update=options)
@@ -264,7 +265,7 @@ def setup(tmp_path, request):
             fencing_token=1,
             read_set=context.mandatory_read_set,
             capability_id="workspace.read",
-            arguments={"path": "data/file.txt"},
+            arguments=arguments,
             scope=Scope(owner_id=OWNER_ID, goal_id=GOAL_ID, resource_paths=("data/file.txt",)),
         )
         batch = ProposalValidator(
@@ -310,6 +311,41 @@ async def test_real_proposal_dispatch_reserves_and_settles_atomically(setup):
     assert get(store, ACTION).status == "succeeded"
     assert get(store, get(store, ACTION).reservation_id).status == "settled"
     assert store.view().records == rebuild(store.events()).records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "setup",
+    [
+        {
+            "input_schema": {"type": "object"},
+            "_arguments": {
+                "path": "data/file.txt",
+                "opaque": [None, {}, [], False, 0, "draft:keep"],
+            },
+        }
+    ],
+    indirect=True,
+)
+async def test_nested_opaque_json_survives_real_proposal_and_authority(setup):
+    import hashlib
+    import json
+
+    store, fake, registry, dispatcher, register, current = setup
+    issued = get(store, ACTION)
+    expected = {"path": "data/file.txt", "opaque": [None, {}, [], False, 0, "draft:keep"]}
+    assert issued.model_dump(mode="json")["arguments"] == expected
+    assert (
+        issued.arguments_digest
+        == hashlib.sha256(
+            json.dumps(expected, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    with pytest.raises(TypeError):
+        issued.arguments["opaque"][0] = "changed"
+    assert (await dispatcher.dispatch_one(ACTION)).disposition == "accept"
+    assert fake.execute_count == 1
+    assert fake.observed[0].arguments == issued.arguments
 
 
 @pytest.mark.asyncio

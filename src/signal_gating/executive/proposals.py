@@ -14,6 +14,8 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any
 
+from signal_gating._immutable import deep_thaw
+
 from .errors import ExecutiveError, InvalidTransition
 from .memory import MemoryPolicy, invalidate_dependents, records_by_id, reference
 from .messages import (
@@ -237,7 +239,7 @@ class ProposalValidator:
                 if isinstance(value, (list, tuple)):
                     return tuple(resolve(item) for item in value)
                 # Declared JSON objects (such as action arguments) are opaque.
-                return value
+                return deep_thaw(value)
 
             resolved: EpisodeResult = resolve(result)
             staged_ids = {a.id for a in self.staged_drafts.values()}
@@ -440,7 +442,7 @@ class ProposalValidator:
                                     allow_nan=False,
                                 ).encode("utf-8")
                             ).hexdigest(),
-                            arguments=proposal.arguments,
+                            arguments=deep_thaw(proposal.arguments),
                             scope=proposal.scope,
                             idempotency_key=proposal.id,
                             constraint_revision=goal.revision,

@@ -19,6 +19,8 @@ from types import MappingProxyType
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
+from signal_gating._immutable import deep_thaw
+
 from .artifacts import ArtifactStore
 from .authority import Authority, ResourceExtractor, decision, reference
 from .budgets import BudgetPolicy
@@ -397,7 +399,7 @@ class Dispatcher:
                     image.get("status") == "authorized"
                     and image.get("authorization_revision") == action.authorization_revision
                 ):
-                    reviewed = ActionRecord.model_validate(image)
+                    reviewed = ActionRecord.model_validate(deep_thaw(image))
                     return self._review_binding(reviewed) == self._review_binding(action)
         return False
 
@@ -475,7 +477,14 @@ class Dispatcher:
         indexed = records_by_id(state)
         principal = indexed.get(action.origin_principal_id)
         assert isinstance(principal, Principal)
-        pending = list(action.read_set)
+        from .authority import _proof_roots
+
+        task = indexed.get(action.task_id)
+        assert isinstance(task, TaskFrame)
+        pending = [
+            *_proof_roots(task, action.read_set, indexed),
+            *(ref for ref in action.read_set if isinstance(indexed.get(ref.id), ArtifactRef)),
+        ]
         seen: set[str] = set()
         try:
             while pending:

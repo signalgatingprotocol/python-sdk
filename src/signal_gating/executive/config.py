@@ -55,6 +55,9 @@ class ArgvCheck(Model):
     id: NonEmpty
     argv: tuple[NonEmpty, ...] = Field(min_length=1)
     timeout_seconds: PositiveNumber = 30
+    max_output_bytes: PositiveInt = 65_536
+    environment: dict[AnnotatedEnv, str] = Field(default_factory=dict)
+    maximum_charge_microunits: NonNegativeInt | None = None
 
 
 class WorkspaceConfig(Model):
