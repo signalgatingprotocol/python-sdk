@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Coroutine, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -75,6 +76,19 @@ from .verification import VerificationService, Verifier
 from .workers import EpisodeRunner, Worker, WorkerError, _wait_until
 
 _RECORD = TypeAdapter(PersistentRecord)
+_RETRYABLE_VERIFICATION = {
+    "late_verification_result",
+    "verification_snapshot_changed",
+    "verification_configuration_changed",
+}
+
+
+@dataclass
+class _VerificationJob:
+    deadline: datetime
+    configuration: str
+    validity_boundary: datetime | None
+    task: asyncio.Task[CommitBatch | str | None]
 
 
 class Clock(Protocol):
@@ -168,6 +182,9 @@ class Kernel:
             self._changed = asyncio.Event()
             self._shutdown = asyncio.Event()
             self._verification_tasks: set[asyncio.Task[CommitBatch]] = set()
+            self._verification_jobs: dict[str, _VerificationJob] = {}
+            self._verification_attempts: dict[str, tuple[int, str, datetime | None]] = {}
+            self._verification_progress = self.store.view().sequence
             self._active: dict[str, asyncio.Task[None]] = {}
             self._driving = asyncio.Lock()
             self._seen_sequence = self.store.view().sequence
@@ -312,7 +329,9 @@ class Kernel:
             completed_subjects = {
                 r.subject_id
                 for r in state.records
-                if isinstance(r, DecisionReceipt) and r.policy_version.startswith("verification")
+                if isinstance(r, DecisionReceipt)
+                and r.policy_version.startswith("verification")
+                and r.reason_code not in _RETRYABLE_VERIFICATION
             }
             self._pending_signals = [
                 r.id
@@ -611,6 +630,15 @@ class Kernel:
     def _observe_events(self) -> None:
         events = self.store.events(after=self._seen_sequence)
         for event in events:
+            images = event.model_dump(mode="json")["payload"].get("records", ())
+            # A stale-attempt receipt is not new evidence for another retry.
+            if not images or not all(
+                raw.get("kind") == "receipt"
+                and raw.get("policy_version") == "verification-v1"
+                and raw.get("reason_code") in _RETRYABLE_VERIFICATION
+                for raw in images
+            ):
+                self._verification_progress = event.sequence
             state = self.store.view()
             self._commit(
                 CommitBatch(
@@ -638,6 +666,7 @@ class Kernel:
                         and record.signal_kind
                         in {"completion_claim", "attach_evidence", "reverify"}
                         and record.id not in self._pending_signals
+                        and record.id not in self._verification_jobs
                     ):
                         self._pending_signals.append(record.id)
                     elif (
@@ -650,29 +679,11 @@ class Kernel:
         self._seen_sequence = self.store.view().sequence
 
     async def _verification_call(
-        self, subject_id: str, call: Coroutine[Any, Any, CommitBatch]
-    ) -> CommitBatch | None:
-        # A trusted injected verifier computes locally for free. Paid/model
-        # judgments remain Dispatcher operations. Late prepared batches are discarded.
-        if self._stopped or len(self._verification_tasks) >= self.config.max_active_episodes:
-            call.close()
-            if not self._stopped:
-                self._verification_failure(subject_id, "verification_capacity")
-            return None
-        child = asyncio.create_task(call)
-        self._verification_tasks.add(child)
-
-        def finished(task: asyncio.Task[CommitBatch]) -> None:
-            self._verification_tasks.discard(task)
-            if not task.cancelled():
-                task.exception()
-
-        child.add_done_callback(finished)
-        timer = asyncio.create_task(
-            self._wait_until(
-                self.clock.now() + timedelta(seconds=self.config.episode_timeout_seconds)
-            )
-        )
+        self, child: asyncio.Task[CommitBatch], deadline: datetime
+    ) -> CommitBatch | str | None:
+        # Only prepare here. The coordinator consumes delivery on its writer turn.
+        # Detached, cancellation-resistant children retain their capacity slot.
+        timer = asyncio.create_task(self._wait_until(deadline))
         shutdown = asyncio.create_task(self._shutdown.wait())
         try:
             done, _ = await asyncio.wait(
@@ -680,37 +691,68 @@ class Kernel:
             )
             if self._stopped:
                 return None
-            if child in done:
-                try:
-                    batch = child.result()
-                except Exception:
-                    self._verification_failure(subject_id, "verification_failed")
-                    return None
-                indexed = records_by_id(self.store.view())
-                if any(
-                    ref.id not in indexed or indexed[ref.id].revision != ref.revision
-                    for ref in batch.expected_revisions
-                ):
-                    receipt = DecisionReceipt(
-                        created_at=self.clock.now(),
-                        subject_id=subject_id,
-                        disposition="stale",
-                        reason_code="verification_snapshot_changed",
-                        policy_version="verification-v1",
-                    )
-                    batch = self._batch((receipt,), self.store.view())
-                # No await between final authoritative CAS and commit. Timer
-                # cleanup happens afterward so controls cannot slip into this gap.
-                self._commit(batch)
-                return None
-            self._verification_failure(subject_id, "verification_timeout")
-            return None
+            if timer in done or self.clock.now() >= deadline:
+                return "verification_timeout"
+            try:
+                return child.result()
+            except asyncio.CancelledError:
+                return "verification_failed"
+            except ExecutiveError as exc:
+                if exc.code == "stale_verification_state":
+                    return "verification_snapshot_changed"
+                return "verification_failed"
+            except Exception:
+                return "verification_failed"
         finally:
             if not child.done():
                 child.cancel()
             timer.cancel()
             shutdown.cancel()
             await asyncio.gather(timer, shutdown, return_exceptions=True)
+
+    def _finish_verifications(self) -> None:
+        for identifier, job in tuple(self._verification_jobs.items()):
+            if not job.task.done():
+                continue
+            del self._verification_jobs[identifier]
+            result = job.task.result()
+            if self._stopped or result is None:
+                continue
+            # Deadline wins even if both child and timer were ready, or delivery
+            # waited for this writer turn. No await separates these guards/commit.
+            if self.clock.now() >= job.deadline:
+                result = "verification_timeout"
+            state = self.store.view()
+            if isinstance(result, CommitBatch):
+                if set(result.expected_revisions) != set(_reads(state)):
+                    result = "verification_snapshot_changed"
+                elif self.verification._configuration() != job.configuration:
+                    result = "verification_configuration_changed"
+                elif self._verification_boundary() != job.validity_boundary:
+                    result = "verification_snapshot_changed"
+            if isinstance(result, str):
+                if result not in _RETRYABLE_VERIFICATION:
+                    self._verification_failure(identifier, result)
+                    continue
+                receipt = DecisionReceipt(
+                    created_at=self.clock.now(),
+                    subject_id=identifier,
+                    disposition="stale",
+                    reason_code=result,
+                    policy_version="verification-v1",
+                )
+                result = self._batch((receipt,), state).model_copy(
+                    update={"response_receipt": receipt}
+                )
+            self._commit(result)
+            response = result.response_receipt
+            if response is not None and response.reason_code in _RETRYABLE_VERIFICATION:
+                subject = records_by_id(state).get(identifier)
+                if isinstance(subject, ExecutiveSignal):
+                    if identifier not in self._pending_signals:
+                        self._pending_signals.append(identifier)
+                elif isinstance(subject, Goal):
+                    self._verification_due.add(identifier)
 
     def _verification_failure(self, subject_id: str, reason: str) -> None:
         state = self.store.view()
@@ -746,33 +788,84 @@ class Kernel:
         )
         self._commit(self._batch(tuple(writes), state))
 
-    async def _verify(self) -> None:
-        while self._pending_signals:
-            identifier = self._pending_signals.pop(0)
-            state = self.store.view()
-            signal = records_by_id(state).get(identifier)
-            if not isinstance(signal, ExecutiveSignal):
+    def _verification_boundary(self) -> datetime | None:
+        # Time may invalidate a prepared proof without changing any record revision.
+        now = self.clock.now()
+        return max(
+            (
+                boundary
+                for record in self.store.view().records
+                if isinstance(record, Belief)
+                for boundary in (record.valid_from, record.valid_until)
+                if boundary is not None and boundary <= now
+            ),
+            default=None,
+        )
+
+    def _verify(self) -> None:
+        # Retry once per changed state/configuration/validity boundary, never on
+        # our own stale receipt. A new explicit cycle also permits another attempt.
+        key = (
+            self._verification_progress,
+            self.verification._configuration(),
+            self._verification_boundary(),
+        )
+        for identifier in (*self._pending_signals, *sorted(self._verification_due)):
+            if (
+                sum(not task.done() for task in self._verification_tasks)
+                >= self.config.max_active_episodes
+            ):
+                break
+            if (
+                identifier in self._verification_jobs
+                or self._verification_attempts.get(identifier) == key
+            ):
                 continue
-            if signal.signal_kind == "completion_claim":
-                batch = await self._verification_call(
-                    signal.id,
+            state = self.store.view()
+            subject = records_by_id(state).get(identifier)
+            if isinstance(subject, ExecutiveSignal):
+                self._pending_signals.remove(identifier)
+                call = (
                     self.verification.evaluate(
-                        CompletionClaim.model_validate(signal.payload["proposal"]), state
-                    ),
+                        CompletionClaim.model_validate(subject.payload["proposal"]), state
+                    )
+                    if subject.signal_kind == "completion_claim"
+                    else self.verification.consume_request(subject, state)
                 )
             else:
-                batch = await self._verification_call(
-                    signal.id, self.verification.consume_request(signal, state)
-                )
-            if batch is not None:
-                self._commit(batch)
-        due, self._verification_due = self._verification_due, set()
-        for identifier in sorted(due):
-            batch = await self._verification_call(
-                identifier, self.verification.reverify(identifier, self.store.view())
-            )
-            if batch is not None:
-                self._commit(batch)
+                self._verification_due.discard(identifier)
+                call = self.verification.reverify(identifier, state)
+            self._verification_attempts[identifier] = key
+            child = asyncio.create_task(call)
+            self._verification_tasks.add(child)
+
+            def finished(task: asyncio.Task[CommitBatch]) -> None:
+                self._verification_tasks.discard(task)
+                if not task.cancelled():
+                    task.exception()
+                self._changed.set()
+
+            child.add_done_callback(finished)
+            deadline = self.clock.now() + timedelta(seconds=self.config.episode_timeout_seconds)
+            job = asyncio.create_task(self._verification_call(child, deadline))
+            job.add_done_callback(lambda _: self._changed.set())
+            self._verification_jobs[identifier] = _VerificationJob(deadline, key[1], key[2], job)
+
+    def _action_slots(self) -> int:
+        occupied = self.dispatcher._active_ids | {
+            action.id for action, _ in self.dispatcher._detached.values()
+        }
+        indexed = records_by_id(self.store.view())
+        scheduled = sum(
+            isinstance(indexed.get(identifier), ActionRecord) and identifier not in occupied
+            for identifier in self._active
+        )
+        return (
+            self.config.max_active_episodes
+            - len(self.dispatcher._pending)
+            - len(self.dispatcher._late)
+            - scheduled
+        )
 
     def _remaining(self, budget: Budget, state: StateView) -> Limits:
         indexed = records_by_id(state)
@@ -810,11 +903,7 @@ class Kernel:
             - len(self.runner._pending)
             - len(self.runner._late_usage)
         )
-        action_slots = (
-            self.config.max_active_episodes
-            - len(self.dispatcher._pending)
-            - len(self.dispatcher._late)
-        )
+        action_slots = self._action_slots()
         unavailable_actions = self.dispatcher._active_ids | {
             a.id for a, _ in self.dispatcher._detached.values()
         }
@@ -1109,6 +1198,7 @@ class Kernel:
 
     async def run_until_idle(self) -> RunSummary:
         async with self._driving:
+            self._verification_attempts.clear()
             # A public tick also checks external bytes and temporal support.
             self._verification_due.update(
                 r.id
@@ -1122,8 +1212,8 @@ class Kernel:
                     if task.done():
                         del self._active[identifier]
                         task.result()
+                self._finish_verifications()
                 self._observe_events()
-                await self._verify()
                 if self._stopped:
                     break
                 state = self.store.view()
@@ -1138,13 +1228,15 @@ class Kernel:
                         isinstance(record, ActionRecord)
                         and record.status in {"proposed", "authorized"}
                         and record.id not in self._active
+                        and self._action_slots() > 0
                         and len(self._active) < self.config.max_active_episodes
                     ):
                         self._launch(record.id, self._dispatch(record.id))
                 if len(self._active) < self.config.max_active_episodes:
                     for episode, packet in self._admit():
                         self._launch(episode.id, self._episode(episode, packet))
-                if self._active:
+                self._verify()
+                if self._active or self._verification_jobs:
                     await self._wait_change()
                 elif self._changed.is_set():
                     continue
@@ -1251,5 +1343,8 @@ class Kernel:
         if self._active:
             await asyncio.gather(*self._active.values())
             self._active.clear()
+        if self._verification_jobs:
+            await asyncio.gather(*(job.task for job in self._verification_jobs.values()))
+            self._verification_jobs.clear()
         self._drain()
         self._commit(recover(self.store, registry=self.registry, now=self.clock.now()))

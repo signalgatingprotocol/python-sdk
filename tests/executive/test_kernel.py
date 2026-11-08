@@ -1173,23 +1173,42 @@ async def test_timer_wakes_eligible_task_while_independent_worker_active(tmp_pat
         assert kernel.store.view() == rebuild(kernel.store.events())
 
 
-async def test_timer_reverifies_expired_completion_while_independent_worker_active(tmp_path):
+@pytest.mark.parametrize("independent_kind", ["worker", "verifier"])
+async def test_timer_reverifies_expired_completion_while_independent_call_active(
+    tmp_path, independent_kind
+):
     import json
     from uuid import uuid4
 
     from signal_gating.executive import Belief, Commitment, Scope
     from signal_gating.executive.authority import reference
+    from signal_gating.executive.verification import ArtifactVerifier
 
     clock = FakeClock()
     due = NOW + timedelta(seconds=5)
     completed_goal = new_goal()
-    independent_goal = new_goal(id=uuid4().hex, criteria=())
+    independent_goal = new_goal(
+        id=uuid4().hex,
+        criteria=(criterion(id=uuid4().hex, verifier_id="controlled-v1"),)
+        if independent_kind == "verifier"
+        else (),
+    )
     independent_started, rechecked = asyncio.Event(), asyncio.Event()
     release = asyncio.get_running_loop().create_future()
+
+    class Verifier:
+        async def verify(self, selected, state):
+            independent_started.set()
+            await release
+            return ArtifactVerifier(kernel.artifacts, principal=kernel.verifier_principal)._result(
+                selected, state, "accept", "controlled_valid_result"
+            )
 
     class Worker:
         async def run_episode(self, packet):
             if packet.goal.id == independent_goal.id:
+                if independent_kind == "verifier":
+                    return completion(packet)
                 independent_started.set()
                 await release
                 return blocked(packet)
@@ -1211,7 +1230,9 @@ async def test_timer_reverifies_expired_completion_while_independent_worker_acti
                 ),
             )
 
-    async with open_kernel(tmp_path, Worker(), clock=clock) as kernel:
+    async with open_kernel(
+        tmp_path, Worker(), clock=clock, verifiers={"controlled-v1": Verifier()}
+    ) as kernel:
         await kernel.submit(CreateGoal(goal=completed_goal), principal=owner())
         belief = Belief(
             claim="Expiring required-work support",
@@ -1251,20 +1272,28 @@ async def test_timer_reverifies_expired_completion_while_independent_worker_acti
             principal=owner(),
         )
         assert (await kernel.run_until_idle()).completed_goal_ids == (completed_goal.id,)
-        original_call = kernel._verification_call
+        original_finish = kernel._finish_verifications
 
-        async def observed_call(subject_id, call):
-            result = await original_call(subject_id, call)
-            if clock.now() >= due:
+        def observed_finish():
+            original_finish()
+            current = next(g for g in records(kernel, Goal) if g.id == completed_goal.id)
+            if clock.now() >= due and current.status == "active":
                 rechecked.set()
-            return result
 
-        kernel._verification_call = observed_call
+        kernel._finish_verifications = observed_finish
         await kernel.submit(CreateGoal(goal=independent_goal), principal=owner())
-        waiting = active_wait_barrier(kernel, independent_started)
+        armed = asyncio.Event()
+        original_wait = kernel._wait_until
+
+        async def observe_timer(at):
+            if at == due:
+                armed.set()
+            await original_wait(at)
+
+        kernel._wait_until = observe_timer
         running = asyncio.create_task(kernel.run_until_idle())
         await asyncio.wait_for(independent_started.wait(), 1)
-        await asyncio.wait_for(waiting.wait(), 1)
+        await asyncio.wait_for(armed.wait(), 1)
         try:
             clock.advance(5)
             await asyncio.wait_for(rechecked.wait(), 1)
@@ -1278,10 +1307,537 @@ async def test_timer_reverifies_expired_completion_while_independent_worker_acti
             independent = next(
                 t for t in records(kernel, TaskFrame) if t.goal_id == independent_goal.id
             )
-            assert independent.status == "running"
+            assert independent.status == (
+                "verifying" if independent_kind == "verifier" else "running"
+            )
             assert not release.done()
         finally:
             release.set_result(None)
             await asyncio.wait_for(running, 1)
         assert not clock.waiters
         assert kernel.store.view() == rebuild(kernel.store.events())
+
+
+def completion(packet):
+    return EpisodeResult(
+        stop_reason="proposed",
+        usage=usage(),
+        proposals=(
+            CompletionClaim(
+                episode_id=packet.episode_id,
+                fencing_token=packet.fencing_token,
+                read_set=packet.mandatory_read_set,
+                criterion_ids=(packet.goal.criteria[0].id,),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_stale_verifier_request_retries_current_state_and_survives_restart(tmp_path, restart):
+    from signal_gating.executive import DecisionReceipt
+    from signal_gating.executive.verification import ArtifactVerifier
+
+    from .factories import signal
+
+    started = asyncio.Queue()
+    release = asyncio.Event()
+    never = asyncio.Event()
+    calls = 0
+
+    class Verifier:
+        async def verify(self, selected, state):
+            nonlocal calls
+            calls += 1
+            started.put_nowait(calls)
+            if calls == 1:
+                await release.wait()
+            elif restart:
+                await never.wait()
+            return ArtifactVerifier(kernel.artifacts, principal=kernel.verifier_principal)._result(
+                selected, state, "accept", "controlled_valid_result"
+            )
+
+    async with open_kernel(
+        tmp_path, FunctionWorker(completion), verifiers={"controlled-v1": Verifier()}
+    ) as kernel:
+        await kernel.submit(
+            CreateGoal(goal=new_goal(criteria=(criterion(verifier_id="controlled-v1"),))),
+            principal=owner(),
+        )
+        running = asyncio.create_task(kernel.run_until_idle())
+        assert await asyncio.wait_for(started.get(), 1) == 1
+        assert (await kernel.ingest(signal(), principal=owner())).disposition == "admit"
+        release.set()
+        assert await asyncio.wait_for(started.get(), 1) == 2
+        if restart:
+            await kernel.stop()
+        await asyncio.wait_for(running, 1)
+        assert any(
+            r.reason_code in {"late_verification_result", "verification_snapshot_changed"}
+            for r in records(kernel, DecisionReceipt)
+        )
+        if not restart:
+            assert records(kernel, Goal)[0].status == "completed"
+            assert records(kernel, TaskFrame)[0].status == "completed"
+        else:
+            assert records(kernel, TaskFrame)[0].status == "verifying"
+        assert kernel.store.view() == rebuild(kernel.store.events())
+        assert not kernel.clock.waiters
+    if restart:
+        never.set()
+        async with open_kernel(
+            tmp_path, FunctionWorker(completion), verifiers={"controlled-v1": Verifier()}
+        ) as kernel:
+            assert len(kernel._pending_signals) == 1
+            await kernel.run_until_idle()
+            assert records(kernel, Goal)[0].status == "completed"
+            assert records(kernel, TaskFrame)[0].status == "completed"
+            assert kernel.store.view() == rebuild(kernel.store.events())
+
+
+async def test_verifier_result_ready_at_deadline_is_discarded(tmp_path):
+    from signal_gating.executive import DecisionReceipt
+    from signal_gating.executive.verification import ArtifactVerifier
+
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class Verifier:
+        async def verify(self, selected, state):
+            started.set()
+            await release.wait()
+            return ArtifactVerifier(kernel.artifacts, principal=kernel.verifier_principal)._result(
+                selected, state, "accept", "controlled_valid_result"
+            )
+
+    async with open_kernel(
+        tmp_path, FunctionWorker(completion), verifiers={"controlled-v1": Verifier()}
+    ) as kernel:
+        await kernel.submit(
+            CreateGoal(goal=new_goal(criteria=(criterion(verifier_id="controlled-v1"),))),
+            principal=owner(),
+        )
+        running = asyncio.create_task(kernel.run_until_idle())
+        await asyncio.wait_for(started.wait(), 1)
+        kernel.clock.advance(kernel.config.episode_timeout_seconds)
+        release.set()
+        await asyncio.wait_for(running, 1)
+        reasons = {r.reason_code for r in records(kernel, DecisionReceipt)}
+        assert "verification_timeout" in reasons
+        assert "completion_verified" not in reasons
+        assert records(kernel, Goal)[0].status == "active"
+        assert records(kernel, TaskFrame)[0].status == "blocked"
+        assert not kernel.clock.waiters
+
+
+async def test_timer_admits_work_while_injected_verifier_is_active(tmp_path):
+    from uuid import uuid4
+
+    from signal_gating.executive.verification import ArtifactVerifier
+
+    delayed = new_goal(criteria=())
+    verifying = new_goal(id=uuid4().hex, criteria=(criterion(verifier_id="controlled-v1"),))
+    started, release, timed_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    class Verifier:
+        async def verify(self, selected, state):
+            started.set()
+            await release.wait()
+            return ArtifactVerifier(kernel.artifacts, principal=kernel.verifier_principal)._result(
+                selected, state, "accept", "controlled_valid_result"
+            )
+
+    def produce(packet):
+        nonlocal calls
+        if packet.goal.id != delayed.id:
+            return completion(packet)
+        calls += 1
+        if calls == 1:
+            return EpisodeResult(
+                stop_reason="blocked",
+                blocker=WakeCondition(
+                    kind="time", at=NOW + timedelta(seconds=5), reason_code="scheduled"
+                ),
+                usage=usage(),
+            )
+        timed_started.set()
+        return blocked(packet)
+
+    async with open_kernel(
+        tmp_path, FunctionWorker(produce), verifiers={"controlled-v1": Verifier()}
+    ) as kernel:
+        await kernel.submit(CreateGoal(goal=delayed), principal=owner())
+        await kernel.run_until_idle()
+        await kernel.submit(CreateGoal(goal=verifying), principal=owner())
+        armed = asyncio.Event()
+        original_wait = kernel._wait_until
+
+        async def observe_timer(at):
+            if at == NOW + timedelta(seconds=5):
+                armed.set()
+            await original_wait(at)
+
+        kernel._wait_until = observe_timer
+        running = asyncio.create_task(kernel.run_until_idle())
+        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(armed.wait(), 1)
+        try:
+            kernel.clock.advance(5)
+            await asyncio.wait_for(timed_started.wait(), 1)
+            assert calls == 2
+            assert not release.is_set()
+        finally:
+            release.set()
+            await asyncio.wait_for(running, 1)
+        assert not kernel.clock.waiters
+        assert kernel.store.view() == rebuild(kernel.store.events())
+
+
+async def test_detached_action_capacity_defers_without_receipt_loop(tmp_path):
+    from signal_gating.executive import (
+        ActionIntent,
+        ActionObservation,
+        ActionRecord,
+        CapabilitySpec,
+        DecisionReceipt,
+        Limits,
+        Scope,
+        SetGrant,
+    )
+
+    from .factories import grant
+
+    started, finished = asyncio.Event(), asyncio.Event()
+    release = asyncio.get_running_loop().create_future()
+    calls = []
+
+    class Adapter:
+        async def execute(self, action):
+            calls.append(action.id)
+            started.set()
+            try:
+                try:
+                    await asyncio.shield(release)
+                except asyncio.CancelledError:
+                    await release
+                return ActionObservation(
+                    action_id=action.id,
+                    expected_revision=action.revision,
+                    outcome="succeeded",
+                    usage=usage(),
+                )
+            finally:
+                finished.set()
+
+        async def reconcile(self, action):
+            raise AssertionError("No lookup")
+
+        async def cancel(self, action):
+            return None
+
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilitySpec(
+            id="effect",
+            binding_version="1",
+            description="Controlled effect",
+            input_schema={"type": "object"},
+            effect_class="consequential",
+        ),
+        Adapter(),
+        resource_scope=lambda _: Scope(resource_paths=(".",)),
+        quote=Limits(
+            input_tokens=0, output_tokens=0, calls=1, elapsed_seconds=30, cost_microunits=0
+        ),
+        quote_source="operator-test",
+        quote_version="1",
+        require_approval=False,
+    )
+
+    produced = False
+
+    def produce(packet):
+        nonlocal produced
+        if produced:
+            return blocked(packet)
+        produced = True
+        return EpisodeResult(
+            stop_reason="proposed",
+            usage=usage(),
+            proposals=tuple(
+                ActionIntent(
+                    episode_id=packet.episode_id,
+                    fencing_token=packet.fencing_token,
+                    read_set=packet.mandatory_read_set,
+                    capability_id="effect",
+                    scope=Scope(
+                        owner_id=packet.goal.owner_id,
+                        goal_id=packet.goal.id,
+                        resource_paths=(".",),
+                    ),
+                    arguments={"index": index},
+                )
+                for index in (1, 2)
+            ),
+        )
+
+    async with open_kernel(
+        tmp_path,
+        FunctionWorker(produce),
+        registry=registry,
+        config=configuration(max_active_episodes=1),
+    ) as kernel:
+        await kernel.submit(CreateGoal(goal=new_goal()), principal=owner())
+        await kernel.submit(
+            SetGrant(
+                grant=grant(
+                    subject_id=kernel.worker_principals["fixture"].id,
+                    capabilities=("effect",),
+                    scope=Scope(owner_id=owner().id, goal_id=new_goal().id, resource_paths=(".",)),
+                )
+            ),
+            principal=owner(),
+        )
+        running = asyncio.create_task(kernel.run_until_idle())
+        await asyncio.wait_for(started.wait(), 1)
+        kernel.clock.advance(30)
+        try:
+            await asyncio.wait_for(running, 1)
+            assert len(calls) == 1
+            assert len(kernel.dispatcher._detached) == 1
+            assert {a.status for a in records(kernel, ActionRecord)} == {
+                "outcome_unknown",
+                "proposed",
+            }
+            assert not any(
+                r.reason_code == "dispatcher_capacity" for r in records(kernel, DecisionReceipt)
+            )
+        finally:
+            release.set_result(None)
+            await asyncio.wait_for(finished.wait(), 1)
+            await asyncio.wait_for(kernel.dispatcher.late_observations_ready.wait(), 1)
+        await kernel.run_until_idle()
+        assert len(calls) == len(set(calls)) == 2
+        assert all(a.status == "succeeded" for a in records(kernel, ActionRecord))
+        assert not kernel.clock.waiters
+
+
+@pytest.mark.parametrize("change", ["new_record", "pause", "deadline"])
+async def test_verification_delivery_rechecks_authority_snapshot_and_deadline(tmp_path, change):
+    from signal_gating.executive import DecisionReceipt
+    from signal_gating.executive.verification import ArtifactVerifier
+
+    from .factories import signal
+
+    prepared, deliver = asyncio.Event(), asyncio.Event()
+
+    class Verifier:
+        async def verify(self, selected, state):
+            return ArtifactVerifier(kernel.artifacts, principal=kernel.verifier_principal)._result(
+                selected, state, "accept", "controlled_valid_result"
+            )
+
+    async with open_kernel(
+        tmp_path, FunctionWorker(completion), verifiers={"controlled-v1": Verifier()}
+    ) as kernel:
+        original_call = kernel._verification_call
+
+        async def delay_delivery(child, deadline):
+            result = await original_call(child, deadline)
+            if not prepared.is_set():
+                prepared.set()
+                await deliver.wait()
+            return result
+
+        kernel._verification_call = delay_delivery
+        await kernel.submit(
+            CreateGoal(goal=new_goal(criteria=(criterion(verifier_id="controlled-v1"),))),
+            principal=owner(),
+        )
+        running = asyncio.create_task(kernel.run_until_idle())
+        await asyncio.wait_for(prepared.wait(), 1)
+        try:
+            if change == "new_record":
+                await kernel.ingest(signal(), principal=owner())
+            elif change == "pause":
+                current = records(kernel, Goal)[0]
+                await kernel.submit(
+                    PauseGoal(goal_id=current.id, expected_revision=current.revision),
+                    principal=owner(),
+                )
+            else:
+                kernel.clock.advance(kernel.config.episode_timeout_seconds)
+        finally:
+            deliver.set()
+        await asyncio.wait_for(running, 1)
+        reasons = {r.reason_code for r in records(kernel, DecisionReceipt)}
+        if change == "new_record":
+            assert "verification_snapshot_changed" in reasons
+            assert records(kernel, Goal)[0].status == "completed"
+        else:
+            assert "completion_verified" not in reasons
+            assert records(kernel, Goal)[0].status == ("paused" if change == "pause" else "active")
+            assert (
+                "verification_snapshot_changed" if change == "pause" else "verification_timeout"
+            ) in reasons
+        assert kernel.store.view() == rebuild(kernel.store.events())
+        assert not kernel.clock.waiters
+
+
+async def test_stale_attempt_receipt_alone_does_not_trigger_verifier_retry_loop(tmp_path):
+    from signal_gating.executive import DecisionReceipt
+
+    calls = 0
+    async with open_kernel(tmp_path, FunctionWorker(completion)) as kernel:
+
+        async def stale(claim, state):
+            nonlocal calls
+            calls += 1
+            return kernel.verification._finish(
+                state, claim.id, "stale", "verification_snapshot_changed"
+            )
+
+        kernel.verification.evaluate = stale
+        await kernel.submit(CreateGoal(goal=new_goal()), principal=owner())
+        await asyncio.wait_for(kernel.run_until_idle(), 1)
+        assert calls == 1
+        assert len(kernel._pending_signals) == 1
+        assert records(kernel, TaskFrame)[0].status == "verifying"
+        await asyncio.wait_for(kernel.run_until_idle(), 1)
+        assert calls == 2
+        assert (
+            sum(
+                r.reason_code == "verification_snapshot_changed"
+                for r in records(kernel, DecisionReceipt)
+            )
+            == 2
+        )
+
+
+async def test_detached_verifier_retains_slot_until_child_finishes(tmp_path):
+    from uuid import uuid4
+
+    from signal_gating.executive.verification import ArtifactVerifier
+
+    started, finished, second_claim = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    release = asyncio.get_running_loop().create_future()
+    calls = 0
+    first = new_goal(criteria=(criterion(verifier_id="controlled-v1"),))
+    second = new_goal(
+        id=uuid4().hex, criteria=(criterion(id=uuid4().hex, verifier_id="controlled-v1"),)
+    )
+
+    class Verifier:
+        async def verify(self, selected, state):
+            nonlocal calls
+            calls += 1
+            started.set()
+            if calls == 1:
+                try:
+                    await asyncio.shield(release)
+                except asyncio.CancelledError:
+                    await release
+                finished.set()
+            return ArtifactVerifier(kernel.artifacts, principal=kernel.verifier_principal)._result(
+                selected, state, "accept", "controlled_valid_result"
+            )
+
+    async with open_kernel(
+        tmp_path,
+        FunctionWorker(completion),
+        config=configuration(max_active_episodes=1),
+        verifiers={"controlled-v1": Verifier()},
+    ) as kernel:
+        original_commit = kernel._commit
+
+        def observe_claim(batch):
+            result = original_commit(batch)
+            if any(
+                raw.get("signal_kind") == "completion_claim"
+                and raw["scope"]["goal_id"] == second.id
+                for event in batch.events
+                for raw in event.payload.get("records", ())
+            ):
+                second_claim.set()
+            return result
+
+        kernel._commit = observe_claim
+        await kernel.submit(CreateGoal(goal=first), principal=owner())
+        running = asyncio.create_task(kernel.run_until_idle())
+        await asyncio.wait_for(started.wait(), 1)
+        await kernel.submit(CreateGoal(goal=second), principal=owner())
+        await asyncio.wait_for(second_claim.wait(), 1)
+        kernel.clock.advance(kernel.config.episode_timeout_seconds)
+        try:
+            await asyncio.wait_for(running, 1)
+            assert calls == 1
+            assert len(kernel._verification_tasks) == 1
+            assert len(kernel._pending_signals) == 1
+            assert not kernel._verification_jobs
+        finally:
+            release.set_result(None)
+            await asyncio.wait_for(finished.wait(), 1)
+            await asyncio.gather(*kernel._verification_tasks)
+        await kernel.run_until_idle()
+        assert calls == 2
+        assert next(g for g in records(kernel, Goal) if g.id == second.id).status == "completed"
+        assert next(g for g in records(kernel, Goal) if g.id == first.id).status == "active"
+        assert not kernel.clock.waiters
+
+
+async def test_verification_delivery_reprepares_when_proof_expires_after_preparation(tmp_path):
+    from signal_gating.executive import Belief, DecisionReceipt, Scope
+    from signal_gating.executive.authority import reference
+    from signal_gating.executive.verification import ArtifactVerifier
+
+    prepared, deliver = asyncio.Event(), asyncio.Event()
+
+    class Verifier:
+        async def verify(self, selected, state):
+            return ArtifactVerifier(kernel.artifacts, principal=kernel.verifier_principal)._result(
+                selected, state, "accept", "controlled_valid_result", reads=selected.inputs
+            )
+
+    async with open_kernel(
+        tmp_path, FunctionWorker(completion), verifiers={"controlled-v1": Verifier()}
+    ) as kernel:
+        belief = Belief(
+            claim="Temporary proof support",
+            scope=Scope(owner_id=owner().id),
+            epistemic_status="supported",
+            valid_until=NOW + timedelta(seconds=5),
+        )
+        kernel._commit(kernel._batch((belief,), kernel.store.view()))
+        await kernel.submit(
+            CreateGoal(
+                goal=new_goal(
+                    criteria=(criterion(verifier_id="controlled-v1", inputs=(reference(belief),)),)
+                )
+            ),
+            principal=owner(),
+        )
+        original_call = kernel._verification_call
+
+        async def delay_delivery(child, deadline):
+            result = await original_call(child, deadline)
+            if not prepared.is_set():
+                assert result.response_receipt.reason_code == "completion_verified"
+                prepared.set()
+                await deliver.wait()
+            return result
+
+        kernel._verification_call = delay_delivery
+        running = asyncio.create_task(kernel.run_until_idle())
+        try:
+            await asyncio.wait_for(prepared.wait(), 1)
+            kernel.clock.advance(5)
+        finally:
+            deliver.set()
+        await asyncio.wait_for(running, 1)
+        assert not any(
+            r.reason_code == "completion_verified" for r in records(kernel, DecisionReceipt)
+        )
+        assert records(kernel, Goal)[0].status == "active"
+        assert not kernel._pending_signals
+        assert not kernel.clock.waiters
