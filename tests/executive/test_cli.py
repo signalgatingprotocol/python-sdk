@@ -857,3 +857,163 @@ def test_cancelled_resume_requires_new_goal_and_preserves_existing_work(tmp_path
     assert "new goal" in json.loads(resumed.stdout)["detail"]
     after = invoke(["inspect", "--store", str(tmp_path / "store"), "--json"], cwd=tmp_path)
     assert before.stdout == after.stdout
+
+
+@pytest.mark.parametrize("operation", ["init", "inspect", "run"])
+def test_physical_sqlite_corruption_exits_four_without_echoing_data(tmp_path, operation):
+    store = tmp_path / "store"
+    assert invoke(["init", "--store", str(store)], cwd=tmp_path).returncode == 0
+    with (store / "executive.sqlite3").open("r+b") as stream:
+        stream.write(b"API_KEY_VALUE broken SQLite header")
+    if operation == "run":
+        config, goal_file = files(tmp_path)
+        args = arguments(tmp_path, config, goal_file) + ["--batch"]
+    else:
+        args = [operation, "--store", str(store)]
+    result = invoke(args, cwd=tmp_path)
+    assert result.returncode == 4, result.stdout + result.stderr
+    response = json.loads(result.stdout)
+    assert response["reason_code"] == "runtime_error"
+    assert response["error_code"] == "store_open_failed"
+    assert "API_KEY_VALUE" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure", ["missing", "unsupported_schema", "permission"])
+def test_ordinary_store_startup_failures_stay_exit_two(tmp_path, failure, monkeypatch, capsys):
+    import sqlite3
+
+    from signal_gating.executive.cli import main
+    from signal_gating.executive.errors import StoreError
+    from signal_gating.executive.store import Store
+
+    store = tmp_path / "store"
+    if failure == "unsupported_schema":
+        assert invoke(["init", "--store", str(store)], cwd=tmp_path).returncode == 0
+        with sqlite3.connect(store / "executive.sqlite3") as db:
+            db.execute("PRAGMA user_version=999")
+    elif failure == "permission":
+
+        def denied(_):
+            raise StoreError("store_open_failed", "Could not open executive snapshot") from (
+                PermissionError("API_KEY_VALUE sensitive permission failure")
+            )
+
+        monkeypatch.setattr(Store, "open_readonly", denied)
+    assert main(["inspect", "--store", str(store), "--json"]) == 2
+    output = capsys.readouterr()
+    response = json.loads(output.out)
+    assert response["reason_code"] == "startup_error"
+    assert "API_KEY_VALUE" not in output.out + output.err
+    if failure == "unsupported_schema":
+        assert response["error_code"] == "unsupported_schema"
+    elif failure == "missing":
+        assert not store.exists()
+
+
+@pytest.mark.parametrize("message", ["database disk image is malformed", "file is not a database"])
+def test_legacy_sqlite_corruption_without_errorcode_still_exits_four(message, monkeypatch, capsys):
+    import sqlite3
+
+    from signal_gating.executive.cli import main
+    from signal_gating.executive.errors import StoreError
+    from signal_gating.executive.store import Store
+
+    # sqlite_errorcode/sqlite_errorname were added in Python 3.11. A constructed
+    # sqlite exception has neither attribute, exercising the Python 3.10 path.
+    error = sqlite3.DatabaseError(message)
+    assert not hasattr(error, "sqlite_errorcode")
+
+    def corrupt(_):
+        raise StoreError("store_open_failed", "Could not open executive snapshot") from error
+
+    monkeypatch.setattr(Store, "open_readonly", corrupt)
+    assert main(["inspect", "--store", "/unused", "--json"]) == 4
+    response = json.loads(capsys.readouterr().out)
+    assert response["reason_code"] == "runtime_error"
+    assert message not in json.dumps(response)
+
+
+@pytest.mark.parametrize("sqlite_code,expected", [(11, 4), (26, 4), (267, 4), (14, 2), (1, 2)])
+def test_sqlite_primary_and_extended_error_codes_are_classified_without_echo(
+    sqlite_code,
+    expected,
+    monkeypatch,
+    capsys,
+):
+    import sqlite3
+
+    from signal_gating.executive.cli import main
+    from signal_gating.executive.errors import StoreError
+    from signal_gating.executive.store import Store
+
+    # Stable SQLite primary codes: CORRUPT=11, NOTADB=26, CANTOPEN=14,
+    # ERROR=1; extended CORRUPT_VTAB=267. Prefer codes over message inference.
+    error = sqlite3.DatabaseError("API_KEY_VALUE file is not a database")
+    error.sqlite_errorcode = sqlite_code
+
+    def fail(_):
+        raise StoreError("store_open_failed", "Could not open executive snapshot") from error
+
+    monkeypatch.setattr(Store, "open_readonly", fail)
+    assert main(["inspect", "--store", "/unused", "--json"]) == expected
+    captured = capsys.readouterr()
+    assert "API_KEY_VALUE" not in captured.out + captured.err
+    assert json.loads(captured.out)["error_code"] == "store_open_failed"
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("close_failure", [False, True])
+async def test_partial_worker_startup_closes_all_transports_with_redacted_exit_precedence(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    close_failure,
+    cancelled,
+):
+    import argparse
+
+    from signal_gating.executive import cli
+    from signal_gating.executive.adapters.openai_worker import OpenAIWorker
+    from signal_gating.executive.context import UTF8ByteCounter
+
+    config, goal_file = files(tmp_path)
+    closed = []
+
+    class Client:
+        max_retries = 0
+
+        def __init__(self, name):
+            self.name = name
+
+        async def close(self):
+            closed.append(self.name)
+            if close_failure and self.name == "first":
+                raise RuntimeError("API_KEY_VALUE sensitive close failure")
+
+    def partial_construction(_, workers):
+        for name in ("first", "second"):
+            workers[name] = OpenAIWorker(
+                Client(name), model="fake", counter=UTF8ByteCounter(), capacity=32768, quote=None
+            )
+        if cancelled:
+            raise asyncio.CancelledError("API_KEY_VALUE sensitive cancellation")
+        raise ValueError("API_KEY_VALUE sensitive startup failure")
+
+    monkeypatch.setattr(cli, "_workers", partial_construction)
+    args = argparse.Namespace(
+        config=config, goal=goal_file, store=tmp_path / "store", live=False, batch=True
+    )
+    if cancelled and not close_failure:
+        with pytest.raises(asyncio.CancelledError):
+            await cli._run(args)
+    else:
+        assert await cli._run(args) == (4 if close_failure else 2)
+    assert closed == ["first", "second"]
+    captured = capsys.readouterr()
+    assert "API_KEY_VALUE" not in captured.out + captured.err
+    responses = [json.loads(line) for line in captured.out.splitlines()]
+    if not cancelled:
+        assert responses[0]["reason_code"] == "startup_error"
+    if close_failure:
+        assert responses[-1]["reason_code"] == "runtime_error"
+    assert not args.store.exists()

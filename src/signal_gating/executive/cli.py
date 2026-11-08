@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
@@ -40,6 +41,22 @@ class OperatorInputError(ValueError):
 
 def _error(exc: Exception, *, started: bool = False) -> int:
     corrupt = isinstance(exc, StoreError) and exc.code in {"corrupt_store", "invalid_journal"}
+    cause = exc.__cause__
+    if isinstance(exc, StoreError) and isinstance(cause, sqlite3.DatabaseError):
+        sqlite_code = getattr(cause, "sqlite_errorcode", None)
+        if isinstance(sqlite_code, int):
+            # Extended SQLite result codes retain their primary code in one byte.
+            corrupt = corrupt or (sqlite_code & 0xFF) in {
+                getattr(sqlite3, "SQLITE_CORRUPT", 11),
+                getattr(sqlite3, "SQLITE_NOTADB", 26),
+            }
+        else:
+            # Python 3.10 has no sqlite_errorcode. Match only SQLite's exact
+            # corruption diagnostics, never generic I/O errors or arbitrary text.
+            corrupt = corrupt or str(cause) in {
+                "database disk image is malformed",
+                "file is not a database",
+            }
     code = 4 if started or corrupt else 2
     details: dict[str, Any] = {"detail": str(exc)} if isinstance(exc, OperatorInputError) else {}
     if isinstance(exc, ExecutiveError):
@@ -171,11 +188,17 @@ def _workers(config: KernelConfig, result: dict[str, Worker]) -> None:
 
 
 async def _close_workers(workers: dict[str, Worker]) -> None:
+    failed = False
     for worker in workers.values():
         if isinstance(worker, OpenAIWorker):
             close = getattr(worker.client, "close", None)
             if close is not None:
-                await close()
+                try:
+                    await close()
+                except Exception:
+                    failed = True
+    if failed:
+        raise RuntimeError("Provider transport close failed")
 
 
 async def _commands(
@@ -237,6 +260,23 @@ async def _commands(
 
 async def _run(args: argparse.Namespace) -> int:
     workers: dict[str, Worker] = {}
+    failure: BaseException | None = None
+    code = 4
+    try:
+        code = await _run_session(args, workers)
+    except BaseException as exc:
+        failure = exc
+    try:
+        await _close_workers(workers)
+    except Exception:
+        _emit("error", reason_code="runtime_error", detail="Provider transport close failed.")
+        return 4
+    if failure is not None:
+        raise failure
+    return code
+
+
+async def _run_session(args: argparse.Namespace, workers: dict[str, Worker]) -> int:
     started = False
     try:
         config = load_config(args.config)
@@ -345,12 +385,6 @@ async def _run(args: argparse.Namespace) -> int:
             return 0
     except Exception as exc:
         return _error(exc, started=started)
-    finally:
-        try:
-            await _close_workers(workers)
-        except Exception:
-            _emit("error", reason_code="runtime_error", detail="Provider transport close failed.")
-            return 4
 
 
 def _parser() -> argparse.ArgumentParser:
