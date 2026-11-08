@@ -22,19 +22,19 @@ Install this experimental candidate from the tested Git code snapshot below,
 including the executive kernel. No PyPI publication is part of this delivery:
 
 ```bash
-pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@7a8592be7946857ad4b1e8b3b1c5039f57f9eddf"
+pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@7b4dd7baf1dcd1926684808a51c2847e98394d2e"
 ```
 
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@7a8592be7946857ad4b1e8b3b1c5039f57f9eddf"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@7b4dd7baf1dcd1926684808a51c2847e98394d2e"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@7a8592be7946857ad4b1e8b3b1c5039f57f9eddf"
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@7b4dd7baf1dcd1926684808a51c2847e98394d2e"
 ```
 
 All three commands use the same code revision. This is a Git installation, not
