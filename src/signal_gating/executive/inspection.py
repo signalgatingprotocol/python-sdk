@@ -107,9 +107,14 @@ _ID_LISTS = frozenset(
         "pending_action_ids",
     }
 )
+_SCALAR_REFERENCES = frozenset(
+    "owner_id goal_id principal_id parent_id budget_id task_id commitment_id episode_id "
+    "context_packet_id criterion_id issuer_id subject_id responsible_principal_id "
+    "origin_principal_id grant_id reservation_id".split()
+)
 
 
-def _observation(value: Any, visible: set[str]) -> Any:
+def _observation(value: Any, visible: set[str], hidden: set[str]) -> Any:
     if isinstance(value, Ref):
         return value.model_dump(mode="json") if value.id in visible else None
     if (
@@ -124,9 +129,13 @@ def _observation(value: Any, visible: set[str]) -> Any:
             if key not in _OBSERVED_FIELDS:
                 continue
             item = getattr(value, key)
+            # Scalar record links need the same privacy boundary as Ref values.
+            # Unknown external subjects remain inert lineage, not permissions.
+            if key in _SCALAR_REFERENCES and item in hidden:
+                continue
             if key in _ID_LISTS:
                 item = tuple(identity for identity in item if identity in visible)
-            projected = _observation(item, visible)
+            projected = _observation(item, visible, hidden)
             if projected is not None or item is None:
                 result[key] = projected
         if isinstance(value, ContextManifest):
@@ -136,7 +145,9 @@ def _observation(value: Any, visible: set[str]) -> Any:
         return result
     if isinstance(value, (tuple, list)):
         return [
-            projected for item in value if (projected := _observation(item, visible)) is not None
+            projected
+            for item in value
+            if (projected := _observation(item, visible, hidden)) is not None
         ]
     if isinstance(value, str):
         # IDs and operator code/version labels survive; prose, URLs, filesystem
@@ -215,9 +226,9 @@ def _goal_records(state: StateView, goal: Goal, events: tuple[JournalEvent, ...]
 def export_goal(store: Store, goal_id: str, *, principal: Principal) -> dict[str, object]:
     """Export a current owner-only, redacted observation, never restorable state.
 
-    Reopen a read-only snapshot even for a stale reader. Only the registered
-    authenticated goal owner may inspect the logical graph; artifact sharing
-    alone does not authorize goal/history access. Manifests require current
+    Reopen a read-only snapshot even for a stale reader. Only the exact current
+    registered Principal DTO of the goal owner may inspect the graph. Artifact
+    sharing alone does not authorize goal/history access. Manifests require current
     owner/goal scope, validity, ACL and verified bytes. Private context artifacts
     are excluded even for the owner. No bytes, prompts, opaque payloads, machine
     paths, credentials or transferable grants are exported. Removed/private
@@ -229,7 +240,11 @@ def export_goal(store: Store, goal_id: str, *, principal: Principal) -> dict[str
     with Store.open_readonly(store.root) as snapshot:
         state, events = snapshot.view(), snapshot.events()
         goal = next((r for r in state.records if isinstance(r, Goal) and r.id == goal_id), None)
-        if goal is None or registered(principal, state) is None or goal.owner_id != principal.id:
+        if (
+            goal is None
+            or registered(principal, state) != principal
+            or goal.owner_id != principal.id
+        ):
             raise AccessDenied("export_access_denied", "Goal export access denied")
         selected = _goal_records(state, goal, events)
         manifests = []
@@ -286,7 +301,13 @@ def export_goal(store: Store, goal_id: str, *, principal: Principal) -> dict[str
         visible = selected | {event.id for event in scoped_events} | {principal.id}
         # Preserve external causal identities as inert lineage, without exposing
         # known private/cross-goal records or context-artifact identities.
-        known = {r.id for r in state.records}
+        known = {r.id for r in state.records} | private
+        known.update(
+            definition.id
+            for record in (*state.records, *(image for e in events for image in _postimages(e)))
+            if isinstance(record, Goal)
+            for definition in (*record.criteria, *record.constraints)
+        )
         lineage = {event.subject.id for event in scoped_events}
         lineage.update(identity for event in scoped_events for identity in event.causal_ids)
         lineage.update(
@@ -299,22 +320,23 @@ def export_goal(store: Store, goal_id: str, *, principal: Principal) -> dict[str
             identity for identity in lineage if identity not in known or identity in visible
         )
         visible -= private
+        hidden = known - visible
         history = []
         for event in scoped_events:
-            observation = _observation(event, visible)
+            observation = _observation(event, visible, hidden)
             observation["records"] = [
-                _observation(image, visible)
+                _observation(image, visible, hidden)
                 for image in _postimages(event)
                 if image.id in selected and not isinstance(image, ArtifactRef)
             ]
             history.append(observation)
         logical = [
-            _observation(record, visible)
+            _observation(record, visible, hidden)
             for record in state.records
             if record.id in selected and not isinstance(record, (ArtifactRef, JournalEvent))
         ]
         policies = {
-            _observation(record.policy_version, visible)
+            _observation(record.policy_version, visible, hidden)
             for record in (
                 *state.records,
                 *(image for e in scoped_events for image in _postimages(e)),

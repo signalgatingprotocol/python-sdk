@@ -390,3 +390,64 @@ def test_cross_goal_receipt_does_not_inherit_scope_from_shared_evidence(tmp_path
         exported = export_goal(store, GOAL_ID, principal=owner())
         assert receipt.id not in json.dumps(exported)
         assert foreign_goal.id not in json.dumps(exported)
+
+
+def test_private_and_cross_goal_scalar_references_are_omitted_everywhere(tmp_path):
+    with Store.open(tmp_path / "store") as store:
+        foreign_goal = goal(id="f" * 32, criteria=())
+        foreign_grant = grant(id="e" * 32, scope=records.Scope(goal_id=foreign_goal.id))
+        write(
+            store,
+            owner(),
+            goal(parent_id=foreign_goal.id),
+            foreign_goal,
+            foreign_grant,
+            Commitment(id=COMMITMENT_ID, goal_id=GOAL_ID, responsible_principal_id=OWNER_ID),
+            frame(),
+            action(grant_id=foreign_grant.id),
+        )
+        private = ArtifactStore(store).put(
+            b"private context",
+            principal=owner(),
+            goal_id=GOAL_ID,
+            media_type="application/vnd.sgp.executive-context+json",
+        )
+        receipt = DecisionReceipt(subject_id=private.id, disposition="admit", reason_code="fixture")
+        external = DecisionReceipt(
+            subject_id="external-subject",
+            disposition="admit",
+            reason_code="fixture",
+            evidence=(Ref(id=GOAL_ID),),
+        )
+        write(store, receipt, external)
+        exported = export_goal(store, GOAL_ID, principal=owner())
+        serialized = json.dumps(exported)
+        for hidden in (private.id, foreign_goal.id, foreign_grant.id):
+            assert hidden not in serialized
+        logical = {record["id"]: record for record in exported["records"]}
+        assert "subject_id" not in logical[receipt.id]
+        assert "parent_id" not in logical[GOAL_ID]
+        assert "grant_id" not in logical[action().id]
+        assert logical[external.id]["subject_id"] == "external-subject"
+        historical = [image for event in exported["history"] for image in event["records"]]
+        assert any(image["id"] == receipt.id for image in historical)
+        assert all("subject_id" not in image for image in historical if image["id"] == receipt.id)
+
+
+@pytest.mark.parametrize("mismatch", [{"revision": 1}, {"roles": ("owner",)}, {"name": "Altered"}])
+def test_export_requires_complete_current_principal_not_partial_identity(tmp_path, mismatch):
+    with Store.open(tmp_path / "store") as store:
+        write(store, owner(), goal())
+        current = owner(revision=2, name="Current owner", roles=("operator",))
+        write(store, current)
+        assert export_goal(store, GOAL_ID, principal=current)["principal_id"] == OWNER_ID
+        with pytest.raises(AccessDenied) as mismatch_error:
+            export_goal(store, GOAL_ID, principal=current.model_copy(update=mismatch))
+        with pytest.raises(AccessDenied) as origin_error:
+            export_goal(
+                store,
+                GOAL_ID,
+                principal=current.model_copy(update={"authenticated_origin": "forged"}),
+            )
+        assert mismatch_error.value.code == origin_error.value.code == "export_access_denied"
+        assert str(mismatch_error.value) == str(origin_error.value) == "Goal export access denied"
