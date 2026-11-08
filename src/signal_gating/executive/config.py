@@ -34,6 +34,7 @@ AnnotatedEnv = Annotated[str, Field(strict=True, pattern=r"^[A-Za-z_][A-Za-z0-9_
 class WorkerConfig(Model):
     id: NonEmpty
     kind: Literal["fixture", "openai"]
+    principal: Principal | None = None
     model: NonEmpty | None = None
     api_key_env: AnnotatedEnv | None = None
     context_token_limit: PositiveInt = 8192
@@ -88,6 +89,7 @@ class KernelConfig(Model):
     workspace: WorkspaceConfig | None = None
     verifier_ids: tuple[NonEmpty, ...] = ()
     approver_ids: tuple[NonEmpty, ...] = ()
+    verifier_principal: Principal | None = None
     max_active_episodes: PositiveInt = 2
     episode_timeout_seconds: PositiveNumber = 120
     max_output_tokens: PositiveInt = 2048

@@ -636,7 +636,10 @@ def _woke(
             isinstance(r, Budget)
             and r.scope.goal_id == goal.id
             and not r.accounting_uncertain
-            and (not condition.refs or r.id in {ref.id for ref in condition.refs})
+            and (
+                not condition.refs
+                or any(ref.id == r.id and ref.revision != r.revision for ref in condition.refs)
+            )
             for r in changed
         )
     return False

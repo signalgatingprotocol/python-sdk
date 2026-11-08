@@ -29,7 +29,9 @@ from .errors import (
     InvalidTransition,
     StoreError,
 )
+from .inspection import inspect_state
 from .intake import Intake
+from .kernel import Clock, Kernel, SystemClock
 from .messages import (
     ActionIntent,
     ApproveCriterion,
@@ -103,9 +105,15 @@ from .records import (
     VerificationResult,
     WakeCondition,
 )
+from .recovery import recover
 from .scheduler import AttentionPolicy, ScheduledItem, Scheduler, wake
 
 __all__ = [
+    "Clock",
+    "Kernel",
+    "SystemClock",
+    "inspect_state",
+    "recover",
     "ContextAssembler",
     "ContextBudgetInsufficient",
     "TokenCounter",

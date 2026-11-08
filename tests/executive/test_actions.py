@@ -374,6 +374,8 @@ async def test_current_admission_blocks_before_any_effect(setup, change):
             )
         )
     else:
+        # Accepted actions outlive reasoning leases. Explicit action TTLs remain binding.
+        update(store, action, expires_at=NOW + timedelta(minutes=5))
         current[0] = NOW + timedelta(minutes=6)
     receipt = await dispatcher.dispatch_one(ACTION)
     assert receipt.disposition in {"deny", "stale", "require_review"}

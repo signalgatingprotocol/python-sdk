@@ -411,7 +411,7 @@ class Dispatcher:
             or action.binding_version != binding.spec.binding_version
         ):
             return decision("stale", "capability_binding_changed"), binding
-        if action.expires_at is None or self.clock() >= action.expires_at:
+        if action.expires_at is not None and self.clock() >= action.expires_at:
             return decision("stale", "action_expired"), binding
         if action.dispatch_attempts:
             original = None

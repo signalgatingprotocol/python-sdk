@@ -31,6 +31,7 @@ from .records import (
     ActionRecord,
     ArtifactRef,
     Belief,
+    Budget,
     Commitment,
     ContextPacket,
     DecisionReceipt,
@@ -46,6 +47,7 @@ from .records import (
     Scope,
     StateView,
     TaskFrame,
+    WakeCondition,
     utc_now,
 )
 from .reducers import reduce_event
@@ -168,6 +170,15 @@ class ProposalValidator:
             )
             for ref in mandatory:
                 require(ref)
+            claims = [p for p in result.proposals if isinstance(p, CompletionClaim)]
+            effects = [p for p in result.proposals if isinstance(p, ActionIntent)]
+            requests = [p for p in result.proposals if isinstance(p, EvidenceRequest)]
+            if (claims and (effects or requests or result.stop_reason != "proposed")) or (
+                effects and result.stop_reason != "proposed"
+            ):
+                raise InvalidTransition(
+                    "conflicting_lifecycle", "Bundle requests conflicting progression"
+                )
             if len({p.id for p in result.proposals}) != len(result.proposals):
                 raise InvalidTransition("duplicate_proposal", "Proposal IDs must be unique")
             if any(p.id in records for p in result.proposals):
@@ -432,7 +443,8 @@ class ProposalValidator:
                             accepted_task_revision=task.revision + 1,
                             accepted_episode_revision=episode.revision + 1,
                             accepted_fencing_token=task.fencing_token,
-                            expires_at=episode.deadline,
+                            # Accepted intents outlive the reasoning lease.
+                            expires_at=None,
                             arguments_digest=hashlib.sha256(
                                 json.dumps(
                                     proposal.model_dump(mode="json")["arguments"],
@@ -579,6 +591,23 @@ class ProposalValidator:
                             require(reference(records[dependency.id]))
                         if isinstance(dependency, Belief):
                             pending.append(dependency)
+            condition = resolved.blocker if resolved.stop_reason == "blocked" else None
+            if resolved.stop_reason == "exhausted":
+                budget = records.get(goal.budget_id or "")
+                condition = WakeCondition(
+                    kind="budget",
+                    reason_code="episode_exhausted",
+                    refs=(reference(budget),) if isinstance(budget, Budget) else (),
+                )
+            elif resolved.stop_reason == "needs_evidence":
+                requests = [p for p in resolved.proposals if isinstance(p, EvidenceRequest)]
+                condition = next(
+                    (p.wake_condition for p in requests if p.wake_condition), None
+                ) or WakeCondition(
+                    kind="new_evidence",
+                    reason_code="evidence_requested",
+                    refs=tuple(dict.fromkeys(r for p in requests for r in p.refs)),
+                )
             # No worker status can finish a task, fulfill a criterion or dispatch.
             writes[episode.id] = episode.model_copy(
                 update={"revision": episode.revision + 1, "status": "accepted"}
@@ -601,9 +630,7 @@ class ProposalValidator:
                         )
                     ),
                     "resume_brief": resolved.resume_brief,
-                    "wake_condition": resolved.blocker
-                    if resolved.stop_reason == "blocked"
-                    else None,
+                    "wake_condition": condition,
                 }
             )
             for identifier, item in tuple(writes.items()):

@@ -329,7 +329,7 @@ class Authority:
             return decision("deny", "inactive_goal_or_task")
         if (
             (episode.status != "running" and not accepted_current)
-            or now >= episode.deadline
+            or (now >= episode.deadline and not accepted_current)
             or "action_intent" not in episode.allowed_proposal_types
             or intent.fencing_token != episode.fencing_token
             or (intent.fencing_token != task.fencing_token and not accepted_current)

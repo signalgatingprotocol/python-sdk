@@ -348,6 +348,10 @@ def _lineage_current(
             "last_scheduled_at",
         }
         return old.model_dump(exclude=excluded) == current.model_dump(exclude=excluded)
+    if isinstance(current, Commitment) and isinstance(old, Commitment):
+        return old.model_dump(exclude={"revision", "status"}) == current.model_dump(
+            exclude={"revision", "status"}
+        )
     if isinstance(current, Episode) and isinstance(old, Episode):
         excluded = {"revision", "status", "usage"}
         return old.model_dump(exclude=excluded) == current.model_dump(exclude=excluded)
@@ -443,7 +447,12 @@ class LocalCheckVerifier(ArtifactVerifier):
                             ref,
                             state,
                             lifecycle_ids=frozenset(
-                                (action.goal_id, action.task_id, action.episode_id or "")
+                                (
+                                    action.goal_id,
+                                    action.task_id,
+                                    action.episode_id or "",
+                                    packet.task.commitment_id,
+                                )
                             ),
                         )
                         for ref in action.read_set
@@ -574,6 +583,8 @@ class VerificationService:
         principal: Principal,
         authority: Authority | None = None,
         local_checks: Mapping[str, tuple[LocalWorkspace, CapabilityRegistry]] | None = None,
+        verifiers: Mapping[str, Verifier] | None = None,
+        repair_rounds: int = 2,
         model_checks: Mapping[str, tuple[CapabilityRegistry, str, str]] | None = None,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
@@ -583,6 +594,10 @@ class VerificationService:
             authority or Authority(),
             clock,
         )
+        if type(repair_rounds) is not int or repair_rounds < 0:
+            raise ValueError("repair_rounds must be a nonnegative integer")
+        self.repair_rounds = repair_rounds
+        self.verifiers = MappingProxyType(dict(verifiers or {}))
         self.local_checks = MappingProxyType(dict(local_checks or {}))
         self.model_checks = MappingProxyType(dict(model_checks or {}))
 
@@ -609,7 +624,14 @@ class VerificationService:
             }
             for key, (registry, capability, policy) in self.model_checks.items()
         }
-        return _digest({"local": local, "models": models})
+        return _digest(
+            {
+                "local": local,
+                "models": models,
+                "injected": sorted(self.verifiers),
+                "repair_rounds": self.repair_rounds,
+            }
+        )
 
     def judgment_arguments(self, criterion: Criterion, state: StateView) -> dict[str, Any]:
         """Build exact model action arguments from trusted selected configuration.
@@ -680,7 +702,11 @@ class VerificationService:
                     r,
                     state,
                     lifecycle_ids=frozenset(
-                        (action.goal_id, action.task_id, action.episode_id or "")
+                        (
+                            action.goal_id,
+                            action.task_id,
+                            action.episode_id or "",
+                        )
                     ),
                 )
                 for r in (*action.read_set, *result.read_set)
@@ -1059,6 +1085,29 @@ class VerificationService:
                 valid = False
         return valid, tuple(dict.fromkeys(reads))
 
+    def _shared_selection(self, refs: tuple[Ref, ...], state: StateView) -> tuple[Ref, ...]:
+        """Refresh selected identity across ACL-only metadata revisions.
+
+        The original claim/owner request remains immutable. Current bytes/access
+        are checked by the verifier; replacement content and revocation stay stale.
+        """
+        indexed = records_by_id(state)
+        selected = []
+        for ref in refs:
+            current = indexed.get(ref.id)
+            old = _historical(self.artifacts, ref)
+            if (
+                isinstance(current, ArtifactRef)
+                and isinstance(old, ArtifactRef)
+                and current.revision >= old.revision
+                and current.model_dump(exclude={"revision", "shared_with"})
+                == old.model_dump(exclude={"revision", "shared_with"})
+            ):
+                selected.append(reference(current))
+            else:
+                selected.append(ref)
+        return tuple(selected)
+
     async def _evaluate(
         self,
         goal: Goal,
@@ -1096,7 +1145,7 @@ class VerificationService:
                         )
             except (ValueError, KeyError, TypeError):
                 continue
-        extras = attached
+        extras = {key: self._shared_selection(refs, state) for key, refs in attached.items()}
         results: list[VerificationResult] = []
         for criterion in goal.criteria:
             base = ArtifactVerifier(
@@ -1167,6 +1216,12 @@ class VerificationService:
                     )
                 results.append(result)
                 continue
+            elif (
+                criterion.evaluator_type == "deterministic"
+                and criterion.verifier_id in self.verifiers
+            ):
+                # Trusted free, local computation only. Metered judgments use Dispatcher.
+                verifier = self.verifiers[criterion.verifier_id]
             else:
                 result = base._result(
                     criterion,
@@ -1183,7 +1238,44 @@ class VerificationService:
                 )
                 results.append(result)
                 continue
-            results.append(await verifier.verify(criterion, state))
+            result = await verifier.verify(criterion, state)
+            if (
+                criterion.evaluator_type == "deterministic"
+                and criterion.verifier_id in self.verifiers
+            ):
+                try:
+                    support = base._support(criterion, state)
+                    required_local = {reference(goal), reference(criterion), *support}
+                    if (
+                        result.criterion_id != criterion.id
+                        or result.verifier_id != criterion.verifier_id
+                        or not required_local <= set(result.read_set)
+                    ):
+                        raise ValueError("unbound_local_verifier_result")
+                    if result.usage.status != "known" or any(
+                        getattr(result.usage, key) != 0
+                        for key in (
+                            "calls",
+                            "input_tokens",
+                            "output_tokens",
+                            "elapsed_seconds",
+                            "cost_microunits",
+                        )
+                    ):
+                        raise ValueError("local_verifier_requires_zero_usage")
+                    for ref in (*result.read_set, *result.evidence):
+                        local_record = records_by_id(state).get(ref.id)
+                        if local_record is None or local_record.revision != ref.revision:
+                            raise ValueError("stale_local_verifier_evidence")
+                        if isinstance(local_record, ArtifactRef):
+                            self.artifacts.read(
+                                local_record, principal=self.principal, goal_id=goal.id
+                            )
+                except (ExecutiveError, ValueError, OSError):
+                    result = base._result(
+                        criterion, state, "insufficient_evidence", "unbound_local_verifier_result"
+                    )
+            results.append(result)
         if self.artifacts.store.view() != state:
             return self._finish(
                 self.artifacts.store.view(), subject, "stale", "late_verification_result"
@@ -1334,7 +1426,7 @@ class VerificationService:
                     }
                 )
                 count = frame.failure_count + 1 if frame.failure_signature == signature else 1
-                repair_ready = count <= 2 and dependencies and effects
+                repair_ready = count <= self.repair_rounds and dependencies and effects
                 writes[frame.id] = frame.model_copy(
                     update={
                         "revision": frame.revision + 1,
@@ -1345,10 +1437,12 @@ class VerificationService:
                         "wake_condition": None
                         if repair_ready
                         else WakeCondition(
-                            kind="new_evidence" if count > 2 else "dependency_change",
+                            kind="new_evidence"
+                            if count > self.repair_rounds
+                            else "dependency_change",
                             refs=frame.dependencies,
                             reason_code="verification_repair_limit"
-                            if count > 2
+                            if count > self.repair_rounds
                             else "verification_dependencies_unsettled",
                         ),
                     }
