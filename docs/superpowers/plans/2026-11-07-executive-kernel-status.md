@@ -1,6 +1,6 @@
 # Executive kernel delivery status
 
-This delivery implements Tasks 1–6 of the [implementation plan](2026-11-07-executive-kernel.md). It is an experimental foundation, not an end-to-end usable kernel. The [approved design](../specs/2026-11-07-executive-kernel-design.md) remains the long-term target.
+This continuation implements Tasks 1–19 of the [implementation plan](2026-11-07-executive-kernel.md): the first usable experimental local executive kernel. The [approved design](../specs/2026-11-07-executive-kernel-design.md) remains the long-term target. The [operator guide](../../executive-kernel.md) covers installed use. No version bump, tag, publication or paid inference is part of this delivery.
 
 ## Implemented
 
@@ -10,16 +10,30 @@ This delivery implements Tasks 1–6 of the [implementation plan](2026-11-07-exe
 - Scoped artifact storage, integrity checks, staging, retention and durable revocation.
 - Authenticated intake, deduplication, bounded backpressure, trusted constraints and scoped action-admission policy.
 - Hierarchical reservations, ancestor CAS, conservative unknown usage, overage accounting and owner usage resolution.
+- Evidence memory, typed proposal validation, contradiction handling and freshness checks.
+- Deterministic scheduling, retained commitments, bounded context assembly and advisory observations separated from material dependencies.
+- Proposal-only OpenAI worker, explicit model/credential references, trusted per-call bounds, atomic admission and usage settlement.
+- Scoped local read/write/check adapters, exact action approval, authenticated check receipts and current artifact verification.
+- Sole-writer coordinator, foreground JSONL CLI, in-flight correction, pause/restart/resume and conservative uncertain-effect recovery.
+- Integrated credential-free release scenario, crash/fault injection and evaluation harness with integrity-checked evidence and explicit synthetic/observed labels.
+- Legacy observation/callable bridges, 69 full versioned DTO/union schemas and owner-only redacted observation export.
+- Installed executive console entrypoint, wheel tests from another cwd, temporary credential-free smoke and complete local operator documentation.
 
-Each task received independent review and any blocking findings were fixed and independently re-reviewed. Deterministic tests establish these component contracts. They do not establish model quality, production savings, external provider billing correctness or a sandbox against hostile same-host code.
+Tasks 1–18 received independent scoped review; blocking findings were fixed and independently re-reviewed. Task 19's installed-usability changes and the whole continuation still require the controller's final independent review and final-head CI gate. Self-review and local checks do not substitute for those gates. The retained continuation records hold per-task commands, results and review findings.
 
-## Remaining before the first usable kernel
+## Validation and remaining limits
 
-Tasks 7–19 remain: evidence memory and proposal validation; scheduling; context assembly; a real model worker; action dispatch/reconciliation; local workspace capabilities; completion verification; coordinator/recovery; foreground CLI; integrated fault scenarios; evaluation harness; legacy/schema bridge; installed documentation and smoke coverage.
+Credential-free tests exercise real journal/coordinator/adapter/verification/recovery infrastructure with deterministic workers and fake provider responses. Installed-wheel checks remove checkout path injection, verify legacy exports, run the release scenario, load config/goals, restart/inspect/export and reject incomplete live setup before calls. The installed optional real-SDK check constructs/closes a client using a dummy named credential with requests/network blocked. This is constructor compatibility evidence only.
 
-Runtime enforcement depends on those integrations. No coordinator currently commits reservations before model/tool calls. No end-to-end worker, verification or recovery loop is supplied by this delivery. Existing SDK compatibility remains unchanged.
+The Task 19 report records clean-environment `make check`, `make package`, `make smoke`, acceptance/crash tests, explicit version validation and outside-checkout installation provenance. Python 3.10–3.14 final-head CI evidence belongs to the delivery gate; do not infer it from one local interpreter or the fixture's static grammar check. Existing SDK compatibility remains unchanged.
 
-## Continuation contracts
+Local Python 3.14.3 validation passed all 1,596 tests with lint and strict type checks. Distribution checks and installed console smoke passed. OpenAI SDK 3.46.0 constructed and closed its actual client with retries disabled and zero guarded request/network attempts. These are local candidate checks; final-head hosted matrix results and independent review remain separate gates.
+
+Paid/live inference, provider billing correctness, model task quality, production savings and security benefit claims remain unverified. The kernel mediates registered calls within a trusted host process; configured programs and external legacy runtimes are not sandboxed. Unknown effects require reconciliation, not an exactly-once claim or blind retry. Portable exports are observation-only, not backups/imports or executable authority.
+
+Adaptive policy promotion remains offline future work grounded in events, receipts and explicit evaluations. Federation requires a second implementation and transport conformance before commitment negotiation, retaining scoped authority, explicit acceptance and uncertain-outcome semantics across partitions.
+
+## Enforced continuation contracts
 
 - Intake prepares batches. Commit before returning a durable receipt; exact retries retrieve the canonical persisted receipt. Queue admission must be serialized by the coordinator.
 - Bind worker configuration IDs to registered principals and trusted argument-to-resource scope extractors. Repeat authority/freshness checks immediately before dispatch.
@@ -30,7 +44,7 @@ Runtime enforcement depends on those integrations. No coordinator currently comm
 
 ## Recorded implementation decisions
 
-These decisions preserve the implementation context for the remaining plan. Revisit them if later integration evidence contradicts their assumptions.
+These historical rulings preserve implementation context, including the earlier Tasks 1–6 delivery cutoff. The completed continuation scope and current review state above supersede that former cutoff; no historical ruling is deleted.
 
 Ruling: Use the managed isolated worktree and explicit elevated writes there — source checkout changed during planning — costs an isolated branch that must be intentionally integrated later.
 Ruling: Worktree is clean of unrelated untracked decision tests; leave them in the source checkout — preserves user work and gives a reliable baseline — integration must not silently adopt them.

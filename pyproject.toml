@@ -32,9 +32,11 @@ dependencies = [
 
 [project.scripts]
 signal-gating-demo = "signal_gating.demo:main"
+signal-gating-executive = "signal_gating.executive.cli:main"
 
 [project.optional-dependencies]
 dev = [
+    "hatchling",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
@@ -60,6 +62,7 @@ packages = ["src/signal_gating"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]

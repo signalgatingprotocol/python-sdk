@@ -18,8 +18,8 @@ advantage over simple rules, production task quality, or inference savings.
 
 ## Install
 
-The first PyPI release has not been published yet. Install the alpha from this
-tested commit, which includes the tool-approval fixes:
+Install this experimental candidate from the tested Git code snapshot below,
+including the executive kernel. No PyPI publication is part of this delivery:
 
 ```bash
 pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@7a8592be7946857ad4b1e8b3b1c5039f57f9eddf"
@@ -37,8 +37,9 @@ For OpenTelemetry export:
 pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@7a8592be7946857ad4b1e8b3b1c5039f57f9eddf"
 ```
 
-The pinned commit makes installs reproducible. See [CHANGELOG.md](CHANGELOG.md)
-for the release-candidate scope and stability notes.
+All three commands use the same code revision. This is a Git installation, not
+a claim of PyPI availability. See [CHANGELOG.md](CHANGELOG.md) for the
+release-candidate scope and stability notes.
 
 ## Quick Start
 
@@ -99,6 +100,35 @@ invocations than the ungated 12-alert baseline while preserving all three
 unique critical incidents. `PASS` requires every expected fixture metric to
 match. The fixture is intentionally small and exact; it is a behavioral proof,
 not a throughput, token, latency, or cost benchmark.
+
+## Experimental executive kernel
+
+The opt-in `signal_gating.executive` API adds durable goals, bounded worker
+episodes, scoped local actions, evidence verification, owner controls and crash
+recovery. Run its credential-free installed scenario from any directory:
+
+```bash
+EXECUTIVE_DEMO_DIR="$(mktemp -d)"
+signal-gating-executive demo --store "$EXECUTIVE_DEMO_DIR/release"
+signal-gating-executive inspect --store "$EXECUTIVE_DEMO_DIR/release/store" --json
+```
+
+The JSON evaluation reports `passed: true`, completed goal IDs and zero
+`forbidden_dispatches` for this synthetic fixture. It makes no provider calls
+and does not establish model quality or production savings. Real OpenAI work
+needs the `llm` extra, an explicitly named model/credential reference, finite
+budgets, trusted per-call bounds and `--live`; paid/live behavior remains
+unverified. The kernel mediates its registered calls inside the trusted host
+process. Configured commands remain trusted code, and unknown consequential
+effects require reconciliation rather than blind retries.
+
+Follow the [executive operator guide](docs/executive-kernel.md) for owner
+bootstrap, a real local goal, grants, exact approvals, correction,
+pause/restart/resume, inspection, uncertainty resolution and portable export.
+The API is experimental and separate from the stable compatibility core.
+Adaptive policy promotion and federation remain subsequent horizons. See
+[delivery status](docs/superpowers/plans/2026-11-07-executive-kernel-status.md)
+for implementation and review coverage.
 
 ## Decision-model gating
 
