@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import sysconfig
+import tarfile
 import venv
 from pathlib import Path
 
@@ -16,6 +18,31 @@ from signal_gating import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
 LEGACY_EXPORTS = ["Agent", "Gate", "Mesh", "MeshEvent", "Receipt", "Signal", "TrajectoryRecorder"]
+
+
+def test_source_distribution_excludes_private_continuation_records(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    for name in ("pyproject.toml", "README.md", "LICENSE", ".gitignore"):
+        shutil.copy2(ROOT / name, project / name)
+    shutil.copytree(ROOT / "src", project / "src", ignore=shutil.ignore_patterns("__pycache__"))
+    private = project / ".superpowers" / "sdd"
+    private.mkdir(parents=True)
+    (private / ".gitignore").write_text("*\n")
+    (private / "private-continuation.txt").write_text("synthetic private continuation marker\n")
+    output = tmp_path / "dist"
+    result = subprocess.run(
+        [sys.executable, "-m", "hatchling", "build", "-t", "sdist", "-d", str(output)],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(next(output.glob("*.tar.gz"))) as archive:
+        names = archive.getnames()
+    assert any(name.endswith("/src/signal_gating/executive/cli.py") for name in names)
+    assert not any("/.superpowers/" in name for name in names)
 
 
 @pytest.fixture(scope="module")
