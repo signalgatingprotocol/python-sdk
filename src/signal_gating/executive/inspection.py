@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
-from .records import ActionRecord, Budget, Goal, KernelView, RunSummary, StateView, TaskFrame, Usage
+from typing import Any
+
+from .records import (
+    ActionRecord,
+    Budget,
+    Goal,
+    KernelView,
+    Ref,
+    RunSummary,
+    StateView,
+    TaskFrame,
+    Usage,
+)
 
 
 def inspect_state(state: StateView, goal_id: str | None = None) -> KernelView:
@@ -52,3 +64,61 @@ def inspect_state(state: StateView, goal_id: str | None = None) -> KernelView:
     # Keep the full typed proof graph available for inspection; goal_id filters
     # the summary, not authoritative references required to explain a finding.
     return KernelView(state=state, summary=summary, goal_id=goal_id)
+
+
+def operator_view(view: KernelView) -> dict[str, Any]:
+    """Current operator proof metadata, without context or artifact content.
+
+    Keep reference identities explicit. Publication is not sharing and an idle
+    finding is not settled spending. The typed KernelView remains authoritative.
+    """
+    records = view.state.records
+    references = {r.id: Ref(id=r.id, revision=r.revision) for r in records}
+    for record in records:
+        if isinstance(record, Goal):
+            for definition in (*record.criteria, *record.constraints):
+                references[definition.id] = Ref(id=definition.id, revision=definition.revision)
+    groups = {
+        "goals": "goal",
+        "tasks": "task",
+        "commitments": "commitment",
+        "actions": "action",
+        "budgets": "budget",
+        "reservations": "reservation",
+        "findings": "verification",
+        "approvals": "criterion_approval",
+        "receipts": "receipt",
+        "principals": "principal",
+    }
+    result: dict[str, Any] = {
+        name: [r.model_dump(mode="json") for r in records if r.kind == kind]
+        for name, kind in groups.items()
+    }
+    result.update(
+        sequence=view.state.sequence,
+        goal_id=view.goal_id,
+        summary=view.summary.model_dump(mode="json"),
+        current_refs=[ref.model_dump(mode="json") for ref in references.values()],
+        artifacts=[
+            r.model_dump(
+                mode="json",
+                include={
+                    "id",
+                    "revision",
+                    "digest",
+                    "media_type",
+                    "size_bytes",
+                    "shared_with",
+                    "valid",
+                },
+            )
+            for r in records
+            if r.kind == "artifact"
+        ],
+        pending_reviews=[
+            r.model_dump(mode="json") for r in records if r.id in view.summary.pending_review_ids
+        ],
+    )
+    selected = [r for r in records if isinstance(r, Goal) and r.id == view.goal_id]
+    result["goal_status"] = selected[0].status if selected else None
+    return result

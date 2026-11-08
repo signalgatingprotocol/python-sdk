@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Coroutine, Mapping
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1317,7 +1317,19 @@ class Kernel:
                 )
         return min(times) if times else None
 
-    async def serve(self, commands: AsyncIterator[AuthenticatedCommand]) -> RunSummary:
+    async def serve(
+        self,
+        commands: AsyncIterator[AuthenticatedCommand],
+        *,
+        on_response: Callable[[AuthenticatedCommand, DecisionReceipt], None] | None = None,
+        on_idle: Callable[[KernelView], None] | None = None,
+    ) -> RunSummary:
+        """Serve until EOF/stop; optional synchronous observers run outside commits.
+
+        Responses are the exact submit return, including non-durable backpressure.
+        Idle observers receive the settled current view after run_until_idle.
+        Observer exceptions propagate after normal service shutdown.
+        """
         eof = False
 
         async def receive() -> None:
@@ -1325,7 +1337,9 @@ class Kernel:
             count = 0
             try:
                 async for item in commands:
-                    await self.submit(item.command, principal=item.principal)
+                    receipt = await self.submit(item.command, principal=item.principal)
+                    if on_response is not None:
+                        on_response(item, receipt)
                     count += 1
                     if count % self.config.scheduler.control_batch_size == 0:
                         # Bound a synchronous producer's control turn. This is
@@ -1340,6 +1354,8 @@ class Kernel:
         try:
             while not self._stopped and not eof:
                 await self.run_until_idle()
+                if on_idle is not None and not self._stopped and not eof:
+                    on_idle(self.inspect())
                 if eof or self._stopped:
                     break
                 self._changed.clear()
@@ -1353,6 +1369,7 @@ class Kernel:
         finally:
             reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
+            await self.stop()
 
     async def stop(self) -> None:
         if self._stopped:
