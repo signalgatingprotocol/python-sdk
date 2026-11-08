@@ -6,6 +6,8 @@ and frozen after validation; model_copy validates updates just like construction
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from math import isfinite
@@ -282,6 +284,31 @@ class Goal(Record):
     budget_id: Identifier | None = None
     priority: NonNegativeInt = 0
     deadline: Timestamp | None = None
+
+
+def goal_definition_digest(goal: Goal) -> str:
+    """Versioned owner intent fingerprint; lifecycle bookkeeping is excluded."""
+    value = goal.model_dump(mode="json", exclude={"revision", "status"})
+    encoded = json.dumps(
+        {"policy": "goal-definition-v1", "goal": value},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class CriterionApproval(Record):
+    """Explicit owner control, never inferred from artifact or signal contents."""
+
+    kind: Literal["criterion_approval"] = "criterion_approval"
+    owner_id: Identifier
+    goal: Ref
+    criterion: Ref
+    goal_definition_digest: Digest
+    artifacts: tuple[Ref, ...] = Field(min_length=1)
+    explanation: NonEmpty
 
 
 class Commitment(Record):
@@ -687,6 +714,7 @@ PersistentRecord = Annotated[
     | Episode
     | Constraint
     | Criterion
+    | CriterionApproval
     | VerificationResult
     | JournalEvent
     | ContextPacket

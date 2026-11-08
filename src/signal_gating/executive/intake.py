@@ -18,6 +18,7 @@ from uuid import uuid4
 from .authority import Authority, decision, reference, registered
 from .errors import ConflictError, ExecutiveError
 from .messages import (
+    ApproveCriterion,
     AttachEvidence,
     CancelGoal,
     Command,
@@ -40,6 +41,7 @@ from .records import (
     ArtifactRef,
     Belief,
     Commitment,
+    CriterionApproval,
     DecisionReceipt,
     Episode,
     ExecutiveSignal,
@@ -53,6 +55,7 @@ from .records import (
     StateView,
     TaskFrame,
     WakeCondition,
+    goal_definition_digest,
     utc_now,
 )
 from .reducers import reduce_event
@@ -687,7 +690,58 @@ class Intake:
                 if current is None or current.revision != ref.revision:
                     raise ConflictError("stale_usage_resolution", "Usage resolver read set changed")
             return result.events, None
+        elif isinstance(command, ApproveCriterion):
+            assert isinstance(target, Goal)
+            criterion = next((c for c in target.criteria if c.id == command.criterion.id), None)
+            if (
+                criterion is None
+                or command.criterion.kind not in {"record", "criterion"}
+                or criterion.revision != command.criterion.revision
+                or criterion.evaluator_type != "human"
+                or criterion.verifier_id != "owner-approval-v1"
+                or criterion.acceptance_rule != "explicit_owner_approval"
+                or target.status not in {"active", "blocked", "completed"}
+            ):
+                raise ConflictError("stale_criterion_approval", "Approval criterion changed")
+            self._check_evidence(command.artifacts, principal, state, target.id)
+            required = (*criterion.inputs, *criterion.required_evidence)
+            approved_artifacts = {(r.id, r.revision) for r in command.artifacts}
+            if (
+                len(approved_artifacts) != len(command.artifacts)
+                or any(not isinstance(records.get(r.id), ArtifactRef) for r in command.artifacts)
+                or any(
+                    isinstance(records.get(r.id), ArtifactRef)
+                    and (r.id, r.revision) not in approved_artifacts
+                    for r in required
+                )
+            ):
+                raise ConflictError(
+                    "invalid_criterion_approval", "Approval must bind artifact revisions"
+                )
+            writes.append(
+                CriterionApproval(
+                    created_at=now,
+                    owner_id=principal.id,
+                    goal=reference(target),
+                    criterion=reference(criterion),
+                    goal_definition_digest=goal_definition_digest(target),
+                    artifacts=command.artifacts,
+                    explanation=command.explanation,
+                )
+            )
         elif isinstance(command, (AttachEvidence, Reverify)):
+            assert isinstance(target, Goal)
+            named_criteria = (
+                ((command.criterion_id,) if command.criterion_id else ())
+                if isinstance(command, AttachEvidence)
+                else command.criterion_ids
+            )
+            if not set(named_criteria) <= {c.id for c in target.criteria}:
+                raise ConflictError("unknown_criterion", "Request names another goal criterion")
+            if isinstance(command, AttachEvidence) and command.task_id is not None:
+                evidence_task = records.get(command.task_id)
+                if not isinstance(evidence_task, TaskFrame) or evidence_task.goal_id != target.id:
+                    raise ConflictError("unknown_task", "Evidence task belongs to another goal")
             self._check_evidence(
                 command.evidence if isinstance(command, AttachEvidence) else (),
                 principal,

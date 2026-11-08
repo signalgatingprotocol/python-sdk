@@ -25,6 +25,7 @@ from .records import (
     Constraint,
     ContextPacket,
     Criterion,
+    CriterionApproval,
     Episode,
     Goal,
     Grant,
@@ -360,6 +361,12 @@ def _validate_state(records: Mapping[str, PersistentRecord]) -> None:
                     item.criterion_id,
                 )
             verification_criteria.add(item.criterion_id)
+        elif isinstance(item, CriterionApproval):
+            require(item.owner_id, {"principal"})
+            approval_goal = require(item.goal.id, {"goal"})
+            require(item.criterion.id, {"criterion"})
+            if not isinstance(approval_goal, Goal) or approval_goal.owner_id != item.owner_id:
+                _fail("invalid_reference", "Approval owner differs from goal owner", item.id)
 
     # Iterative DFS avoids recursion limits on a valid, long task chain.
     done: set[str] = set()

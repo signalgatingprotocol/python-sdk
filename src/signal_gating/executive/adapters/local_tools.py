@@ -206,6 +206,29 @@ class StoreArtifacts:
                     found.append((reference(current), data))
         return tuple(found)
 
+    def receipt_evidence(
+        self, action: ActionRecord, ref: Ref, *, principal: Principal | None = None
+    ) -> tuple[ArtifactRef, bytes]:
+        """Resolve immutable receipt content across ACL-only reference revisions.
+
+        This is for nested prepared/output evidence only. Action input read sets
+        and replacement content retain exact-revision checks in content(). The
+        reducer forbids changes to this identity's bytes, scope and validity;
+        revocation/invalidation, current ACL and actual integrity still apply.
+        """
+        self._ready()
+        current = next((r for r in self.store.view().records if r.id == ref.id), None)
+        if (
+            not isinstance(current, ArtifactRef)
+            or ref.kind not in {"record", "artifact"}
+            or ref.revision > current.revision
+        ):
+            raise ValueError("stale_evidence")
+        data = self.artifacts.read(
+            current, principal=principal or self._owner(action), goal_id=action.goal_id
+        )
+        return current, data
+
 
 class LocalWorkspace:
     """Relative prefix scopes; '.' covers the root, never symlink components.
@@ -366,6 +389,18 @@ class LocalWorkspace:
         if self.artifacts is None:
             raise ValueError("missing_artifact_bridge")
         return self.artifacts
+
+    @property
+    def launcher_version(self) -> str:
+        return _LAUNCHER_VERSION
+
+    def input_digests(self, criterion: Criterion) -> dict[str, str]:
+        """Read the exact owner-declared file set through the scoped workspace."""
+        if not criterion.workspace_inputs or len(set(criterion.workspace_inputs)) != len(
+            criterion.workspace_inputs
+        ):
+            raise ValueError("invalid_check_inputs")
+        return {path: _digest(self._read(path)) for path in criterion.workspace_inputs}
 
     def _criterion(self, arguments: Mapping[str, Any], goal_id: str) -> Criterion:
         ref = Ref.model_validate(arguments["criterion_ref"])
@@ -629,19 +664,19 @@ class _LocalAdapter:
         evidence = tuple(Ref.model_validate(r) for r in data.get("outputs", ()))
         if self.spec.id in {"write_text", "run_check"}:
             prepared_ref = Ref.model_validate(data["prepared_ref"])
+            current_prepared, _ = bridge.receipt_evidence(action, prepared_ref)
             prepared = next(
-                (d for r, d in matches if r == prepared_ref and d.get("phase") == "prepared"), None
+                (
+                    d
+                    for r, d in matches
+                    if r.id == current_prepared.id and d.get("phase") == "prepared"
+                ),
+                None,
             )
             if prepared is None:
                 raise ValueError("incomplete_evidence")
-            evidence = (*evidence, prepared_ref)
-        principal = bridge._owner(action)
-        indexed = {r.id: r for r in bridge.store.view().records}
-        for ref in evidence:
-            current = indexed.get(ref.id)
-            if not isinstance(current, ArtifactRef) or reference(current) != ref:
-                raise ValueError("stale_evidence")
-            bridge.artifacts.read(current, principal=principal, goal_id=action.goal_id)
+            evidence = (*evidence, reference(current_prepared))
+        evidence = tuple(reference(bridge.receipt_evidence(action, ref)[0]) for ref in evidence)
         if self.spec.id == "write_text" and data["outcome"] == "succeeded":
             replacement = bridge.content(
                 action, Ref.model_validate(action.arguments["content_ref"])

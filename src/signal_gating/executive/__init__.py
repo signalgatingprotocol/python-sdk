@@ -32,6 +32,7 @@ from .errors import (
 from .intake import Intake
 from .messages import (
     ActionIntent,
+    ApproveCriterion,
     AttachEvidence,
     AuthenticatedCommand,
     BeliefChange,
@@ -71,6 +72,7 @@ from .records import (
     ContextManifest,
     ContextPacket,
     Criterion,
+    CriterionApproval,
     CriterionGap,
     DecisionReceipt,
     Disposition,
@@ -122,6 +124,7 @@ __all__ = [
     "Scope",
     "Constraint",
     "Criterion",
+    "CriterionApproval",
     "Principal",
     "Limits",
     "Usage",
@@ -169,6 +172,7 @@ __all__ = [
     "ResolveUsage",
     "AttachEvidence",
     "Reverify",
+    "ApproveCriterion",
     "ShareArtifact",
     "SetGrant",
     "AuthenticatedCommand",
