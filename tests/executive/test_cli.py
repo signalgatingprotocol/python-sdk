@@ -213,7 +213,7 @@ def test_resume_is_explicit_and_does_not_duplicate_commitments(tmp_path):
         session.close()
 
 
-@pytest.mark.parametrize("kind", ["demo", "export"])
+@pytest.mark.parametrize("kind", ["export"])
 def test_deferred_commands_are_clear_and_do_not_create_store(tmp_path, kind):
     args = [kind, "--store", str(tmp_path / "store")]
     if kind == "export":

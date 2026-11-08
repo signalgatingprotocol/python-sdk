@@ -413,12 +413,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run a foreground operator command, with stable process exit codes."""
     try:
         args = _parser().parse_args(argv)
-        if args.operation in {"export", "demo"}:
+        if args.operation == "demo":
+            from .demo import run_demo
+
+            result = asyncio.run(run_demo(args.store))
+            _emit("evaluation", evaluation=result.model_dump(mode="json", exclude={"receipts"}))
+            return 0 if result.passed else 3
+        if args.operation == "export":
             _emit(
                 "unavailable",
-                reason_code=f"{args.operation}_unavailable",
-                detail="Integration is supplied by Task "
-                + ("18" if args.operation == "export" else "16"),
+                reason_code="export_unavailable",
+                detail="Integration is supplied by Task 18",
             )
             return 2
         if args.operation == "run":

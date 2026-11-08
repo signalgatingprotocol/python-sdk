@@ -754,12 +754,20 @@ class EvaluationCase(Record):
 
 
 class EvaluationResult(Model):
+    # Optional measured fixture projection. passed/summary retain their meanings.
+    metrics: dict[str, int] = Field(default_factory=dict)
+    scope: Literal["synthetic_fixture", "observed_run"] = "synthetic_fixture"
+
     case_id: Identifier
     policy_version: NonEmpty
     passed: bool
     receipts: tuple[DecisionReceipt, ...] = ()
     summary: RunSummary
     failures: tuple[NonEmpty, ...] = ()
+
+    @property
+    def completed(self) -> bool:
+        return self.passed and bool(self.summary.completed_goal_ids)
 
 
 class EvaluationReport(Model):
