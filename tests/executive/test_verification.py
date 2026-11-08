@@ -439,7 +439,14 @@ async def test_reverify_request_is_consumed_without_implying_success(setup):
     assert get(store, GOAL_ID).status == "active"  # A ready task has not claimed completion.
 
 
-async def checked(setup, tmp_path, *, program="print('checked')", extra_criterion=False):
+async def checked(
+    setup,
+    tmp_path,
+    *,
+    program="print('checked')",
+    extra_criterion=False,
+    optional_local_check=False,
+):
     """Real registered action with owner review, reserve, dispatch and accounting."""
     from signal_gating.executive.actions import CapabilityRegistry, Dispatcher
     from signal_gating.executive.adapters.local_tools import LocalWorkspace, StoreArtifacts
@@ -464,6 +471,8 @@ async def checked(setup, tmp_path, *, program="print('checked')", extra_criterio
             "workspace_inputs": ("source",),
         }
     )
+    if optional_local_check:
+        c = c.model_copy(update={"required": False})
     worker = owner(id="e" * 32, roles=("worker",))
     budget = Budget(
         id="f" * 32,
@@ -492,6 +501,15 @@ async def checked(setup, tmp_path, *, program="print('checked')", extra_criterio
                                 "budget_id": budget.id,
                                 "criteria": (
                                     c,
+                                    *(
+                                        (
+                                            g.criteria[0].model_copy(
+                                                update={"id": "d" * 32, "revision": 1}
+                                            ),
+                                        )
+                                        if optional_local_check
+                                        else ()
+                                    ),
                                     *(
                                         (
                                             c.model_copy(
@@ -1372,3 +1390,63 @@ async def test_prerequisite_definition_evidence_is_not_an_unverified_prerequisit
     store.commit(await service(setup).evaluate(claim(store, (reference(a),)), store.view()))
     assert get(store, TASK_ID).status == "completed"
     assert get(store, GOAL_ID).status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["evaluate", "reverify"])
+@pytest.mark.parametrize(
+    "current_check", ["pass", "unconfigured", "changed_input", "stale_version"]
+)
+async def test_nested_accepted_finding_uses_current_replacement(
+    setup, tmp_path, mode, current_check
+):
+    store, _, a = setup
+    workspace, registry, _ = await checked(setup, tmp_path, optional_local_check=True)
+    configured = service(setup, local_checks={"registered-check-v1": (workspace, registry)})
+    store.commit(await configured.reverify(GOAL_ID, store.view()))
+    prior = next(
+        r
+        for r in store.view().records
+        if isinstance(r, VerificationResult) and r.criterion_id == "6" * 32
+    )
+    assert prior.disposition == "accept"
+    if current_check == "stale_version":
+        store.commit(await configured.reverify(GOAL_ID, store.view()))
+    original = get(store, prior.id)
+    support = Belief(
+        claim="Authenticated check establishes prerequisite",
+        scope=Scope(goal_id=GOAL_ID),
+        epistemic_status="supported",
+        evidence=(reference(prior),),
+    )
+    store.commit(CommitBatch(events=(event((support,)),)))
+    change(store, get(store, COMMITMENT_ID), dependencies=(reference(support),))
+    proposal = claim(store, (reference(a),))
+    selected = service(setup) if current_check == "unconfigured" else configured
+    if current_check == "changed_input":
+        workspace.root.joinpath("source").write_text("Changed after the authentic pass")
+    batch = await (
+        selected.evaluate(proposal, store.view())
+        if mode == "evaluate"
+        else selected.reverify(GOAL_ID, store.view())
+    )
+    store.commit(batch)
+    current = get(store, prior.id)
+    assert current.revision == original.revision + 1
+    assert reference(original) in batch.expected_revisions
+    assert reference(prior) in batch.response_receipt.state_revisions
+    assert reference(current) in batch.response_receipt.state_revisions
+    if current_check == "pass":
+        assert current.disposition == "accept"
+        assert get(store, GOAL_ID).status == "completed"
+    else:
+        assert current.disposition == (
+            "accept" if current_check == "stale_version" else "insufficient_evidence"
+        )
+        assert get(store, GOAL_ID).status == "active"
+        assert get(store, TASK_ID).status == "blocked"
+        assert get(store, COMMITMENT_ID).status != "completed"
+        assert batch.response_receipt.reason_code != "completion_verified"
+    assert rebuild(store.events()) == store.view()
+    with Store.open_readonly(store.root) as reopened:
+        assert reopened.view() == store.view()

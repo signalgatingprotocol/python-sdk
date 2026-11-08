@@ -1027,7 +1027,11 @@ class VerificationService:
                 if explicit and item.disposition != "accept":
                     valid = False
                 if item.disposition == "accept":
-                    finding_support(item)
+                    replacement = findings.get(item.criterion_id, item)
+                    if replacement.disposition != "accept":
+                        valid = False
+                    else:
+                        finding_support(replacement)
             elif isinstance(item, (TaskFrame, Commitment, Goal, ActionRecord)):
                 if explicit and not _dependency_satisfied(item, materialized):
                     valid = False
