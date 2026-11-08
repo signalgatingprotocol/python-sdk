@@ -27,6 +27,7 @@ from .messages import CommitBatch, InboxAcknowledgment, OutboxEntry
 from .migrations import SCHEMA_VERSION, migrate, schema_version
 from .records import (
     Constraint,
+    Criterion,
     DecisionReceipt,
     ExecutiveSignal,
     Goal,
@@ -374,9 +375,9 @@ class Store:
                 previous = current.get(record.id)
                 if previous is None:
                     valid = record.revision == 1 or (
-                        isinstance(record, Constraint)
+                        isinstance(record, (Constraint, Criterion))
                         and any(
-                            isinstance(goal, Goal) and record in goal.constraints
+                            isinstance(goal, Goal) and record in (*goal.constraints, *goal.criteria)
                             for goal in current.values()
                         )
                     )
@@ -415,7 +416,11 @@ class Store:
             # every existing changed record, just as for caller-supplied writes.
             for record in derived:
                 previous = current.get(record.id)
-                if previous is None and isinstance(record, Constraint) and record.revision > 1:
+                if previous is None and (
+                    isinstance(record, Criterion)
+                    or isinstance(record, Constraint)
+                    and record.revision > 1
+                ):
                     # An existing embedded identity may become standalone at
                     # its unchanged revision. Fence the pre-batch owner too,
                     # even if this event does not rewrite that Goal.
@@ -423,12 +428,14 @@ class Store:
                         goal
                         for goal in current.values()
                         if isinstance(goal, Goal)
-                        and any(c.id == record.id for c in goal.constraints)
+                        and any(c.id == record.id for c in (*goal.constraints, *goal.criteria))
                     )
-                    if not owners or any(goal.id not in expected for goal in owners):
+                    if (owners or record.revision > 1) and (
+                        not owners or any(goal.id not in expected for goal in owners)
+                    ):
                         raise ConflictError(
                             "missing_promotion_read",
-                            "Constraint promotion requires its owning goal CAS",
+                            "Embedded definition promotion requires its owning goal CAS",
                             record_id=record.id,
                         )
                 if previous is not None and record.id not in expected:

@@ -18,6 +18,7 @@ from uuid import uuid4
 from .authority import Authority, decision, reference, registered
 from .errors import ConflictError, ExecutiveError
 from .messages import (
+    ApproveCriterion,
     AttachEvidence,
     CancelGoal,
     Command,
@@ -40,6 +41,7 @@ from .records import (
     ArtifactRef,
     Belief,
     Commitment,
+    CriterionApproval,
     DecisionReceipt,
     Episode,
     ExecutiveSignal,
@@ -53,6 +55,7 @@ from .records import (
     StateView,
     TaskFrame,
     WakeCondition,
+    goal_definition_digest,
     utc_now,
 )
 from .reducers import reduce_event
@@ -228,6 +231,27 @@ class Intake:
                 after = reduce_event(
                     after, event.model_copy(update={"sequence": state.sequence + offset})
                 )
+            if isinstance(item, (ReviseGoal, ResolveConflict)):
+                from .memory import invalidate_dependents
+
+                before_records = {r.id: r for r in state.records}
+                changed_refs = tuple(
+                    reference(r)
+                    for r in after.records
+                    if isinstance(r, (Goal, Belief))
+                    and r.id in before_records
+                    and r != before_records[r.id]
+                )
+                retired_criteria = tuple(
+                    reference(c)
+                    for old in state.records
+                    if isinstance(old, Goal) and any(ref.id == old.id for ref in changed_refs)
+                    for c in old.criteria
+                )
+                events = (
+                    *events,
+                    *invalidate_dependents(after, (*changed_refs, *retired_criteria)),
+                )
             return self._finish(
                 item, principal, state, now, policy, events=events, digest=digest, identity=identity
             )
@@ -353,6 +377,29 @@ class Intake:
         expected = getattr(command, "expected_revision", None)
         if expected is not None and (target is None or target.revision != expected):
             raise ConflictError("stale_command", "Command target revision changed")
+        if (
+            isinstance(command, ReviseGoal)
+            and isinstance(target, Goal)
+            and target.status == "completed"
+        ):
+            # Reopening must precede ordinary correction/conflict transitions.
+            # All events still commit atomically against the original CAS reads.
+            from .memory import invalidate_dependents
+
+            reopening = invalidate_dependents(state, (reference(target),))
+            reopened = state
+            for event in reopening:
+                reopened = reduce_event(
+                    reopened, event.model_copy(update={"sequence": reopened.sequence + 1})
+                )
+            current_goal = next(r for r in reopened.records if r.id == target.id)
+            corrected, policy = self._command(
+                command.model_copy(update={"expected_revision": current_goal.revision}),
+                principal,
+                reopened,
+                now,
+            )
+            return (*reopening, *corrected), policy
         writes: list[PersistentRecord] = []
         if isinstance(command, CreateGoal):
             target = command.goal
@@ -429,6 +476,12 @@ class Intake:
                 for field in ("outcome", "constraints", "criteria", "limits", "worker_id")
                 if getattr(command, field) is not None
             }
+            if command.criteria is not None:
+                # Retain exact removed definitions for historical finding refs.
+                remaining = {c.id for c in command.criteria}
+                writes.extend(
+                    c for c in target.criteria if c.id not in remaining and c.id not in records
+                )
             target = target.model_copy(update={"revision": target.revision + 1, **changes})
             writes.append(target)
             self._fence(target, state, writes)
@@ -637,7 +690,58 @@ class Intake:
                 if current is None or current.revision != ref.revision:
                     raise ConflictError("stale_usage_resolution", "Usage resolver read set changed")
             return result.events, None
+        elif isinstance(command, ApproveCriterion):
+            assert isinstance(target, Goal)
+            criterion = next((c for c in target.criteria if c.id == command.criterion.id), None)
+            if (
+                criterion is None
+                or command.criterion.kind not in {"record", "criterion"}
+                or criterion.revision != command.criterion.revision
+                or criterion.evaluator_type != "human"
+                or criterion.verifier_id != "owner-approval-v1"
+                or criterion.acceptance_rule != "explicit_owner_approval"
+                or target.status not in {"active", "blocked", "completed"}
+            ):
+                raise ConflictError("stale_criterion_approval", "Approval criterion changed")
+            self._check_evidence(command.artifacts, principal, state, target.id)
+            required = (*criterion.inputs, *criterion.required_evidence)
+            approved_artifacts = {(r.id, r.revision) for r in command.artifacts}
+            if (
+                len(approved_artifacts) != len(command.artifacts)
+                or any(not isinstance(records.get(r.id), ArtifactRef) for r in command.artifacts)
+                or any(
+                    isinstance(records.get(r.id), ArtifactRef)
+                    and (r.id, r.revision) not in approved_artifacts
+                    for r in required
+                )
+            ):
+                raise ConflictError(
+                    "invalid_criterion_approval", "Approval must bind artifact revisions"
+                )
+            writes.append(
+                CriterionApproval(
+                    created_at=now,
+                    owner_id=principal.id,
+                    goal=reference(target),
+                    criterion=reference(criterion),
+                    goal_definition_digest=goal_definition_digest(target),
+                    artifacts=command.artifacts,
+                    explanation=command.explanation,
+                )
+            )
         elif isinstance(command, (AttachEvidence, Reverify)):
+            assert isinstance(target, Goal)
+            named_criteria = (
+                ((command.criterion_id,) if command.criterion_id else ())
+                if isinstance(command, AttachEvidence)
+                else command.criterion_ids
+            )
+            if not set(named_criteria) <= {c.id for c in target.criteria}:
+                raise ConflictError("unknown_criterion", "Request names another goal criterion")
+            if isinstance(command, AttachEvidence) and command.task_id is not None:
+                evidence_task = records.get(command.task_id)
+                if not isinstance(evidence_task, TaskFrame) or evidence_task.goal_id != target.id:
+                    raise ConflictError("unknown_task", "Evidence task belongs to another goal")
             self._check_evidence(
                 command.evidence if isinstance(command, AttachEvidence) else (),
                 principal,

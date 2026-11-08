@@ -12,6 +12,13 @@ from .config import (
     WorkerConfig,
     WorkspaceConfig,
 )
+from .context import (
+    ContextAssembler,
+    ContextBudgetInsufficient,
+    TokenCounter,
+    UTF8ByteCounter,
+    render_packet,
+)
 from .errors import (
     AuthorityError,
     BudgetError,
@@ -22,9 +29,12 @@ from .errors import (
     InvalidTransition,
     StoreError,
 )
+from .inspection import export_contract_schemas, export_goal, inspect_state
 from .intake import Intake
+from .kernel import Clock, Kernel, SystemClock
 from .messages import (
     ActionIntent,
+    ApproveCriterion,
     AttachEvidence,
     AuthenticatedCommand,
     BeliefChange,
@@ -64,6 +74,7 @@ from .records import (
     ContextManifest,
     ContextPacket,
     Criterion,
+    CriterionApproval,
     CriterionGap,
     DecisionReceipt,
     Disposition,
@@ -85,6 +96,7 @@ from .records import (
     Ref,
     Reservation,
     RunSummary,
+    SchedulerState,
     Scope,
     StateView,
     TaskFrame,
@@ -93,8 +105,27 @@ from .records import (
     VerificationResult,
     WakeCondition,
 )
+from .recovery import recover
+from .scheduler import AttentionPolicy, ScheduledItem, Scheduler, wake
 
 __all__ = [
+    "Clock",
+    "Kernel",
+    "SystemClock",
+    "inspect_state",
+    "export_contract_schemas",
+    "export_goal",
+    "recover",
+    "ContextAssembler",
+    "ContextBudgetInsufficient",
+    "TokenCounter",
+    "UTF8ByteCounter",
+    "render_packet",
+    "AttentionPolicy",
+    "ScheduledItem",
+    "Scheduler",
+    "SchedulerState",
+    "wake",
     "Authority",
     "RuleRegistry",
     "Intake",
@@ -103,6 +134,7 @@ __all__ = [
     "Scope",
     "Constraint",
     "Criterion",
+    "CriterionApproval",
     "Principal",
     "Limits",
     "Usage",
@@ -150,6 +182,7 @@ __all__ = [
     "ResolveUsage",
     "AttachEvidence",
     "Reverify",
+    "ApproveCriterion",
     "ShareArtifact",
     "SetGrant",
     "AuthenticatedCommand",

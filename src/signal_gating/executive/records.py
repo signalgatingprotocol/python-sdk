@@ -6,6 +6,8 @@ and frozen after validation; model_copy validates updates just like construction
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from math import isfinite
@@ -201,6 +203,9 @@ class Criterion(Record):
     verifier_id: NonEmpty
     inputs: tuple[Ref, ...] = ()
     acceptance_rule: NonEmpty
+    # Owner-declared local-check binding; workers cannot choose a smaller input set.
+    check_id: NonEmpty | None = None
+    workspace_inputs: tuple[NonEmpty, ...] = ()
     required_evidence: tuple[Ref, ...] = ()
     required: bool = True
 
@@ -281,6 +286,31 @@ class Goal(Record):
     deadline: Timestamp | None = None
 
 
+def goal_definition_digest(goal: Goal) -> str:
+    """Versioned owner intent fingerprint; lifecycle bookkeeping is excluded."""
+    value = goal.model_dump(mode="json", exclude={"revision", "status"})
+    encoded = json.dumps(
+        {"policy": "goal-definition-v1", "goal": value},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class CriterionApproval(Record):
+    """Explicit owner control, never inferred from artifact or signal contents."""
+
+    kind: Literal["criterion_approval"] = "criterion_approval"
+    owner_id: Identifier
+    goal: Ref
+    criterion: Ref
+    goal_definition_digest: Digest
+    artifacts: tuple[Ref, ...] = Field(min_length=1)
+    explanation: NonEmpty
+
+
 class Commitment(Record):
     kind: Literal["commitment"] = "commitment"
     goal_id: Identifier
@@ -344,6 +374,10 @@ class TaskFrame(Record):
     priority: NonNegativeInt = 0
     deadline: Timestamp | None = None
     urgent: bool = False
+    eligible_since: Timestamp | None = None
+    last_scheduled_at: Timestamp | None = None
+    failure_signature: Digest | None = None
+    failure_reason: NonEmpty | None = None
 
 
 class Grant(Record):
@@ -408,6 +442,9 @@ class Reservation(Record):
     maximum: Limits
     trusted_maximum_quote: bool = False
     usage: Usage = Field(default_factory=Usage)
+    # Preserve final settlement while retaining a later conservative measured floor.
+    observed_usage: Usage | None = None
+    accounting_conflict: NonEmpty | None = None
     status: Literal["reserved", "settled", "uncertain", "released"] = "reserved"
     evidence: tuple[Ref, ...] = ()
 
@@ -449,12 +486,15 @@ class DecisionReceipt(Record):
     reason_code: NonEmpty
     evidence: tuple[Ref, ...] = ()
     event_ids: tuple[Identifier, ...] = ()
+    wake_condition: WakeCondition | None = None
 
 
 class CapabilitySpec(Model):
     id: NonEmpty
     binding_version: NonEmpty
     description: str = ""
+    # Operator registration identity changes even if a version string is reused.
+    binding_id: Identifier | None = None
     input_schema: JsonObject
     effect_class: Literal["read_only", "reversible", "consequential", "human_only"]
     resource_scope_rules: tuple[NonEmpty, ...] = ()
@@ -480,6 +520,17 @@ class ActionRecord(Record):
     task_id: Identifier
     capability_id: NonEmpty
     binding_version: NonEmpty
+    binding_id: Identifier | None = None
+    # Trusted acceptance lineage, never inferred from a worker name or payload role.
+    episode_id: Identifier | None = None
+    worker_id: NonEmpty | None = None
+    origin_principal_id: Identifier | None = None
+    accepted_task_revision: PositiveInt | None = None
+    accepted_episode_revision: PositiveInt | None = None
+    accepted_fencing_token: NonNegativeInt | None = None
+    dispatched_at: Timestamp | None = None
+    dispatch_attempts: NonNegativeInt = 0
+    prior_reservation_ids: tuple[Identifier, ...] = ()
     arguments_digest: Digest
     arguments: JsonObject = Field(default_factory=dict)
     arguments_ref: Ref | None = None
@@ -544,8 +595,13 @@ class PolicyDecision(Model):
 
 
 class ContextManifest(Model):
+    required_ids: tuple[Identifier, ...] = ()
+    visible_ids: tuple[Identifier, ...] = ()
+    context_token_limit: PositiveInt | None = None
     included: tuple[Ref, ...] = ()
     omitted: tuple[Ref, ...] = ()
+    # Read-only status snapshots fenced at packet admission, never action proof.
+    observed_refs: tuple[Ref, ...] = ()
     selection_reasons: tuple[NonEmpty, ...] = ()
     required_tokens: NonNegativeInt = 0
     input_tokens: NonNegativeInt = 0
@@ -571,6 +627,8 @@ class ContextPacket(Record):
     mandatory_read_set: tuple[Ref, ...] = ()
     manifest: ContextManifest
     rendered_input: str
+    rendered_artifact: ArtifactRef | None = None
+    worker_instructions: str | None = None
 
 
 class ArtifactDraft(Model):
@@ -631,6 +689,17 @@ class JournalEvent(Record):
     payload: JsonObject = Field(default_factory=dict)
 
 
+class SchedulerState(Record):
+    """One journalled fairness cursor and bounded control-backlog observation."""
+
+    kind: Literal["scheduler"] = "scheduler"
+    id: Literal["d3f108b20fa446218be896319d57243e"] = "d3f108b20fa446218be896319d57243e"
+    cursor: NonNegativeInt = 0
+    control_pending: NonNegativeInt = 0
+    control_since: Timestamp | None = None
+    overload_reported: bool = False
+
+
 PersistentRecord = Annotated[
     Principal
     | Goal
@@ -647,9 +716,11 @@ PersistentRecord = Annotated[
     | Episode
     | Constraint
     | Criterion
+    | CriterionApproval
     | VerificationResult
     | JournalEvent
-    | ContextPacket,
+    | ContextPacket
+    | SchedulerState,
     Field(discriminator="kind"),
 ]
 
@@ -685,6 +756,15 @@ class EvaluationCase(Record):
 
 
 class EvaluationResult(Model):
+    # Optional measured fixture projection. passed/summary retain their meanings.
+    metrics: dict[str, int] = Field(default_factory=dict)
+    scope: Literal["synthetic_fixture", "observed_run"] = "synthetic_fixture"
+    trial: NonNegativeInt = 0
+    arm: str = ""
+    store_path: str | None = None
+    measurements: dict[str, NonNegativeInt | NonNegativeNumber | None] = Field(default_factory=dict)
+    usage_observations: tuple[Usage, ...] = ()
+
     case_id: Identifier
     policy_version: NonEmpty
     passed: bool
@@ -692,8 +772,50 @@ class EvaluationResult(Model):
     summary: RunSummary
     failures: tuple[NonEmpty, ...] = ()
 
+    @property
+    def completed(self) -> bool:
+        return self.passed and bool(self.summary.completed_goal_ids)
+
 
 class EvaluationReport(Model):
     results: tuple[EvaluationResult, ...]
     scope: Literal["synthetic_fixture", "observed_run"] = "synthetic_fixture"
     policy_versions: tuple[NonEmpty, ...] = ()
+    arm: str = ""
+    configuration_digest: str = ""
+    manifest_digest: str = ""
+    evaluation_kind: Literal["fresh", "replay"] = "fresh"
+    case_names: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def attempts(self) -> int:
+        return len(self.results)
+
+    @property
+    def accepted(self) -> bool:
+        return bool(self.results) and all(result.passed for result in self.results)
+
+    @property
+    def worker_calls(self) -> int:
+        return sum(r.metrics.get("worker_calls", 0) for r in self.results)
+
+    @property
+    def control_calls(self) -> int:
+        return sum(r.metrics.get("control_calls", 0) for r in self.results)
+
+    @property
+    def verifier_calls(self) -> int:
+        return sum(r.metrics.get("verifier_calls", 0) for r in self.results)
+
+    @property
+    def total_calls(self) -> int:
+        return self.worker_calls + self.control_calls + self.verifier_calls
+
+    @property
+    def cost_status(self) -> Literal["known", "unknown"]:
+        return (
+            "known"
+            if self.results
+            and all(r.measurements.get("cost_microunits") is not None for r in self.results)
+            else "unknown"
+        )

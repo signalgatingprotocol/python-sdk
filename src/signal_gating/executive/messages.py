@@ -175,6 +175,15 @@ class Reverify(CommandBase):
     criterion_ids: tuple[Identifier, ...] = ()
 
 
+class ApproveCriterion(CommandBase):
+    kind: Literal["approve_criterion"] = "approve_criterion"
+    goal_id: Identifier
+    expected_revision: PositiveInt
+    criterion: Ref
+    artifacts: tuple[Ref, ...] = Field(min_length=1)
+    explanation: NonEmpty
+
+
 class ShareArtifact(CommandBase):
     kind: Literal["share_artifact"] = "share_artifact"
     artifact_id: Identifier
@@ -200,6 +209,7 @@ Command = Annotated[
     | ResolveUsage
     | AttachEvidence
     | Reverify
+    | ApproveCriterion
     | ShareArtifact
     | SetGrant,
     Field(discriminator="kind"),

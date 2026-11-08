@@ -13,6 +13,9 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from types import MappingProxyType
 
+from signal_gating._immutable import deep_thaw
+
+from .memory import records_by_id
 from .messages import (
     ActionIntent,
     Command,
@@ -29,6 +32,7 @@ from .records import (
     CapabilitySpec,
     Constraint,
     ContextPacket,
+    Criterion,
     Episode,
     Goal,
     Grant,
@@ -40,10 +44,37 @@ from .records import (
     Scope,
     StateView,
     TaskFrame,
+    VerificationResult,
 )
 
 Rule = Callable[[Mapping[str, Record]], PolicyDecision]
 ResourceExtractor = Callable[[ActionIntent], Scope]
+
+
+def _proof_roots(
+    task: TaskFrame, reads: tuple[Ref, ...], indexed: Mapping[str, Record]
+) -> tuple[Ref, ...]:
+    """Definition/data reads fence versions; only accepted support implies proof.
+
+    Explicit task dependencies always retain satisfaction checks. Supplied unknown
+    beliefs and criterion definitions confer no authority just by being read.
+    """
+    return tuple(
+        dict.fromkeys(
+            (
+                *task.dependencies,
+                *(
+                    ref
+                    for ref in reads
+                    if (
+                        isinstance(item := indexed.get(ref.id), Belief)
+                        and item.epistemic_status == "supported"
+                    )
+                    or (isinstance(item, VerificationResult) and item.disposition == "accept")
+                ),
+            )
+        )
+    )
 
 
 def decision(disposition: str, reason: str, *, evidence: tuple[Ref, ...] = ()) -> PolicyDecision:
@@ -230,10 +261,40 @@ class Authority:
                 pending = result
         return pending or decision("authorize", "constraints_satisfied")
 
+    def check_dispatch(
+        self, action: ActionRecord, state: StateView, now: datetime
+    ) -> PolicyDecision:
+        """Repeat current admission using exact, trusted proposal-acceptance lineage."""
+        if action.episode_id is None or action.accepted_task_revision is None:
+            return decision("deny", "missing_action_lineage")
+        episode = next((r for r in state.records if r.id == action.episode_id), None)
+        if not isinstance(episode, Episode) or episode.worker_id != action.worker_id:
+            return decision("deny", "action_worker_binding_changed")
+        intent = ActionIntent(
+            id=action.id,
+            episode_id=episode.id,
+            fencing_token=episode.fencing_token,
+            capability_id=action.capability_id,
+            arguments=deep_thaw(action.arguments),
+            scope=action.scope,
+            read_set=action.read_set,
+        )
+        return self._check_action(intent, state, now, accepted=action)
+
     def check_action(self, intent: ActionIntent, state: StateView, now: datetime) -> PolicyDecision:
+        return self._check_action(intent, state, now)
+
+    def _check_action(
+        self,
+        intent: ActionIntent,
+        state: StateView,
+        now: datetime,
+        *,
+        accepted: ActionRecord | None = None,
+    ) -> PolicyDecision:
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("Action check requires an aware timestamp")
-        records = {r.id: r for r in state.records}
+        records = records_by_id(state)
         episode = records.get(intent.episode_id)
         if not isinstance(episode, Episode):
             return decision("deny", "unknown_episode")
@@ -255,25 +316,34 @@ class Authority:
             or "owner" not in owner.roles
         ):
             return decision("deny", "unknown_worker_or_owner")
-        if target.status != "active" or task.status != "running":
+        accepted_current = accepted is not None and (
+            episode.status == "accepted"
+            and episode.revision == accepted.accepted_episode_revision
+            and task.status in {"suspended", "verifying"}
+            and task.revision == accepted.accepted_task_revision
+            and task.fencing_token == accepted.accepted_fencing_token
+        )
+        if accepted is not None and not accepted_current:
+            return decision("stale", "stale_accepted_action_context")
+        if target.status != "active" or (task.status != "running" and not accepted_current):
             return decision("deny", "inactive_goal_or_task")
         if (
-            episode.status != "running"
-            or now >= episode.deadline
+            (episode.status != "running" and not accepted_current)
+            or (now >= episode.deadline and not accepted_current)
             or "action_intent" not in episode.allowed_proposal_types
             or intent.fencing_token != episode.fencing_token
-            or intent.fencing_token != task.fencing_token
-            or packet.fencing_token != task.fencing_token
+            or (intent.fencing_token != task.fencing_token and not accepted_current)
+            or (packet.fencing_token != task.fencing_token and not accepted_current)
             or packet.episode_id != episode.id
             or packet.task.id != task.id
             or packet.goal.id != target.id
             or packet.goal.revision != target.revision
-            or packet.task.revision != task.revision
+            or (packet.task.revision != task.revision and not accepted_current)
         ):
             return decision("stale", "stale_action_context")
         for ref in (
-            *packet.mandatory_read_set,
-            *(reference(b) for b in packet.beliefs),
+            *(packet.mandatory_read_set if accepted is None else ()),
+            *((reference(b) for b in packet.beliefs) if accepted is None else ()),
             *intent.read_set,
             *intent.affected_records,
         ):
@@ -281,9 +351,61 @@ class Authority:
             if (
                 record is None
                 or record.revision != ref.revision
-                or (ref.kind != "record" and record.kind != ref.kind)
+                or (ref.kind != "record" and getattr(record, "kind", None) != ref.kind)
             ):
                 return decision("stale", "stale_action_read_set")
+        from .scheduler import _fresh
+
+        indexed = records_by_id(state)
+        dependencies = _proof_roots(task, intent.read_set, indexed)
+        if not _fresh(task.model_copy(update={"dependencies": dependencies}), indexed, now):
+            return decision("stale", "expired_action_support")
+        from .reducers import _dependency_satisfied
+
+        materialized = {r.id: r for r in state.records}
+        for ref in task.dependencies:
+            item = indexed.get(ref.id)
+            if item is None or not _dependency_satisfied(item, materialized):
+                return decision("stale", "unsettled_action_dependency")
+        pending = list(dependencies)
+        seen: set[str] = set()
+        while pending:
+            dependency = pending.pop()
+            item = indexed.get(dependency.id)
+            if (
+                item is None
+                or item.revision != dependency.revision
+                or (dependency.kind != "record" and dependency.kind != getattr(item, "kind", None))
+            ):
+                return decision("stale", "stale_action_support")
+            if item.id in seen:
+                continue
+            if isinstance(item, Criterion):
+                finding = next(
+                    (
+                        r
+                        for r in state.records
+                        if isinstance(r, VerificationResult)
+                        and r.criterion_id == item.id
+                        and r.disposition == "accept"
+                    ),
+                    None,
+                )
+                if finding is None:
+                    return decision("stale", "unsupported_action_criterion")
+                pending.extend((*item.inputs, *item.required_evidence, reference(finding)))
+            if isinstance(item, VerificationResult):
+                if item.disposition != "accept":
+                    return decision("stale", "unsupported_action_finding")
+                pending.extend((*item.read_set, *item.evidence))
+            if isinstance(item, Belief):
+                if item.epistemic_status != "supported":
+                    return decision("stale", "unsupported_action_belief")
+                if item.id not in seen:
+                    pending.extend(item.evidence)
+            if isinstance(item, ArtifactRef) and not item.valid:
+                return decision("stale", "invalid_action_artifact")
+            seen.add(dependency.id)
         capability = self.capabilities.get(intent.capability_id)
         extractor = self.resource_scopes.get(intent.capability_id)
         if capability is None or capability.id != intent.capability_id or extractor is None:
@@ -300,6 +422,13 @@ class Authority:
             resources.resource_paths != intent.scope.resource_paths
             or resources.owner_id not in (None, target.owner_id)
             or resources.goal_id not in (None, target.id)
+            or not _scope_allows(
+                intent.scope,
+                resources,
+                owner_id=target.owner_id,
+                goal_id=target.id,
+                principal_id=worker.id,
+            )
         ):
             return decision("deny", "argument_scope_mismatch")
         constraints = self.check_constraints(
