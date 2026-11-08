@@ -53,12 +53,27 @@ def _chain(state: StateView, budget_id: str) -> tuple[Budget, ...]:
             child = result[-1]
             if child.limits.currency != budget.limits.currency:
                 raise BudgetError("currency_mismatch", "Ancestor budget currency differs")
-            if any(
-                getattr(budget.scope, name) is not None
-                and getattr(child.scope, name) != getattr(budget.scope, name)
-                for name in ("owner_id", "goal_id")
-            ):
-                raise BudgetError("budget_scope_mismatch", "Child escapes ancestor scope")
+            if budget.scope.owner_id is not None and child.scope.owner_id != budget.scope.owner_id:
+                raise BudgetError("budget_scope_mismatch", "Child escapes ancestor owner")
+            if budget.scope.goal_id is not None and child.scope.goal_id != budget.scope.goal_id:
+                # Descendant goal budgets share their actual persisted ancestors.
+                # A matching owner alone must never authorize sibling/foreign scopes.
+                goal_id = child.scope.goal_id
+                visited: set[str] = set()
+                while goal_id != budget.scope.goal_id:
+                    goal = records.get(goal_id or "")
+                    if (
+                        not isinstance(goal, Goal)
+                        or goal.id in visited
+                        or goal.owner_id != child.scope.owner_id
+                        or goal.owner_id != budget.scope.owner_id
+                    ):
+                        raise BudgetError("budget_scope_mismatch", "Invalid goal ancestry")
+                    visited.add(goal.id)
+                    goal_id = goal.parent_id
+                ancestor = records.get(goal_id or "")
+                if not isinstance(ancestor, Goal) or ancestor.owner_id != child.scope.owner_id:
+                    raise BudgetError("budget_scope_mismatch", "Invalid ancestor owner")
         seen.add(budget_id)
         result.append(budget)
         budget_id = budget.parent_id or ""
@@ -162,6 +177,8 @@ class BudgetPolicy:
             events=(event,),
             expected_revisions=(
                 *(_ref(b) for b in chain),
+                # Goal ancestry is part of the authorization of cross-goal trees.
+                *(_ref(r) for r in state.records if isinstance(r, Goal)),
                 *((_ref(previous),) if previous else ()),
             ),
         )
@@ -207,7 +224,6 @@ class BudgetPolicy:
                 raise BudgetError("reservation_conflict", "Reservation ID has different binding")
             if previous.status != "reserved":
                 raise BudgetError("reservation_consumed", "Reservation is already reconciled")
-            return self._batch(state, chain, previous, ())
         for budget in chain:
             for name in _QUANTITIES:
                 ceiling = _quantity(budget.limits, name)
@@ -222,13 +238,17 @@ class BudgetPolicy:
                     amount is None
                     or actual is None
                     or held is None
-                    or actual + held + amount > ceiling
+                    or actual + held + (0 if previous is not None else amount) > ceiling
                 ):
                     raise BudgetError(
                         "budget_exhausted",
                         f"Cannot bound {name} within budget",
                         record_id=budget.id,
                     )
+        if isinstance(previous, Reservation):
+            # The existing reservation is already included in held. Recheck
+            # today's ceilings without reserving its maximum a second time.
+            return self._batch(state, chain, previous, ())
         reservation = Reservation(
             id=reservation_id,
             created_at=self.clock(),

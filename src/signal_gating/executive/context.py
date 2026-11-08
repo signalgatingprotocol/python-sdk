@@ -339,6 +339,9 @@ class ContextAssembler:
                     if isinstance(r, Grant)
                     and r.scope.goal_id in (None, *seen)
                     and r.scope.owner_id in (None, goal.owner_id)
+                    and r.subject_id == principal.id
+                    and not r.revoked
+                    and (r.expires_at is None or now < r.expires_at)
                 ),
                 key=lambda r: r.id,
             )

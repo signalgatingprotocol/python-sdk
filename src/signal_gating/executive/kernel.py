@@ -24,7 +24,7 @@ from .adapters.local_tools import LocalWorkspace, StoreArtifacts
 from .adapters.openai_worker import OpenAIWorker
 from .artifacts import ArtifactStore
 from .authority import Authority, reference
-from .budgets import BudgetPolicy
+from .budgets import BudgetPolicy, _chain
 from .config import KernelConfig
 from .context import ContextAssembler, TokenCounter, UTF8ByteCounter
 from .errors import ExecutiveError
@@ -47,6 +47,7 @@ from .records import (
     Belief,
     Budget,
     CapabilitySpec,
+    Commitment,
     ContextPacket,
     DecisionReceipt,
     Episode,
@@ -597,6 +598,8 @@ class Kernel:
         if not isinstance(reservation, Reservation) or reservation.subject_id != episode.id:
             return False
         try:
+            if self._episode_budget(task, goal, state).id != reservation.budget_id:
+                return False
             self.budgets.reserve(
                 state,
                 reservation.budget_id,
@@ -893,15 +896,31 @@ class Kernel:
             - scheduled
         )
 
-    def _remaining(self, budget: Budget, state: StateView) -> Limits:
+    def _episode_budget(self, task: TaskFrame, goal: Goal, state: StateView) -> Budget:
         indexed = records_by_id(state)
+        commitment = indexed.get(task.commitment_id)
+        if not isinstance(commitment, Commitment) or commitment.goal_id != goal.id:
+            raise ExecutiveError("invalid_context_binding", "Task commitment is absent")
+        budget_id = commitment.budget_id or goal.budget_id
+        if budget_id is None:
+            raise ExecutiveError("missing_episode_budget", "Episode requires a budget")
+        chain = _chain(state, budget_id)
+        budget = chain[0]
+        if (
+            budget.scope.owner_id not in (None, goal.owner_id)
+            or budget.scope.goal_id not in (None, goal.id)
+            or (budget.scope.owner_id is None and budget.scope.goal_id != goal.id)
+            or (goal.budget_id is not None and goal.budget_id not in {b.id for b in chain})
+        ):
+            raise ExecutiveError("budget_scope_mismatch", "Episode escapes its goal budget")
+        return budget
+
+    def _remaining(self, budget: Budget, state: StateView) -> Limits:
+        chain = _chain(state, budget.id)
         values: dict[str, Any] = {"currency": budget.limits.currency}
         for key in ("input_tokens", "output_tokens", "calls", "elapsed_seconds", "cost_microunits"):
             available = []
-            node = budget
-            visited: set[str] = set()
-            while node.id not in visited:
-                visited.add(node.id)
+            for node in chain:
                 maximum = getattr(node.limits, key)
                 if maximum is not None:
                     actual, reserved = getattr(node.actual, key), getattr(node.reserved, key)
@@ -910,10 +929,6 @@ class Kernel:
                         if actual is None or reserved is None
                         else max(0, maximum - actual - reserved)
                     )
-                parent = indexed.get(node.parent_id or "")
-                if not isinstance(parent, Budget):
-                    break
-                node = parent
             values[key] = min(available) if available else None
         return Limits(**values)
 
@@ -969,9 +984,7 @@ class Kernel:
                 wc = self.worker_configs.get(goal.worker_id)
                 if wc is None:
                     raise ExecutiveError("unknown_worker", "Worker is not configured")
-                budget = indexed.get(goal.budget_id or "")
-                if not isinstance(budget, Budget):
-                    raise ExecutiveError("missing_episode_budget", "Goal requires a budget")
+                budget = self._episode_budget(item, goal, state)
                 remaining = self._remaining(budget, state)
                 duration = min(
                     self.config.episode_timeout_seconds,
@@ -1005,13 +1018,37 @@ class Kernel:
                     raise ExecutiveError(
                         "unknown_token_counter", "Configure the required token counter"
                     )
-                requests = tuple(
-                    EvidenceRequest.model_validate(r.payload["proposal"])
+                superseded = {
+                    r.subject_id
                     for r in state.records
-                    if isinstance(r, ExecutiveSignal)
-                    and r.signal_kind == "evidence_request"
-                    and r.scope.goal_id == goal.id
-                )
+                    if isinstance(r, DecisionReceipt)
+                    and r.policy_version == "evidence-request-v1"
+                    and r.reason_code == "evidence_request_superseded"
+                }
+                requests = []
+                for signal in state.records:
+                    if (
+                        not isinstance(signal, ExecutiveSignal)
+                        or signal.signal_kind != "evidence_request"
+                        or signal.scope.goal_id != goal.id
+                        or signal.id in superseded
+                    ):
+                        continue
+                    request = EvidenceRequest.model_validate(signal.payload["proposal"])
+                    origin = indexed.get(request.episode_id)
+                    if isinstance(origin, Episode) and origin.task_id == item.id:
+                        # Bind this fresh continuation to current evidence. The
+                        # persisted proposal and its historical refs stay intact.
+                        requests.append(
+                            request.model_copy(
+                                update={
+                                    "refs": tuple(
+                                        reference(indexed[ref.id]) if ref.id in indexed else ref
+                                        for ref in request.refs
+                                    )
+                                }
+                            )
+                        )
                 packet = self._context_assembler_type(
                     self.artifacts,
                     worker=wc,
@@ -1024,7 +1061,7 @@ class Kernel:
                     planned,
                     principal=self.worker_principals[wc.id],
                     remaining_limits=remaining,
-                    evidence_requests=requests,
+                    evidence_requests=tuple(requests),
                 )
                 assert packet.rendered_artifact is not None
                 pins.append(packet.rendered_artifact)
@@ -1089,6 +1126,17 @@ class Kernel:
                     packet.rendered_artifact,
                     packet,
                     episode,
+                    *(
+                        DecisionReceipt(
+                            created_at=self.clock.now(),
+                            subject_id=request.id,
+                            policy_version="evidence-request-v1",
+                            disposition="accept",
+                            reason_code="evidence_request_superseded",
+                            evidence=(reference(episode), reference(packet)),
+                        )
+                        for request in requests
+                    ),
                 ]
                 for event in reservation.events:
                     if event.event_type == "state.changed":
@@ -1140,9 +1188,11 @@ class Kernel:
         task.add_done_callback(lambda _: self._changed.set())
 
     async def _episode(self, episode: Episode, packet: ContextPacket) -> None:
+        observed = False
         try:
             result = await self.runner.run(episode, packet, self.workers[episode.worker_id])
             self._observe(episode, result.usage)
+            observed = True
             if result.stop_reason == "proposed" and not result.proposals:
                 self._fail_episode(episode, "no_progress")
                 return
@@ -1161,13 +1211,17 @@ class Kernel:
             if receipt is not None and receipt.disposition != "accept":
                 self._fail_episode(episode, receipt.reason_code)
         except (WorkerError, ExecutiveError) as exc:
-            self._observe(
-                episode,
-                exc.usage if isinstance(exc, WorkerError) else Usage(source="kernel-worker-error"),
-            )
+            if not observed:
+                self._observe(
+                    episode,
+                    exc.usage
+                    if isinstance(exc, WorkerError)
+                    else Usage(source="kernel-worker-error"),
+                )
             self._fail_episode(episode, exc.code)
         except asyncio.CancelledError:
-            self._observe(episode, Usage(calls=1, source="kernel-cancelled"))
+            if not observed:
+                self._observe(episode, Usage(calls=1, source="kernel-cancelled"))
             self._fail_episode(episode, "episode_fenced")
 
     def _fail_episode(self, episode: Episode, reason: str) -> None:
