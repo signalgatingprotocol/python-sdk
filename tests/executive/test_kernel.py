@@ -1079,3 +1079,209 @@ async def test_owner_budget_revision_updates_the_enforced_ledger_atomically(tmp_
         assert len(records(kernel, Episode)) == 1
         assert records(kernel, Budget)[0].actual.calls == 1
         assert kernel.store.view() == rebuild(kernel.store.events())
+
+
+def active_wait_barrier(kernel, active):
+    """Observe a settled active wait, after admission notifications were drained."""
+    waiting = asyncio.Event()
+    original_wait = kernel._wait_change
+
+    async def observe():
+        if active.is_set() and not kernel._changed.is_set():
+            waiting.set()
+        await original_wait()
+
+    kernel._wait_change = observe
+    return waiting
+
+
+@pytest.mark.parametrize("boundary", ["task_time", "belief_valid_from"])
+async def test_timer_wakes_eligible_task_while_independent_worker_active(tmp_path, boundary):
+    from uuid import uuid4
+
+    from signal_gating.executive import Belief, Scope
+    from signal_gating.executive.authority import reference
+
+    clock = FakeClock()
+    due = NOW + timedelta(seconds=5)
+    delayed_goal = new_goal(criteria=())
+    independent_goal = new_goal(id=uuid4().hex, criteria=())
+    independent_started, delayed_started = asyncio.Event(), asyncio.Event()
+    release = asyncio.get_running_loop().create_future()
+    delayed_calls = 0
+
+    class Worker:
+        async def run_episode(self, packet):
+            nonlocal delayed_calls
+            if packet.goal.id == independent_goal.id:
+                independent_started.set()
+                await release
+                return blocked(packet)
+            delayed_calls += 1
+            if boundary == "task_time" and delayed_calls == 1:
+                return EpisodeResult(
+                    stop_reason="blocked",
+                    blocker=WakeCondition(kind="time", at=due, reason_code="scheduled"),
+                    usage=usage(),
+                )
+            delayed_started.set()
+            return blocked(packet)
+
+    async with open_kernel(tmp_path, Worker(), clock=clock) as kernel:
+        await kernel.submit(CreateGoal(goal=delayed_goal), principal=owner())
+        if boundary == "belief_valid_from":
+            task = records(kernel, TaskFrame)[0]
+            belief = Belief(
+                claim="Future supported prerequisite",
+                scope=Scope(owner_id=owner().id, goal_id=delayed_goal.id),
+                epistemic_status="supported",
+                valid_from=due,
+            )
+            kernel.store.commit(
+                kernel._batch(
+                    (
+                        belief,
+                        task.model_copy(
+                            update={
+                                "revision": task.revision + 1,
+                                "dependencies": (reference(belief),),
+                            }
+                        ),
+                    ),
+                    kernel.store.view(),
+                )
+            )
+        await kernel.run_until_idle()
+        assert not delayed_started.is_set()
+        await kernel.submit(CreateGoal(goal=independent_goal), principal=owner())
+        waiting = active_wait_barrier(kernel, independent_started)
+        running = asyncio.create_task(kernel.run_until_idle())
+        await asyncio.wait_for(independent_started.wait(), 1)
+        await asyncio.wait_for(waiting.wait(), 1)
+        try:
+            clock.advance(5)
+            await asyncio.wait_for(delayed_started.wait(), 1)
+            independent = next(
+                t for t in records(kernel, TaskFrame) if t.goal_id == independent_goal.id
+            )
+            assert independent.status == "running"
+            assert not release.done()
+        finally:
+            release.set_result(None)
+            await asyncio.wait_for(running, 1)
+        assert not clock.waiters
+        assert kernel.store.view() == rebuild(kernel.store.events())
+
+
+async def test_timer_reverifies_expired_completion_while_independent_worker_active(tmp_path):
+    import json
+    from uuid import uuid4
+
+    from signal_gating.executive import Belief, Commitment, Scope
+    from signal_gating.executive.authority import reference
+
+    clock = FakeClock()
+    due = NOW + timedelta(seconds=5)
+    completed_goal = new_goal()
+    independent_goal = new_goal(id=uuid4().hex, criteria=())
+    independent_started, rechecked = asyncio.Event(), asyncio.Event()
+    release = asyncio.get_running_loop().create_future()
+
+    class Worker:
+        async def run_episode(self, packet):
+            if packet.goal.id == independent_goal.id:
+                independent_started.set()
+                await release
+                return blocked(packet)
+            evidence = tuple(
+                Ref.model_validate(a["ref"])
+                for a in json.loads(packet.rendered_input)["untrusted_evidence"]["artifacts"]
+            )
+            return EpisodeResult(
+                stop_reason="proposed",
+                usage=usage(),
+                proposals=(
+                    CompletionClaim(
+                        episode_id=packet.episode_id,
+                        fencing_token=packet.fencing_token,
+                        read_set=packet.mandatory_read_set,
+                        criterion_ids=(packet.goal.criteria[0].id,),
+                        artifacts=evidence,
+                    ),
+                ),
+            )
+
+    async with open_kernel(tmp_path, Worker(), clock=clock) as kernel:
+        await kernel.submit(CreateGoal(goal=completed_goal), principal=owner())
+        belief = Belief(
+            claim="Expiring required-work support",
+            scope=Scope(owner_id=owner().id, goal_id=completed_goal.id),
+            epistemic_status="supported",
+            valid_until=due,
+        )
+        commitment = records(kernel, Commitment)[0]
+        kernel.store.commit(
+            kernel._batch(
+                (
+                    belief,
+                    commitment.model_copy(
+                        update={
+                            "revision": commitment.revision + 1,
+                            "dependencies": (reference(belief),),
+                        }
+                    ),
+                ),
+                kernel.store.view(),
+            )
+        )
+        artifact = kernel.artifacts.put(
+            b"actual completion evidence",
+            principal=owner(),
+            goal_id=completed_goal.id,
+            media_type="text/plain",
+        )
+        await kernel.submit(
+            ShareArtifact(
+                artifact_id=artifact.id,
+                principal_ids=(
+                    kernel.worker_principals["fixture"].id,
+                    kernel.verifier_principal.id,
+                ),
+            ),
+            principal=owner(),
+        )
+        assert (await kernel.run_until_idle()).completed_goal_ids == (completed_goal.id,)
+        original_call = kernel._verification_call
+
+        async def observed_call(subject_id, call):
+            result = await original_call(subject_id, call)
+            if clock.now() >= due:
+                rechecked.set()
+            return result
+
+        kernel._verification_call = observed_call
+        await kernel.submit(CreateGoal(goal=independent_goal), principal=owner())
+        waiting = active_wait_barrier(kernel, independent_started)
+        running = asyncio.create_task(kernel.run_until_idle())
+        await asyncio.wait_for(independent_started.wait(), 1)
+        await asyncio.wait_for(waiting.wait(), 1)
+        try:
+            clock.advance(5)
+            await asyncio.wait_for(rechecked.wait(), 1)
+            current = next(g for g in records(kernel, Goal) if g.id == completed_goal.id)
+            assert current.status == "active"
+            dependent = next(
+                t for t in records(kernel, TaskFrame) if t.goal_id == completed_goal.id
+            )
+            assert dependent.status == "blocked"
+            assert dependent.wake_condition.reason_code == "completion_prerequisites_unsettled"
+            independent = next(
+                t for t in records(kernel, TaskFrame) if t.goal_id == independent_goal.id
+            )
+            assert independent.status == "running"
+            assert not release.done()
+        finally:
+            release.set_result(None)
+            await asyncio.wait_for(running, 1)
+        assert not clock.waiters
+        assert kernel.store.view() == rebuild(kernel.store.events())

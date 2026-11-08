@@ -1153,7 +1153,7 @@ class Kernel:
             return self.inspect().summary.model_copy(update={"stop_reason": "stopped"})
 
     async def _wait_change(self) -> None:
-        waiting = [
+        waiting: list[asyncio.Task[Any]] = [
             asyncio.create_task(event.wait())
             for event in (
                 self._changed,
@@ -1161,8 +1161,23 @@ class Kernel:
                 self.dispatcher.late_observations_ready,
             )
         ]
+        deadline = self._next_wake()
+        timer = asyncio.create_task(self._wait_until(deadline)) if deadline else None
+        if timer is not None:
+            waiting.append(timer)
         try:
-            await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            completed, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if timer is not None and timer in completed:
+                timer.result()
+            if deadline is not None and self.clock.now() >= deadline:
+                # Clock boundaries can invalidate transitive completion proof
+                # even while an unrelated owned call remains active. Reuse the
+                # service's full current-proof walk rather than another index.
+                self._verification_due.update(
+                    r.id
+                    for r in self.store.view().records
+                    if isinstance(r, Goal) and r.status == "completed"
+                )
         finally:
             for task in waiting:
                 task.cancel()
@@ -1180,8 +1195,12 @@ class Kernel:
                 and record.wake_condition.at > now
             ):
                 times.append(record.wake_condition.at)
-            if isinstance(record, Belief) and record.valid_until and record.valid_until > now:
-                times.append(record.valid_until)
+            if isinstance(record, Belief):
+                times.extend(
+                    boundary
+                    for boundary in (record.valid_from, record.valid_until)
+                    if boundary is not None and boundary > now
+                )
         return min(times) if times else None
 
     async def serve(self, commands: AsyncIterator[AuthenticatedCommand]) -> RunSummary:
@@ -1210,16 +1229,7 @@ class Kernel:
                 if eof or self._stopped:
                     break
                 self._changed.clear()
-                deadline = self._next_wake()
-                waiters = [asyncio.create_task(self._wait_change())]
-                if deadline:
-                    waiters.append(asyncio.create_task(self._wait_until(deadline)))
-                try:
-                    await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-                finally:
-                    for task in waiters:
-                        task.cancel()
-                    await asyncio.gather(*waiters, return_exceptions=True)
+                await self._wait_change()
             if reader.done():
                 reader.result()
             await self.stop()
