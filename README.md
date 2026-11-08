@@ -1,6 +1,6 @@
 # SGP Python SDK
 
-Typed signals, composable gates, and a record of which signals were let through, for Python agents.
+A Python SDK for agent systems: typed signals, gates that decide which signals reach which agent, and a record of every decision.
 
 Multi-agent systems degrade when every event reaches every agent: context fills
 with noise, stale information displaces relevant state, and one bad output can
@@ -18,30 +18,28 @@ advantage over simple rules, production task quality, or inference savings.
 
 ## Install
 
-The first PyPI release has not been published yet. Install the current alpha
-from the verified commit used for the `0.1.0` release candidate:
+Install this experimental candidate from the tested Git code snapshot below,
+including the executive kernel. No PyPI publication is part of this delivery:
 
 ```bash
-pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
+pip install "signal-gating @ git+https://github.com/signalgatingprotocol/python-sdk@971bd71ce7970961194f73dcb572003aac4ff365"
 ```
-
-After the first release, the stable install command will be
-`pip install signal-gating`.
 
 For LLM-backed agents (the optional `openai` client):
 
 ```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
+pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@971bd71ce7970961194f73dcb572003aac4ff365"
 ```
 
 For OpenTelemetry export:
 
 ```bash
-pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
+pip install "signal-gating[otel] @ git+https://github.com/signalgatingprotocol/python-sdk@971bd71ce7970961194f73dcb572003aac4ff365"
 ```
 
-The pinned commit makes installs reproducible. See [CHANGELOG.md](CHANGELOG.md)
-for the release-candidate scope and stability notes.
+All three commands use the same code revision. This is a Git installation, not
+a claim of PyPI availability. See [CHANGELOG.md](CHANGELOG.md) for the
+release-candidate scope and stability notes.
 
 ## Quick Start
 
@@ -95,13 +93,42 @@ critical_incidents_preserved=3/3
 result=PASS
 ```
 
-The scenario sends six low-priority alerts and two exact copies of three
-critical incidents through real `by_priority` and `deduplicate` gates. It
+The scenario sends six low-priority alerts and three critical incidents, each
+one sent twice, through real `by_priority` and `deduplicate` gates. It
 derives each drop count from SDK trace spans and records 75% fewer handler
 invocations than the ungated 12-alert baseline while preserving all three
 unique critical incidents. `PASS` requires every expected fixture metric to
 match. The fixture is intentionally small and exact; it is a behavioral proof,
 not a throughput, token, latency, or cost benchmark.
+
+## Experimental executive kernel
+
+The opt-in `signal_gating.executive` API adds durable goals, bounded worker
+episodes, scoped local actions, evidence verification, owner controls and crash
+recovery. Run its credential-free installed scenario from any directory:
+
+```bash
+EXECUTIVE_DEMO_DIR="$(mktemp -d)"
+signal-gating-executive demo --store "$EXECUTIVE_DEMO_DIR/release"
+signal-gating-executive inspect --store "$EXECUTIVE_DEMO_DIR/release/store" --json
+```
+
+The JSON evaluation reports `passed: true`, completed goal IDs and zero
+`forbidden_dispatches` for this synthetic fixture. It makes no provider calls
+and does not establish model quality or production savings. Real OpenAI work
+needs the `llm` extra, an explicitly named model/credential reference, finite
+budgets, trusted per-call bounds and `--live`; paid/live behavior remains
+unverified. The kernel mediates its registered calls inside the trusted host
+process. Configured commands remain trusted code, and unknown consequential
+effects require reconciliation rather than blind retries.
+
+Follow the [executive operator guide](docs/executive-kernel.md) for owner
+bootstrap, a real local goal, grants, exact approvals, correction,
+pause/restart/resume, inspection, uncertainty resolution and portable export.
+The API is experimental and separate from the stable compatibility core.
+Adaptive policy promotion and federation are not in this release. See
+[delivery status](docs/superpowers/plans/2026-11-07-executive-kernel-status.md)
+for implementation and review coverage.
 
 ## Decision-model gating
 
@@ -214,7 +241,9 @@ Also included:
   can be a legitimate read. Review findings against the actual tool contract.
 - **Policy as code** (`signal_gating.policy`): declarative YAML
   policies, first-match-wins rules, versioning, and would-allow/would-deny
-  decision labels. Dry-run labels do not guarantee non-enforcing delivery.
+  decision labels. A `require_approval` rule invokes `engine.approver` even
+  below the auto-approve ceiling; without a callback, the call stays blocked.
+  Dry-run labels do not guarantee non-enforcing delivery.
 - **Agent Skills compatibility** (`signal_gating.skills`): export SGP
   tool surfaces as skills, load installed skills with risk
   classification. Includes the `sgp-control` skill text.
@@ -653,11 +682,8 @@ log for signal-carrying mesh events.
 ### LLM-backed agents (Hermes)
 
 `LLMAgent` connects an agent to an OpenAI-compatible model server: Nous
-Hermes, or any OpenAI-compatible server. Install the extra:
-
-```bash
-pip install "signal-gating[llm] @ git+https://github.com/signalgatingprotocol/python-sdk@8ff4299caa57bc2c038fbb7557a3731cf3307731"
-```
+Hermes, or any OpenAI-compatible server. Install the [`llm` extra](#install)
+before running this example:
 
 ```python
 from signal_gating import Mesh, Signal
@@ -846,8 +872,8 @@ bit-rot) before replay. The digest is keyless, so it is not a cryptographic
 signature; to make a persisted trajectory tamper-evident against a motivated
 actor, sign or HMAC the file with a key the verifier holds out of band.
 
-A trajectory is more than readable: its signal-carrying receipts are
-**reconstructable**. Each receipt stores the full signal wire envelope, so a run
+A trajectory can be rebuilt from its receipts. Each receipt stores the full
+signal wire envelope, so a run
 persisted to disk reloads as verifiable receipts and exact typed signals. In a
 fresh process, import the modules that define your signal subclasses before
 replay so their wire names are registered; strict replay raises
@@ -887,7 +913,7 @@ structured `intercepted` and `edge_rejected` receipts for blocked attempts.
 
 ### Wire format & durability
 
-Signals serialize to a self-describing JSON envelope and reconstruct as their **original subclass**:
+Signals serialize to a self-describing JSON envelope and reconstruct as their original subclass:
 the foundation for persistence, durable replay, and crossing process or network
 boundaries. Subclasses register themselves automatically when their defining
 module is imported; no manual registration boilerplate:

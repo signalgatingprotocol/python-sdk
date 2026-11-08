@@ -1,0 +1,19 @@
+{
+  "scope": "synthetic_fixture",
+  "entrypoint": "python -m signal_gating.executive demo --store <empty-directory>",
+  "goal": "Prepare a local reviewed release preserving Python 3.10. Deployment requires separate authorization.",
+  "steps": [
+    "Owner creates revision 1 and makes three legitimate corrections to revision 4; worker starts a delayed proposal.",
+    "Owner commits and acknowledges revision 5 with a versioned hard Python 3.10 requirement and required check.",
+    "The delayed proposal dropping 3.10 returns with revision 4 in its read set; a durable stale receipt fences it without dispatch.",
+    "A real unrelated arithmetic-test output remains private and available; compatibility is still unproven.",
+    "Three equivalent log events retain provenance and produce two coalescing receipts without losing the commitment.",
+    "Urgent owner correction revokes the task token and pauses the retained frame with a lost-reply local effect unresolved.",
+    "Reopen the kernel; pause, budget, hard requirement and commitment survive; unresolved effects cannot be dispatched again.",
+    "Independent no-effect lookup reconciles the staging effect; explicit owner resume provides current requirements, artifacts and compatibility gap.",
+    "Worker drafts the repair; owner shares current refs and approves local write/check; independent verification plus owner artifact review completes preparation."
+  ],
+  "compatibility_evidence": "Static Python 3.10 grammar parsing plus fixture execution on the current interpreter. This is not a real interpreter matrix.",
+  "data": "The installed demo embeds minimal project strings and never reads this checkout example.",
+  "limits": "No live model, paid calls, credentials, network, messages, publication or deployment. Fixture semantics only; no model-quality, savings, security or exactly-once claim."
+}

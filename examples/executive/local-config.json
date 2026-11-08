@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "owner": {
+    "schema_version": 1,
+    "id": "11111111111111111111111111111111",
+    "revision": 1,
+    "created_at": "2026-11-08T02:22:07.299293Z",
+    "kind": "principal",
+    "name": "Local owner",
+    "trust_domain": "local",
+    "authenticated_origin": "local-config",
+    "roles": [
+      "owner"
+    ]
+  },
+  "bootstrap_owner": true,
+  "bootstrap_grants": [],
+  "workers": [
+    {
+      "schema_version": 1,
+      "id": "fixture",
+      "kind": "fixture",
+      "principal": null,
+      "model": null,
+      "api_key_env": null,
+      "context_token_limit": 32768,
+      "max_output_tokens": 128,
+      "token_counter_id": "utf8-bytes-v1",
+      "framing_tokens_reserved": 256,
+      "prices": null
+    }
+  ],
+  "workspace": {
+    "schema_version": 1,
+    "root": ".",
+    "readable_paths": [
+      "."
+    ],
+    "writable_paths": [],
+    "named_checks": [],
+    "allow_symlinks": false
+  },
+  "verifier_ids": [],
+  "approver_ids": [],
+  "verifier_principal": null,
+  "max_active_episodes": 2,
+  "episode_timeout_seconds": 120.0,
+  "max_output_tokens": 2048,
+  "context_token_limit": 8192,
+  "framing_tokens_reserved": 256,
+  "max_signal_bytes": 65536,
+  "max_artifact_bytes": 8388608,
+  "identical_failure_limit": 2,
+  "verification_repair_rounds": 2,
+  "max_queued_ordinary_items": 10000,
+  "strict_money": true,
+  "scheduler": {
+    "schema_version": 1,
+    "policy_version": "deterministic-v1",
+    "control_batch_size": 64,
+    "reconciliation_quota": 4,
+    "urgent_quota": 2,
+    "ordinary_quota": 1,
+    "aging_interval_seconds": 60.0,
+    "max_aging_points": 100,
+    "urgent_deadline_seconds": 60.0,
+    "control_overload_seconds": 10.0
+  }
+}

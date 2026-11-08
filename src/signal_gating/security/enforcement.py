@@ -77,7 +77,11 @@ class AuditRecord:
 
 
 class PolicyEngine:
-    """Fail-closed tool-call authorization."""
+    """Fail-closed tool-call authorization.
+
+    Approval callbacks must return True or False. Other return types are
+    denied and audited.
+    """
 
     def __init__(
         self,
@@ -120,6 +124,21 @@ class PolicyEngine:
                 f"{self.max_auto_approve.name}",
             )
 
+        return self._require_approval(
+            tool_name, arguments, agent_name, risk,
+            f"risk {risk.level.name} exceeds auto-approve ceiling "
+            f"{self.max_auto_approve.name}",
+        )
+
+    def _require_approval(
+        self,
+        tool_name: str,
+        arguments: dict[str, object] | None,
+        agent_name: str,
+        risk: ToolRisk,
+        reason: str,
+    ) -> Decision:
+        """Request approval for a registered tool, regardless of its risk ceiling."""
         if self.approver is not None and not self.dry_run:
             # Copy only for an approval callback, including mutable leaves.
             # Custom objects retain their __deepcopy__ hook's copy semantics.
@@ -129,12 +148,16 @@ class PolicyEngine:
                     arguments=deepcopy(arguments) if arguments is not None else {},
                     risk=risk,
                     agent_name=agent_name,
-                    reason=(
-                        f"risk {risk.level.name} exceeds auto-approve ceiling "
-                        f"{self.max_auto_approve.name}"
-                    ),
+                    reason=reason,
                 )
             )
+            if type(approved) is not bool:
+                return self._record(
+                    tool_name, agent_name, risk.level,
+                    Decision.DENY,
+                    f"approval callback returned {type(approved).__name__}; "
+                    "return True or False",
+                )
             if approved:
                 return self._record(
                     tool_name, agent_name, risk.level,
@@ -149,8 +172,10 @@ class PolicyEngine:
         return self._record(
             tool_name, agent_name, risk.level,
             Decision.REQUIRE_APPROVAL,
-            f"risk {risk.level.name} exceeds auto-approve ceiling "
-            f"{self.max_auto_approve.name}; no approver configured",
+            f"{reason}; " + (
+                "approval not requested in dry run"
+                if self.dry_run else "no approver configured"
+            ),
         )
 
     def _record(

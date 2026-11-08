@@ -32,9 +32,11 @@ dependencies = [
 
 [project.scripts]
 signal-gating-demo = "signal_gating.demo:main"
+signal-gating-executive = "signal_gating.executive.cli:main"
 
 [project.optional-dependencies]
 dev = [
+    "hatchling",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
@@ -58,8 +60,12 @@ Issues = "https://github.com/signalgatingprotocol/python-sdk/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/signal_gating"]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["/.superpowers"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]

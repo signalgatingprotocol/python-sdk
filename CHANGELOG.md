@@ -6,6 +6,8 @@ documented stable core may still change during the `0.x` series.
 
 ## Unreleased
 
+- Experimental executive kernel (`signal_gating.executive`): durable goals, bounded worker episodes, scoped local actions, evidence verification, owner controls, and crash recovery. Use is optional, and the kernel stays separate from the stable core in `signal_gating.core`. See `docs/executive-kernel.md`.
+
 ## 0.1.0 - release candidate
 
 The first public alpha establishes the SDK's signal-routing model and a stable

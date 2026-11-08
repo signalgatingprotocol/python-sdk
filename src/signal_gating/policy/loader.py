@@ -130,9 +130,12 @@ def engine_from_policy(
 ) -> PolicyEngine:
     """Build a PolicyEngine wired to a declarative policy.
 
-    The policy's rule order is preserved by wrapping decide() as the
-    approver-adjacent check: rule matches for allow/deny short-circuit,
-    require_approval delegates to the engine's approver (or denies).
+    The first matching policy rule wins. Allow still respects the engine's
+    registry and risk ceiling; deny blocks without consulting an approver.
+    Require-approval rules invoke ``engine.approver`` even below the ceiling.
+    Unregistered tools are denied, and absent approvers or dry runs leave
+    approval-required calls pending. YAML approver names are informational;
+    the application configures the engine's single approval callback.
     """
     engine = PolicyEngine(
         max_auto_approve=policy.max_auto_approve,
@@ -154,16 +157,16 @@ def engine_from_policy(
         verdict = policy.decide(tool_name, agent_name, level)
         if verdict is Decision.ALLOW:
             return base_evaluate(tool_name, arguments, agent_name)
-        # Policy deny / require_approval short-circuits before approver.
-        if verdict is Decision.REQUIRE_APPROVAL and engine.approver is None:
-            return engine._record(
-                tool_name, agent_name, level or RiskLevel.UNKNOWN,
-                Decision.REQUIRE_APPROVAL,
+        if verdict is Decision.REQUIRE_APPROVAL:
+            if risk is None:
+                return base_evaluate(tool_name, arguments, agent_name)
+            return engine._require_approval(
+                tool_name, arguments, agent_name, risk,
                 f"policy {policy.name!r} v{policy.version} requires approval",
             )
         return engine._record(
             tool_name, agent_name, level or RiskLevel.UNKNOWN,
-            Decision.DENY if verdict is Decision.DENY else Decision.REQUIRE_APPROVAL,
+            Decision.DENY,
             f"policy {policy.name!r} v{policy.version} rule matched",
         )
 
