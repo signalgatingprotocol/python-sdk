@@ -23,10 +23,19 @@ from .adapters.openai_worker import OpenAIWorker
 from .config import KernelConfig
 from .context import UTF8ByteCounter
 from .errors import ExecutiveError, StoreError
-from .inspection import inspect_state, operator_view
+from .inspection import export_goal, inspect_state, operator_view
 from .kernel import Kernel, SystemClock
 from .messages import AuthenticatedCommand, Command, CreateGoal, EpisodeResult, ResumeGoal
-from .records import ContextPacket, DecisionReceipt, Goal, KernelView, Limits, Usage, WakeCondition
+from .records import (
+    ContextPacket,
+    DecisionReceipt,
+    Goal,
+    KernelView,
+    Limits,
+    Principal,
+    Usage,
+    WakeCondition,
+)
 from .store import DATABASE_NAME, Store
 from .workers import Worker
 
@@ -420,12 +429,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit("evaluation", evaluation=result.model_dump(mode="json", exclude={"receipts"}))
             return 0 if result.passed else 3
         if args.operation == "export":
-            _emit(
-                "unavailable",
-                reason_code="export_unavailable",
-                detail="Integration is supplied by Task 18",
-            )
-            return 2
+            # Trusted local filesystem operator context, as for inspect. The
+            # owner comes only from persisted state, never a JSON assertion or
+            # config/credential lookup. No second writer is acquired.
+            with Store.open_readonly(args.store) as store:
+                records = store.view().records
+                goal = next((r for r in records if isinstance(r, Goal) and r.id == args.goal), None)
+                principal = next(
+                    (
+                        r
+                        for r in records
+                        if isinstance(r, Principal) and goal is not None and r.id == goal.owner_id
+                    ),
+                    None,
+                )
+                if principal is None:
+                    raise OperatorInputError("Goal export access denied.")
+                value = export_goal(store, args.goal, principal=principal)
+            # Refuse an existing destination, including symlinks. Export must
+            # never overwrite store/config/credential or unrelated local files.
+            descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(value, stream, sort_keys=True, ensure_ascii=True)
+                stream.write("\n")
+            _emit("exported", goal_id=args.goal)
+            return 0
         if args.operation == "run":
             return asyncio.run(_run(args))
         if args.operation == "init":

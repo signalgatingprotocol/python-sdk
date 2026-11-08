@@ -29,7 +29,7 @@ from .errors import (
     InvalidTransition,
     StoreError,
 )
-from .inspection import inspect_state
+from .inspection import export_contract_schemas, export_goal, inspect_state
 from .intake import Intake
 from .kernel import Clock, Kernel, SystemClock
 from .messages import (
@@ -113,6 +113,8 @@ __all__ = [
     "Kernel",
     "SystemClock",
     "inspect_state",
+    "export_contract_schemas",
+    "export_goal",
     "recover",
     "ContextAssembler",
     "ContextBudgetInsufficient",

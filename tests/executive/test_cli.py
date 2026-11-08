@@ -213,15 +213,54 @@ def test_resume_is_explicit_and_does_not_duplicate_commitments(tmp_path):
         session.close()
 
 
-@pytest.mark.parametrize("kind", ["export"])
-def test_deferred_commands_are_clear_and_do_not_create_store(tmp_path, kind):
-    args = [kind, "--store", str(tmp_path / "store")]
-    if kind == "export":
-        args += ["--goal", goal().id, "--output", str(tmp_path / "export")]
+def test_export_missing_store_fails_without_creating_store_or_output(tmp_path):
+    args = [
+        "export",
+        "--store",
+        str(tmp_path / "store"),
+        "--goal",
+        goal().id,
+        "--output",
+        str(tmp_path / "export"),
+    ]
     result = invoke(args, cwd=tmp_path)
     assert result.returncode == 2
-    assert json.loads(result.stdout)["reason_code"] == f"{kind}_unavailable"
+    assert json.loads(result.stdout)["reason_code"] == "startup_error"
     assert not (tmp_path / "store").exists()
+    assert not (tmp_path / "export").exists()
+
+
+def test_export_reads_snapshot_during_writer_without_loading_config_or_credentials(tmp_path):
+    config, goal_file = files(tmp_path)
+    session = Session(arguments(tmp_path, config, goal_file), tmp_path)
+    try:
+        before = session.wait("idle")
+        config.unlink()
+        output = tmp_path / "portable.json"
+        result = invoke(
+            [
+                "export",
+                "--store",
+                str(tmp_path / "store"),
+                "--goal",
+                goal().id,
+                "--output",
+                str(output),
+            ],
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        value = json.loads(output.read_text())
+        assert value["schema_version"] == 1
+        assert value["authority"] == "observation_only"
+        assert value["principal_id"] == owner().id
+        assert "API_KEY_VALUE" not in output.read_text()
+        assert json.loads(result.stdout)["status"] == "exported"
+        session.send({"kind": "inspect"})
+        after = session.wait("inspect")
+        assert after["sequence"] == before["sequence"]
+    finally:
+        session.close()
 
 
 def test_live_requires_opt_in_and_explicit_budgets_before_client(tmp_path):
