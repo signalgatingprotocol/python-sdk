@@ -85,6 +85,7 @@ _RETRYABLE_VERIFICATION = {
 
 @dataclass
 class _VerificationJob:
+    sequence: int
     deadline: datetime
     configuration: str
     validity_boundary: datetime | None
@@ -183,6 +184,7 @@ class Kernel:
             self._shutdown = asyncio.Event()
             self._verification_tasks: set[asyncio.Task[CommitBatch]] = set()
             self._verification_jobs: dict[str, _VerificationJob] = {}
+            self._verification_retries: set[str] = set()
             self._verification_attempts: dict[str, tuple[int, str, datetime | None]] = {}
             self._verification_progress = self.store.view().sequence
             self._active: dict[str, asyncio.Task[None]] = {}
@@ -715,6 +717,7 @@ class Kernel:
             if not job.task.done():
                 continue
             del self._verification_jobs[identifier]
+            self._verification_retries.discard(identifier)
             result = job.task.result()
             if self._stopped or result is None:
                 continue
@@ -747,6 +750,11 @@ class Kernel:
             self._commit(result)
             response = result.response_receipt
             if response is not None and response.reason_code in _RETRYABLE_VERIFICATION:
+                # Other stale-attempt receipts change full snapshots without
+                # advancing ordinary progress. Retry that real interference once
+                # in isolation; our own newly committed receipt is not a trigger.
+                if state.sequence != job.sequence:
+                    self._verification_retries.add(identifier)
                 subject = records_by_id(state).get(identifier)
                 if isinstance(subject, ExecutiveSignal):
                     if identifier not in self._pending_signals:
@@ -803,22 +811,32 @@ class Kernel:
         )
 
     def _verify(self) -> None:
-        # Retry once per changed state/configuration/validity boundary, never on
-        # our own stale receipt. A new explicit cycle also permits another attempt.
+        # Ordinary changed-state/configuration/time retries remain concurrent.
+        # If only audit interference exhausted a key, retry in isolation once
+        # other jobs settle. Our own stale receipt never grants another try.
         key = (
             self._verification_progress,
             self.verification._configuration(),
             self._verification_boundary(),
         )
+        self._verification_retries.intersection_update(
+            identifier
+            for identifier, attempted in self._verification_attempts.items()
+            if attempted == key
+        )
+        if self._verification_retries.intersection(self._verification_jobs):
+            return
         for identifier in (*self._pending_signals, *sorted(self._verification_due)):
             if (
                 sum(not task.done() for task in self._verification_tasks)
                 >= self.config.max_active_episodes
             ):
                 break
+            retry = identifier in self._verification_retries
             if (
                 identifier in self._verification_jobs
-                or self._verification_attempts.get(identifier) == key
+                or (self._verification_attempts.get(identifier) == key and not retry)
+                or (retry and self._verification_jobs)
             ):
                 continue
             state = self.store.view()
@@ -849,7 +867,11 @@ class Kernel:
             deadline = self.clock.now() + timedelta(seconds=self.config.episode_timeout_seconds)
             job = asyncio.create_task(self._verification_call(child, deadline))
             job.add_done_callback(lambda _: self._changed.set())
-            self._verification_jobs[identifier] = _VerificationJob(deadline, key[1], key[2], job)
+            self._verification_jobs[identifier] = _VerificationJob(
+                state.sequence, deadline, key[1], key[2], job
+            )
+            if retry:
+                break
 
     def _action_slots(self) -> int:
         occupied = self.dispatcher._active_ids | {

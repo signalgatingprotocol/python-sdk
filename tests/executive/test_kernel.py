@@ -1841,3 +1841,87 @@ async def test_verification_delivery_reprepares_when_proof_expires_after_prepara
         assert records(kernel, Goal)[0].status == "active"
         assert not kernel._pending_signals
         assert not kernel.clock.waiters
+
+
+async def test_concurrent_stale_requests_complete_without_another_owner_cycle(tmp_path):
+    from uuid import uuid4
+
+    from signal_gating.executive import ExecutiveSignal
+    from signal_gating.executive.verification import ArtifactVerifier
+
+    a, b = uuid4().hex, uuid4().hex
+    calls = {a: 0, b: 0}
+    started = {a: asyncio.Event(), b: asyncio.Event()}
+    release = {a: asyncio.Event(), b: asyncio.Event()}
+    stale = {a: asyncio.Event(), b: asyncio.Event()}
+
+    class Verifier:
+        async def verify(self, selected, state):
+            identifier = selected.id
+            calls[identifier] += 1
+            started[identifier].set()
+            if calls[identifier] == 1:
+                await release[identifier].wait()
+            elif identifier == a and calls[a] == 2:
+                # If concurrent retries are admitted, B's stale receipt arrives
+                # after A2's snapshot. A serialized retry instead starts afterward.
+                await stale[b].wait()
+            return ArtifactVerifier(kernel.artifacts, principal=kernel.verifier_principal)._result(
+                selected, state, "accept", "controlled_valid_result"
+            )
+
+    async with open_kernel(
+        tmp_path, FunctionWorker(completion), verifiers={"controlled-v1": Verifier()}
+    ) as kernel:
+        original_commit = kernel._commit
+
+        def observe_stale(batch):
+            result = original_commit(batch)
+            receipt = batch.response_receipt
+            if receipt and receipt.reason_code in {
+                "late_verification_result",
+                "verification_snapshot_changed",
+            }:
+                claim = next(
+                    signal
+                    for signal in records(kernel, ExecutiveSignal)
+                    if signal.id == receipt.subject_id
+                )
+                stale[claim.payload["proposal"]["criterion_ids"][0]].set()
+            return result
+
+        kernel._commit = observe_stale
+        await kernel.submit(
+            CreateGoal(goal=new_goal(criteria=(criterion(id=a, verifier_id="controlled-v1"),))),
+            principal=owner(),
+        )
+        running = asyncio.create_task(kernel.run_until_idle())
+        try:
+            await asyncio.wait_for(started[a].wait(), 1)
+            await kernel.submit(
+                CreateGoal(
+                    goal=new_goal(
+                        id=uuid4().hex,
+                        criteria=(criterion(id=b, verifier_id="controlled-v1"),),
+                    )
+                ),
+                principal=owner(),
+            )
+            await asyncio.wait_for(started[b].wait(), 1)
+            release[a].set()
+            await asyncio.wait_for(stale[a].wait(), 1)
+            release[b].set()
+            await asyncio.wait_for(stale[b].wait(), 1)
+            await asyncio.wait_for(running, 1)
+            assert all(goal.status == "completed" for goal in records(kernel, Goal))
+            assert all(task.status == "completed" for task in records(kernel, TaskFrame))
+            assert sorted(calls.values()) == [2, 3]
+            assert not kernel._pending_signals
+            assert not kernel._verification_jobs
+            assert not kernel.clock.waiters
+            assert kernel.store.view() == rebuild(kernel.store.events())
+        finally:
+            for event in (*release.values(), *stale.values()):
+                event.set()
+            await kernel.stop()
+            await asyncio.gather(running, return_exceptions=True)
