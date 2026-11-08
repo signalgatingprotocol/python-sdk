@@ -205,10 +205,23 @@ class ArtifactStore:
             raise StoreError("artifact_too_large", "Artifact exceeds configured byte limit")
 
     def put(
-        self, data: bytes, *, principal: Principal, goal_id: str, media_type: str
+        self,
+        data: bytes,
+        *,
+        principal: Principal,
+        goal_id: str,
+        media_type: str,
+        publication_source: str = "artifact-store",
     ) -> ArtifactRef:
-        """Stage bytes, then journal a new scoped reference; failures leave collectible bytes."""
+        """Journal a scoped reference with trusted host publication provenance.
+
+        publication_source is coordinator/adapter configuration, never worker
+        content. Staged worker drafts do not acquire this creation-event metadata.
+        It does not replace current access, validity or byte-integrity checks.
+        """
         self.store.check_writable()
+        if not isinstance(publication_source, str) or not publication_source:
+            raise ValueError("Publication source must be a nonempty trusted string")
         goal = self._owner_goal(principal, goal_id)
         self._limit(data)
         ref = self._stage(data, principal, goal, media_type)
@@ -216,7 +229,7 @@ class ArtifactStore:
             event = JournalEvent(
                 sequence=1,
                 event_type="state.changed",
-                producer_id="artifact-store",
+                producer_id=publication_source,
                 principal_id=principal.id,
                 subject=Ref(id=ref.id, kind="artifact"),
                 payload={"records": [ref.model_dump(mode="json")]},

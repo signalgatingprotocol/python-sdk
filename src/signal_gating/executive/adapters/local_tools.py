@@ -46,14 +46,17 @@ from ..records import (
 from ..store import Store
 
 _RECEIPT = "application/vnd.sgp.workspace-receipt-v1+json"
+_PUBLICATION_SOURCE = "local-workspace-v2"
 _MISSING = "missing"
 # Static package-owned launcher: no shell, interpolation, imports from cwd or
 # checkout-relative executable. -I/-S isolates this plumbing from host startup.
 # Closing the sole inherited directory descriptor prevents leaking it to checks.
-_LAUNCHER_VERSION = "fchdir-exec-v1"
+_LAUNCHER_VERSION = "fchdir-exec-env-v2"
 _LAUNCHER = (
-    "import os,sys; fd=int(sys.argv[1]); os.fchdir(fd); os.close(fd); "
-    "os.execve(sys.argv[2],sys.argv[2:],dict(os.environ))"
+    "import json,os,sys; env=json.load(sys.stdin); "
+    "fd=int(sys.argv[1]); os.fchdir(fd); os.close(fd); "
+    "null=os.open(os.devnull,os.O_RDONLY); os.dup2(null,0); os.close(null); "
+    "os.execve(sys.argv[2],sys.argv[2:],env)"
 )
 
 
@@ -91,9 +94,9 @@ def _signature(info: os.stat_result) -> tuple[int, ...]:
 class StoreArtifacts:
     """Single-writer bridge. Never use from a pool/thread or inside a transaction.
 
-    Owner-origin receipt artifacts are trusted adapter observations. Worker drafts
-    cannot forge that origin. Task13 must independently re-read their bytes/current
-    ACLs and input digests, and Task14 must share evidence with configured verifiers.
+    Receipt provenance comes from adapter-owned creation journal events, not owner
+    origin, MIME or content claims (worker drafts also have owner origin). Task13
+    consumes receipts() then checks action lineage/current ACLs/inputs independently.
     """
 
     def __init__(self, store: Store) -> None:
@@ -149,16 +152,48 @@ class StoreArtifacts:
         principal = self._owner(action)
         return reference(
             self.artifacts.put(
-                data, principal=principal, goal_id=action.goal_id, media_type=media_type
+                data,
+                principal=principal,
+                goal_id=action.goal_id,
+                media_type=media_type,
+                publication_source=_PUBLICATION_SOURCE,
             )
         )
 
     def receipts(self, action: ActionRecord) -> tuple[tuple[Ref, dict[str, Any]], ...]:
+        """Authenticate adapter publication, then read current scoped receipt bytes.
+
+        Public verifier hook: creation-event provenance survives ACL revisions,
+        but validity/access/integrity use current ArtifactStore reads. The caller
+        must additionally bind the receipt body to the action/check/configuration.
+        Generic put(), accepted drafts and body claims cannot supply provenance.
+        """
         principal = self._owner(action)
+        published: set[str] = set()
+        for event in self.store.events():
+            if (
+                event.event_type != "state.changed"
+                or event.producer_id != _PUBLICATION_SOURCE
+                or event.principal_id != principal.id
+                or event.subject is None
+                or event.subject.revision != 1
+                or event.subject.kind != "artifact"
+            ):
+                continue
+            for image in event.model_dump(mode="json")["payload"]["records"]:
+                if (
+                    image.get("kind") == "artifact"
+                    and image.get("id") == event.subject.id
+                    and image.get("revision") == 1
+                    and image.get("origin") == principal.id
+                    and image.get("scope", {}).get("goal_id") == action.goal_id
+                ):
+                    published.add(image["id"])
         found = []
         for current in self.store.view().records:
             if (
                 isinstance(current, ArtifactRef)
+                and current.id in published
                 and current.valid
                 and current.origin == principal.id
                 and current.media_type == _RECEIPT
@@ -235,6 +270,7 @@ class LocalWorkspace:
             "artifact_store": str(artifacts.store.root) if artifacts else None,
             "implementation": "local-workspace-v1",
             "launcher": _LAUNCHER_VERSION,
+            "publication_source": _PUBLICATION_SOURCE,
         }
         self.configuration_digest = _digest(_json(config_identity))
         self._pairs: tuple[tuple[CapabilitySpec, ExecutionAdapter], ...] = tuple(
@@ -479,8 +515,10 @@ class LocalWorkspace:
             check = spec.id == "run_check"
             costs = [c.maximum_charge_microunits for c in self.checks.values()]
             cost = (
-                None
-                if check and (not costs or any(c is None for c in costs))
+                0
+                if not check
+                else None
+                if not costs or any(c is None for c in costs)
                 else max((c for c in costs if c is not None), default=0)
             )
             duration = (
@@ -880,12 +918,21 @@ class _LocalAdapter:
                     str(root),
                     *config.argv,
                     pass_fds=(root,),
-                    env=dict(config.environment),
-                    stdin=asyncio.subprocess.DEVNULL,
+                    env={},
+                    stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     start_new_session=True,
                 )
+
+            async def send_environment() -> None:
+                assert process is not None and process.stdin is not None
+                # Pass exact original values privately as pipe data, not argv or
+                # the launcher's Python-startup-mutated os.environ. EOF frames it.
+                process.stdin.write(_json(dict(config.environment)))
+                await process.stdin.drain()
+                process.stdin.close()
+                await process.stdin.wait_closed()
 
             async def wait_process() -> int:
                 nonlocal reason
@@ -905,6 +952,7 @@ class _LocalAdapter:
                 asyncio.create_task(wait_process()),
                 asyncio.create_task(pump(process.stdout)),
                 asyncio.create_task(pump(process.stderr)),
+                asyncio.create_task(send_environment()),
             ]
             results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=config.timeout_seconds)
             returncode = results[0]

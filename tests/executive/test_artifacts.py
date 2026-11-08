@@ -75,6 +75,44 @@ def test_put_bytes_and_reference_are_private_atomic_and_replayable(store: Store)
     assert ArtifactStore(store).read(ref, principal=owner(), goal_id=GOAL_ID) == b"evidence"
 
 
+def test_trusted_publication_source_is_creation_metadata_not_artifact_content(store: Store) -> None:
+    artifacts = ArtifactStore(store)
+    ordinary = put(artifacts)
+    adapter = artifacts.put(
+        b"evidence",
+        principal=owner(),
+        goal_id=GOAL_ID,
+        media_type="text/plain",
+        publication_source="trusted-adapter-fixture",
+    )
+    publications = {
+        event.subject.id: event
+        for event in store.events()
+        if event.subject is not None and event.subject.id in {ordinary.id, adapter.id}
+    }
+    assert publications[ordinary.id].producer_id == "artifact-store"
+    assert publications[adapter.id].producer_id == "trusted-adapter-fixture"
+    assert publications[adapter.id].payload["records"][0]["revision"] == 1
+    assert ordinary.digest == adapter.digest and ordinary.id != adapter.id
+    assert not artifacts._staged
+    assert rebuild(store.events()) == store.view()
+
+
+def test_invalid_publication_source_is_refused_before_byte_mutation(store: Store) -> None:
+    artifacts = ArtifactStore(store)
+    before = store.view()
+    with pytest.raises(ValueError, match="Publication source"):
+        artifacts.put(
+            b"evidence",
+            principal=owner(),
+            goal_id=GOAL_ID,
+            media_type="text/plain",
+            publication_source="",
+        )
+    assert store.view() == before
+    assert not artifacts.root.exists()
+
+
 @pytest.mark.parametrize("size,allowed", [(4, True), (5, False)])
 def test_byte_limit_is_enforced_before_writing(store: Store, size: int, allowed: bool) -> None:
     artifacts = ArtifactStore(store, max_artifact_bytes=4)

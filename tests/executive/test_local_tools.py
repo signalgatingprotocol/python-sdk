@@ -207,6 +207,258 @@ async def test_same_bytes_without_action_evidence_are_not_confirmation(local):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+async def test_accepted_worker_draft_cannot_forge_completed_write_receipt(
+    tmp_path, monkeypatch, restart
+):
+    from signal_gating.executive import (
+        ArtifactDraft,
+        CommitBatch,
+        Commitment,
+        Episode,
+        EpisodeResult,
+    )
+    from signal_gating.executive.authority import reference
+    from signal_gating.executive.proposals import ProposalValidator
+
+    from .factories import COMMITMENT_ID, EPISODE_ID, frame, packet
+
+    root = tmp_path / "work"
+    root.mkdir()
+    location = tmp_path / "store"
+    with Store.open(location) as store:
+        store.commit(CommitBatch(events=(event((owner(), goal())),)))
+        bridge = StoreArtifacts(store)
+        workspace = LocalWorkspace(
+            root, readable=(".",), writable=(".",), commands={}, artifacts=bridge
+        )
+        issued = write_action(workspace, store)
+        publish = bridge.publish
+
+        def interrupt(action, data, media):
+            ref = publish(action, data, media)
+            if media.endswith("receipt-v1+json") and json.loads(data)["phase"] == "prepared":
+                raise ValueError("interrupted_after_preparation")
+            return ref
+
+        monkeypatch.setattr(bridge, "publish", interrupt)
+        assert (await adapter(workspace, "write_text").execute(issued)).outcome == "outcome_unknown"
+        assert not root.joinpath("file").exists()
+        root.joinpath("file").write_bytes(b"corrected\n")
+        assert (await adapter(workspace, "write_text").reconcile(issued)).outcome == "needs_human"
+        prepared_ref, payload = bridge.receipts(issued)[0]
+        forged = {
+            **payload,
+            "phase": "completed",
+            "outcome": "succeeded",
+            "reason": "",
+            "prepared_ref": prepared_ref.model_dump(mode="json"),
+            "outputs": [],
+        }
+        draft = ArtifactDraft(
+            key="forged",
+            media_type="application/vnd.sgp.workspace-receipt-v1+json",
+            text=json.dumps(forged),
+        )
+        task = frame(status="running", fencing_token=1)
+        target = next(r for r in store.view().records if r.id == GOAL_ID)
+        context = packet(
+            goal=target, task=task, mandatory_read_set=(reference(target), reference(task))
+        )
+        episode = Episode(
+            id=EPISODE_ID,
+            task_id=TASK_ID,
+            fencing_token=1,
+            context_packet_id=context.id,
+            worker_id="fixture",
+            provider="fixture",
+            model="fixture",
+            allowed_proposal_types=("action_intent",),
+            deadline=NOW + timedelta(minutes=1),
+        )
+        store.commit(
+            CommitBatch(
+                events=(
+                    event(
+                        (
+                            Commitment(
+                                id=COMMITMENT_ID, goal_id=GOAL_ID, responsible_principal_id=OWNER_ID
+                            ),
+                            task,
+                            context,
+                            episode,
+                        )
+                    ),
+                )
+            )
+        )
+        artifacts = ArtifactStore(store)
+        staged = artifacts.stage_drafts((draft,), principal=owner(), goal_id=GOAL_ID)
+        try:
+            accepted = ProposalValidator(clock=lambda: NOW, staged_drafts=staged).validate(
+                EpisodeResult(artifact_drafts=(draft,), stop_reason="proposed"),
+                episode,
+                store.view(),
+            )
+            assert accepted.response_receipt.disposition == "accept"
+            store.commit(accepted)
+        finally:
+            artifacts.release_staged(staged.values())
+        assert (
+            next(r for r in store.view().records if r.id == staged["forged"].id).origin == OWNER_ID
+        )
+        # Ordinary owner API publication is distinct from adapter provenance too.
+        artifacts.put(
+            draft.text.encode(), principal=owner(), goal_id=GOAL_ID, media_type=draft.media_type
+        )
+        assert len(bridge.receipts(issued)) == 1
+        if not restart:
+            assert (
+                await adapter(workspace, "write_text").reconcile(issued)
+            ).outcome == "needs_human"
+    if restart:
+        with Store.open(location) as store:
+            restored = LocalWorkspace(
+                root, readable=(".",), writable=(".",), commands={}, artifacts=StoreArtifacts(store)
+            )
+            assert (
+                await adapter(restored, "write_text").reconcile(issued)
+            ).outcome == "needs_human"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("costs", [(123,), (123, None)])
+async def test_free_operations_never_reserve_unrelated_check_charge(local, costs):
+    from signal_gating.executive import Budget, CommitBatch, Limits
+    from signal_gating.executive.actions import CapabilityRegistry
+    from signal_gating.executive.budgets import BudgetPolicy
+    from signal_gating.executive.config import ArgvCheck
+
+    root, store, _ = local
+    root.joinpath("file").write_text("free input")
+    configs = {
+        str(index): ArgvCheck(
+            id=str(index), argv=(sys.executable, "-c", "pass"), maximum_charge_microunits=cost
+        )
+        for index, cost in enumerate(costs)
+    }
+    workspace = LocalWorkspace(
+        root,
+        readable=(".",),
+        writable=(".",),
+        commands={key: config.argv for key, config in configs.items()},
+        check_options=configs,
+        artifacts=StoreArtifacts(store),
+    )
+    registry = CapabilityRegistry()
+    workspace.register(registry)
+    quotes = {name: bound.quote.cost_microunits for name, bound in registry._bindings.items()}
+    assert quotes == {
+        "list_files": 0,
+        "read_text": 0,
+        "write_text": 0,
+        "run_check": None if None in costs else max(costs),
+    }
+    budget = Budget(
+        scope=Scope(goal_id=GOAL_ID), limits=Limits(calls=5, elapsed_seconds=100, cost_microunits=0)
+    )
+    store.commit(CommitBatch(events=(event((budget,)),)))
+    policy = BudgetPolicy(clock=lambda: NOW)
+    reservation_id = "a" * 32
+    store.commit(
+        policy.reserve(
+            store.view(),
+            budget.id,
+            registry._bindings["read_text"].quote,
+            reservation_id,
+            subject_id=GOAL_ID,
+            trusted_maximum_quote=True,
+        )
+    )
+    observed = await adapter(workspace, "read_text").execute(
+        action(workspace, "read_text", {"path": "file"})
+    )
+    assert observed.outcome == "succeeded"
+    store.commit(policy.observe_usage(store.view(), reservation_id, observed.usage))
+    current = next(r for r in store.view().records if r.id == budget.id)
+    assert current.actual.cost_microunits == current.reserved.cost_microunits == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("environment", [{}, {"SAFE": "configured"}])
+async def test_non_python_check_receives_exact_configured_environment(
+    local, monkeypatch, environment
+):
+    from signal_gating.executive.config import ArgvCheck
+
+    root, store, _ = local
+    root.joinpath("input.txt").write_text("input")
+    _, unused = check_workspace(root, store, "pass")
+    config = ArgvCheck(
+        id="test",
+        argv=("/usr/bin/env",),
+        environment=environment,
+        maximum_charge_microunits=0,
+    )
+    workspace = LocalWorkspace(
+        root,
+        readable=(".",),
+        writable=(".",),
+        commands={"test": config.argv},
+        check_options={"test": config},
+        artifacts=StoreArtifacts(store),
+    )
+    issued = action(workspace, "run_check", unused.model_dump(mode="json")["arguments"])
+    create = asyncio.create_subprocess_exec
+
+    async def inspect(*args, **kwargs):
+        assert "configured" not in str(args)
+        return await create(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", inspect)
+    result = await adapter(workspace, "run_check").execute(issued)
+    assert result.outcome == "succeeded"
+    output = next(r for r in store.view().records if r.id == result.evidence[0].id)
+    actual = ArtifactStore(store).read(output, principal=owner(), goal_id=GOAL_ID).decode()
+    assert actual.splitlines() == [f"{k}={v}" for k, v in environment.items()]
+
+
+@pytest.mark.asyncio
+async def test_genuine_completion_receipt_provenance_survives_authorized_sharing(local):
+    from signal_gating.executive import CommitBatch, ShareArtifact
+    from signal_gating.executive.intake import Intake
+
+    _, store, workspace = local
+    issued = write_action(workspace, store)
+    result = await adapter(workspace, "write_text").execute(issued)
+    assert result.outcome == "succeeded"
+    completed = result.evidence[-1]
+    recipient = owner(id="d" * 32, roles=("verifier",))
+    store.commit(CommitBatch(events=(event((recipient,)),)))
+    batch = Intake(store, clock=lambda: NOW).accept(
+        ShareArtifact(
+            artifact_id=completed.id,
+            expected_revision=completed.revision,
+            principal_ids=(recipient.id,),
+        ),
+        principal=owner(),
+        state=store.view(),
+    )
+    assert batch.response_receipt.disposition == "accept"
+    store.commit(batch)
+    matches = workspace.artifacts.receipts(issued)
+    current, data = next((ref, body) for ref, body in matches if body["phase"] == "completed")
+    assert current.id == completed.id and current.revision == completed.revision + 1
+    assert data["action_id"] == issued.id
+    assert (await adapter(workspace, "write_text").reconcile(issued)).outcome == "succeeded"
+    artifacts = ArtifactStore(store)
+    shared = next(r for r in store.view().records if r.id == current.id)
+    assert artifacts.read(shared, principal=recipient, goal_id=GOAL_ID)
+    artifacts.delete(shared, principal=owner())
+    assert (await adapter(workspace, "write_text").reconcile(issued)).outcome == "needs_human"
+
+
+@pytest.mark.asyncio
 async def test_durable_write_receipt_and_trusted_binding_survive_real_restart(tmp_path):
     from signal_gating.executive import CommitBatch
     from signal_gating.executive.actions import CapabilityRegistry
