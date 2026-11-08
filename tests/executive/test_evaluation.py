@@ -415,3 +415,201 @@ async def test_category_requirements_cannot_be_bypassed_by_arithmetic_completion
         assert result.summary.completed_goal_ids
         assert not result.passed
         assert any(failure.startswith("category_") for failure in result.failures)
+
+
+@pytest.mark.parametrize("termination", ["cancelled", "timeout"])
+async def test_started_cancelled_or_timed_out_invocation_retains_unknown_usage(
+    monkeypatch, termination
+):
+    import asyncio
+    from datetime import timedelta
+
+    import signal_gating.executive.evaluation as evaluation
+
+    started = asyncio.Event()
+
+    class DeadlineClock(evaluation._Clock):
+        async def wait_until(self, at):
+            await started.wait()
+            self.offset += max(timedelta(), at - self.now()) + timedelta(microseconds=1)
+
+    if termination == "timeout":
+        monkeypatch.setattr(evaluation, "_Clock", DeadlineClock)
+
+    class Interrupted:
+        async def run_episode(self, packet):
+            started.set()
+            if termination == "cancelled":
+                raise asyncio.CancelledError()
+            await asyncio.Event().wait()
+
+    report = await evaluate_cases(
+        cases()[:1], arm="executive", trials=1, worker_factory=Interrupted
+    )
+    result = report.results[0]
+    assert report.worker_calls >= 1
+    if termination == "cancelled":
+        assert report.worker_calls == 1
+    assert result.metrics["uncertain_reservations"] == report.worker_calls
+    assert len(result.usage_observations) == report.worker_calls
+    assert report.cost_status == "unknown"
+    assert all(
+        result.measurements[key] is None
+        for key in ("cost_microunits", "input_tokens", "output_tokens")
+    )
+    assert all(usage.calls == 1 for usage in result.usage_observations)
+
+
+async def test_inflight_usage_replaced_by_late_observation_without_double_count():
+    import asyncio
+
+    from signal_gating.executive.evaluation import _aggregate_usage, _Meter
+
+    from .factories import packet
+
+    started, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    observed = Usage.zero().model_copy(update={"calls": 1, "input_tokens": 7})
+
+    class Late:
+        calls = 0
+
+        async def run_episode(self, packet):
+            self.calls += 1
+            if self.calls > 1:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await release.wait()
+            return EpisodeResult(stop_reason="proposed", usage=observed)
+
+    meter = _Meter(Late())
+    await meter.invoke(packet())
+    pending = asyncio.create_task(meter.invoke(packet()))
+    await asyncio.wait_for(started.wait(), 1)
+    pending.cancel()
+    await asyncio.wait_for(cancelled.wait(), 1)
+    try:
+        assert meter.worker_calls == len(meter.usages) == 2
+        assert _aggregate_usage(meter.usages).cost_microunits is None
+        assert _aggregate_usage(meter.usages).input_tokens is None
+    finally:
+        release.set()
+        await pending
+    assert meter.worker_calls == len(meter.usages) == 2
+    assert meter.usages == [observed, observed]
+    assert _aggregate_usage(meter.usages).calls == 2
+    assert _aggregate_usage(meter.usages).input_tokens == 14
+
+
+@pytest.fixture
+def paired_report_inputs():
+    """Constructed scorer/transport fixtures, never observed outcome evidence."""
+    from signal_gating.executive.records import EvaluationResult, RunSummary
+
+    heldout = [case for case in cases() if case.name.startswith("heldout/")]
+    return [
+        EvaluationReport(
+            arm=arm,
+            configuration_digest="same",
+            manifest_digest="same",
+            case_names={case.id: case.name for case in heldout},
+            results=tuple(
+                EvaluationResult(
+                    case_id=case.id,
+                    trial=trial,
+                    arm=arm,
+                    policy_version="review-regression-fixture",
+                    passed=True,
+                    summary=RunSummary(completed_goal_ids=case.expected_completed_goal_ids),
+                    measurements={"cost_microunits": 2**60 + (arm == "executive")},
+                )
+                for case in heldout
+                for trial in range(3)
+            ),
+        )
+        for arm in ARMS
+    ]
+
+
+def test_large_integer_paired_difference_and_uncertainty(paired_report_inputs):
+    comparison = compare_reports(paired_report_inputs)
+    for arm in ARMS:
+        if arm != "executive":
+            difference = comparison["resource_differences"][arm]["cost_microunits"]
+            assert difference["mean_difference"] == 1
+            assert difference["interval_95"] == [1, 1]
+
+
+async def test_intermittent_factory_failure_does_not_change_actual_configuration_identity():
+    healthy = await evaluate_cases(cases()[:1], arm="notes", trials=2, worker_factory=FixtureWorker)
+    calls = 0
+
+    def intermittent():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("controlled constructor failure")
+        return FixtureWorker()
+
+    failed = await evaluate_cases(cases()[:1], arm="rules", trials=2, worker_factory=intermittent)
+    assert failed.attempts == healthy.attempts == 2
+    assert failed.results[0].failures == ("worker_factory_failure",)
+    assert failed.results[0].measurements["cost_microunits"] is None
+    assert failed.cost_status == "unknown"
+    assert failed.configuration_digest == healthy.configuration_digest
+    assert compare_reports([healthy, failed])["benefit_claim_allowed"] is False
+
+
+def test_cli_persists_every_collected_attempt_when_comparison_rejected(
+    paired_report_inputs, tmp_path, monkeypatch
+):
+    import signal_gating.executive.evaluation as evaluation
+
+    by_arm = {report.arm: report for report in paired_report_inputs}
+    report = by_arm["rules"]
+    failed = report.results[0].model_copy(
+        update={
+            "passed": False,
+            "failures": ("worker_factory_failure",),
+            "measurements": {"cost_microunits": None},
+        }
+    )
+    by_arm["rules"] = report.model_copy(
+        update={
+            "configuration_digest": "genuine_config_mismatch",
+            "results": (failed, *report.results[1:]),
+        }
+    )
+
+    async def collected(cases, *, arm, trials, worker_factory):
+        return by_arm[arm]
+
+    monkeypatch.setattr(evaluation, "evaluate_cases", collected)
+    output = tmp_path / "retained.json"
+    assert (
+        main(
+            [
+                "--cases",
+                str(EXAMPLES / "cases.jsonl"),
+                "--protocol",
+                str(EXAMPLES / "protocol.json"),
+                "--output",
+                str(output),
+            ]
+        )
+        == 2
+    )
+    assert output.exists()
+    artifact = json.loads(output.read_text())
+    assert sum(len(report["results"]) for report in artifact["reports"]) == 360
+    rejected = artifact["comparison"]
+    assert rejected["reason"] == "comparison_rejected"
+    assert rejected["benefit_claim_allowed"] is False
+    assert rejected["cost_claim_allowed"] is False
+    raw_failure = next(report for report in artifact["reports"] if report["arm"] == "rules")[
+        "results"
+    ][0]
+    assert raw_failure["failures"] == ["worker_factory_failure"]
+    assert raw_failure["measurements"]["cost_microunits"] is None

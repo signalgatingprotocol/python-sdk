@@ -266,17 +266,32 @@ class _Meter:
             )
         self.worker_calls += 1
         self.packets.append(packet)
+        # Allocate accounting BEFORE dispatch. Cancellation/BaseException and
+        # detached unfinished work retain uncertainty. A late result replaces
+        # this invocation's slot instead of adding a second charge.
+        usage_index = len(self.usages)
+        self.usages.append(
+            Usage(
+                calls=1,
+                currency=packet.remaining_limits.currency,
+                source="evaluation-worker-inflight",
+            )
+        )
         started = time.perf_counter_ns()
         try:
             result = await self.worker.run_episode(packet)
-            self.usages.append(result.usage)
+            self.usages[usage_index] = result.usage
             return result
         except WorkerError as exc:
-            self.usages.append(exc.usage)
+            self.usages[usage_index] = exc.usage
             self.errors.append(exc.code)
             raise
         except Exception:
-            self.usages.append(Usage(calls=1, source="evaluation-worker-failure"))
+            self.usages[usage_index] = Usage(
+                calls=1,
+                currency=packet.remaining_limits.currency,
+                source="evaluation-worker-failure",
+            )
             self.errors.append("worker_failure")
             raise
         finally:
@@ -1127,7 +1142,6 @@ async def evaluate_cases(
                         measurements={"cost_microunits": None},
                     )
                 )
-                configurations.add("worker_factory_failure")
                 continue
             owners = [
                 r
@@ -1254,7 +1268,7 @@ def compare_reports(reports: Sequence[EvaluationReport]) -> dict[str, object]:
                 if left is None or right is None:
                     missing = True
                     break
-                clusters.setdefault(key[0], []).append(float(left) - float(right))
+                clusters.setdefault(key[0], []).append(left - right)
             resources[measurement] = (
                 None
                 if missing
@@ -1382,9 +1396,25 @@ async def _run_cli(
         reports.append(
             await evaluate_cases(selected, arm=arm, trials=protocol.trials, worker_factory=factory)
         )
-    comparison = compare_reports(reports)
+    status = 0
+    try:
+        comparison = compare_reports(reports)
+    except Exception as exc:
+        # Invalid pairing/configuration cannot authorize a claim, but rejecting
+        # the comparison must never discard the already collected attempts.
+        comparison = {
+            "reason": "comparison_rejected",
+            "error_type": type(exc).__name__,
+            "detail": str(exc) if isinstance(exc, ValueError) else "comparison_failed",
+            "criteria_met": False,
+            "cost_claim_allowed": False,
+            "benefit_claim_allowed": False,
+        }
+        status = 2
     output = {
-        "scope": comparison.get("scope", "synthetic_fixture"),
+        "scope": "observed_run"
+        if reports and all(r.scope == "observed_run" for r in reports)
+        else "synthetic_fixture",
         "protocol": protocol.model_dump(mode="json"),
         "reports": [r.model_dump(mode="json") for r in reports],
         "comparison": comparison,
@@ -1392,7 +1422,7 @@ async def _run_cli(
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(output, indent=2) + "\n")
     print(_json({"output": str(args.output.resolve()), "comparison": output["comparison"]}))
-    return 0
+    return status
 
 
 def main(argv: Sequence[str] | None = None) -> int:
