@@ -648,3 +648,145 @@ def test_opaque_json_survives_counted_rendering_and_persisted_messages(setup, bo
             assert actual == (schema if boundary == "capability_schema" else arguments)
     finally:
         artifacts.release_staged((packet.rendered_artifact,))
+
+
+def test_unresolved_verification_is_current_counted_data_without_private_evidence(setup):
+    from signal_gating.executive import CriterionGap, VerificationResult
+
+    store, artifacts, task, _ = setup
+    worker = owner(id="d" * 32, roles=("worker",))
+    private = put(artifacts, "PRIVATE VERIFICATION INPUT")
+    selected = goal().criteria[0]
+    finding = VerificationResult(
+        criterion_id=selected.id,
+        verifier_id=selected.verifier_id,
+        disposition="insufficient_evidence",
+        reason_code="registered_check_unproven",
+        read_set=(reference(selected), reference(private)),
+        evidence=(reference(private),),
+        gaps=(
+            CriterionGap(
+                criterion_id=selected.id,
+                reason_code="registered_check_unproven",
+                description="PRIVATE GAP DETAIL",
+                evidence_needed=(reference(private),),
+            ),
+        ),
+    )
+    foreign_criterion = selected.model_copy(update={"id": "f" * 32})
+    foreign_goal = goal(id="ab" * 16, criteria=(foreign_criterion,))
+    foreign = finding.model_copy(
+        update={
+            "id": "e" * 32,
+            "criterion_id": foreign_criterion.id,
+            "read_set": (reference(foreign_criterion),),
+            "reason_code": "FOREIGN_FINDING",
+        }
+    )
+    store.commit(CommitBatch(events=(event((worker, finding, foreign_goal, foreign)),)))
+    before = store.view()
+    running, state = planned(store, task)
+    packet = assembler(artifacts).build(running, state, principal=worker)
+    try:
+        material = json.loads(packet.rendered_input)
+        assert material["untrusted_evidence"]["verification_status"] == [
+            {
+                "semantics": "observation_as_of_admission",
+                "ref": reference(finding).model_dump(mode="json"),
+                "criterion": reference(selected).model_dump(mode="json"),
+                "disposition": "insufficient_evidence",
+                "reason_code": "registered_check_unproven",
+                "gaps": [{"reason_code": "registered_check_unproven"}],
+            }
+        ]
+        assert packet.manifest.observed_refs == (reference(finding),)
+        assert reference(finding) not in packet.mandatory_read_set
+        assert finding.id not in packet.manifest.visible_ids
+        assert finding.id not in packet.manifest.required_ids
+        assert private.id not in packet.manifest.visible_ids
+        assert private.id not in packet.rendered_input
+        assert "PRIVATE" not in packet.rendered_input
+        assert foreign.id not in packet.rendered_input
+        assert "FOREIGN_FINDING" not in packet.rendered_input
+        assert store.view() == before
+        assert packet.manifest.input_tokens == UTF8ByteCounter().count(
+            json.dumps(
+                render_packet(packet), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        )
+        store.commit(CommitBatch(events=(event((packet.rendered_artifact,)),)))
+        durable = json.loads(
+            artifacts.read(packet.rendered_artifact, principal=owner(), goal_id=GOAL_ID)
+        )
+        assert durable["messages"] == list(render_packet(packet))
+        assert durable["manifest"]["observed_refs"] == [reference(finding).model_dump(mode="json")]
+    finally:
+        artifacts.release_staged((packet.rendered_artifact,))
+
+
+@pytest.mark.parametrize("case", ["accepted", "old_criterion", "other_verifier"])
+def test_verification_status_never_exports_accepted_or_obsolete_findings(setup, case):
+    from signal_gating.executive import VerificationResult
+
+    store, artifacts, task, _ = setup
+    selected = goal().criteria[0]
+    finding = VerificationResult(
+        criterion_id=selected.id,
+        verifier_id=selected.verifier_id,
+        disposition="insufficient_evidence",
+        reason_code="not_yet_verified",
+        read_set=(reference(selected),),
+    )
+    if case == "accepted":
+        finding = finding.model_copy(update={"disposition": "accept"})
+    elif case == "old_criterion":
+        selected = selected.model_copy(update={"revision": selected.revision + 1})
+        current = next(r for r in store.view().records if r.id == GOAL_ID)
+        store.commit(
+            CommitBatch(
+                events=(
+                    event(
+                        (
+                            current.model_copy(
+                                update={
+                                    "revision": current.revision + 1,
+                                    "criteria": (selected,),
+                                }
+                            ),
+                        )
+                    ),
+                ),
+                expected_revisions=(reference(current),),
+            )
+        )
+    else:
+        finding = finding.model_copy(update={"verifier_id": "previous-verifier"})
+    store.commit(CommitBatch(events=(event((finding,)),)))
+    running, state = planned(store, task)
+    packet = assembler(artifacts).build(running, state, principal=owner())
+    try:
+        assert "verification_status" not in json.loads(packet.rendered_input)["untrusted_evidence"]
+        assert reference(finding) not in packet.mandatory_read_set
+        assert finding.id not in packet.manifest.visible_ids
+        assert not packet.manifest.observed_refs
+    finally:
+        artifacts.release_staged((packet.rendered_artifact,))
+
+
+def test_verification_status_is_counted_before_staging_instead_of_silently_truncated(setup):
+    from signal_gating.executive import VerificationResult
+
+    store, artifacts, task, _ = setup
+    selected = goal().criteria[0]
+    finding = VerificationResult(
+        criterion_id=selected.id,
+        verifier_id=selected.verifier_id,
+        disposition="insufficient_evidence",
+        reason_code="large_gap_" * 30000,
+        read_set=(reference(selected),),
+    )
+    store.commit(CommitBatch(events=(event((finding,)),)))
+    running, state = planned(store, task)
+    with pytest.raises(ContextBudgetInsufficient):
+        assembler(artifacts).build(running, state, principal=owner())
+    assert not artifacts.root.exists()

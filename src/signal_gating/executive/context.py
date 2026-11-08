@@ -7,6 +7,9 @@ provider calls or Store commits occur here. The caller atomically journals the
 packet, its full rendered_artifact post-image, episode, running task, scheduler
 selection and budget reservation with original pre-batch CAS reads. Include all
 actual inputs in CAS, translating embedded definitions to their owning Goal.
+Also CAS-bind manifest.observed_refs at admission: those advisory snapshots are
+not mandatory action dependencies. Kernel admission already reads the full original
+StateView. Standalone callers must include these source refs in their admission CAS.
 Always release_staged((packet.rendered_artifact,)) in finally after acceptance or
 rejection. Build errors release any pin acquired by this build.
 
@@ -48,6 +51,7 @@ from .records import (
     Scope,
     StateView,
     TaskFrame,
+    VerificationResult,
     utc_now,
 )
 
@@ -362,6 +366,29 @@ class ContextAssembler:
         )
         for action in pending:
             required[action.id] = action
+        # Unresolved current-criterion observations are work status, not proof.
+        # Keep their source refs separately for admission CAS, never as implicit
+        # proof/action dependencies. Accepted findings are not projected. Omit private
+        # input/evidence refs or arbitrary verifier descriptions through status.
+        criteria = {c.id: c for c in goal.criteria}
+        unresolved = tuple(
+            sorted(
+                (
+                    r
+                    for r in state.records
+                    if isinstance(r, VerificationResult)
+                    and r.criterion_id in criteria
+                    and r.disposition != "accept"
+                    and r.verifier_id == criteria[r.criterion_id].verifier_id
+                    and any(
+                        ref.id == r.criterion_id
+                        and ref.revision == criteria[r.criterion_id].revision
+                        for ref in r.read_set
+                    )
+                ),
+                key=lambda r: r.criterion_id,
+            )
+        )
         # Dependencies are mandatory context, never lossy summaries. Required
         # artifact content goes through the same current access/integrity read.
         dependencies = [*frame.dependencies, *(d for c in commitments for d in c.dependencies)]
@@ -457,6 +484,29 @@ class ContextAssembler:
                             and isinstance(r, (TaskFrame, Goal))
                         ],
                         "pending_effects": [_material(a) for a in pending],
+                        **(
+                            {
+                                "verification_status": [
+                                    {
+                                        "semantics": "observation_as_of_admission",
+                                        "ref": reference(finding).model_dump(mode="json"),
+                                        "criterion": reference(
+                                            criteria[finding.criterion_id]
+                                        ).model_dump(mode="json"),
+                                        "disposition": finding.disposition,
+                                        "reason_code": finding.reason_code,
+                                        "gaps": [
+                                            {"reason_code": gap.reason_code}
+                                            for gap in finding.gaps
+                                            if gap.criterion_id == finding.criterion_id
+                                        ],
+                                    }
+                                    for finding in unresolved
+                                ]
+                            }
+                            if unresolved
+                            else {}
+                        ),
                     },
                     "changes": [
                         reference(r).model_dump(mode="json")
@@ -533,6 +583,7 @@ class ContextAssembler:
         manifest = ContextManifest(
             included=reads,
             omitted=tuple(omitted),
+            observed_refs=tuple(reference(finding) for finding in unresolved),
             required_ids=tuple(sorted(required)),
             visible_ids=tuple(sorted(visible)),
             selection_reasons=tuple(reasons),

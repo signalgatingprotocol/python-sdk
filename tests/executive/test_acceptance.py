@@ -24,8 +24,24 @@ from signal_gating.executive.store import Store
 
 async def test_nine_step_release_and_measured_receipts(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "openai", None)
+    commit = Store.commit
+    observed_admissions = []
+
+    def checked_commit(store, batch):
+        for event in batch.events:
+            for raw in event.payload.get("records", ()):
+                if raw.get("kind") == "context_packet":
+                    refs = raw["manifest"].get("observed_refs", ())
+                    bound = {(ref.id, ref.revision) for ref in batch.expected_revisions}
+                    assert all((ref["id"], ref["revision"]) in bound for ref in refs)
+                    if refs:
+                        observed_admissions.append(raw["id"])
+        return commit(store, batch)
+
+    monkeypatch.setattr(Store, "commit", checked_commit)
     result = await run_demo(tmp_path / "demo")
     assert result.passed, result.failures
+    assert observed_admissions
     assert result.completed
     assert result.scope == "synthetic_fixture"
     assert result.metrics["stale_proposals_rejected"] == 1
@@ -36,6 +52,7 @@ async def test_nine_step_release_and_measured_receipts(tmp_path, monkeypatch):
     assert result.metrics["unrelated_artifacts_retained"] == 1
     assert result.metrics["reconciled_effects"] == 1
     assert result.metrics["interrupted_frames_retained"] == 1
+    assert result.metrics["resumed_context_supplied"] == 1
     with Store.open_readonly(tmp_path / "demo" / "store") as store:
         state = store.view()
         assert rebuild(store.events()) == state
@@ -80,6 +97,88 @@ async def test_nine_step_release_and_measured_receipts(tmp_path, monkeypatch):
             for grant in state.records
             if isinstance(grant, Grant)
         )
+        resumed_at = next(e.sequence for e in store.events() if e.event_type == "goal.resumed")
+        admission = next(
+            e
+            for e in store.events()
+            if e.sequence > resumed_at
+            and any(raw.get("kind") == "context_packet" for raw in e.payload.get("records", ()))
+        )
+        resumed_id = next(
+            raw["id"] for raw in admission.payload["records"] if raw.get("kind") == "context_packet"
+        )
+        resumed = next(
+            r for r in state.records if isinstance(r, ContextPacket) and r.id == resumed_id
+        )
+        before = rebuild(tuple(e for e in store.events() if e.sequence < admission.sequence))
+        prior = {r.id: r for r in before.records}
+        rendered = json.loads(resumed.rendered_input)["untrusted_evidence"]
+        useful = next(
+            a
+            for a in rendered["artifacts"]
+            if a["text"] == ("Unrelated fixture arithmetic test: 2+2 == 4 PASS\n")
+        )
+        retained = prior[useful["ref"]["id"]]
+        assert useful["ref"]["revision"] == retained.revision
+        assert rendered["verification_status"]
+        gap = next(
+            status
+            for status in rendered["verification_status"]
+            if status["criterion"]["id"] == resumed.goal.criteria[0].id
+        )
+        finding = prior[gap["ref"]["id"]]
+        assert finding.revision == gap["ref"]["revision"]
+        assert finding.disposition == gap["disposition"] == "insufficient_evidence"
+        assert finding.reason_code == gap["reason_code"] == "registered_check_unproven"
+        assert gap["criterion"]["revision"] == resumed.goal.criteria[0].revision == 2
+        assert any(c.id == old.task.commitment_id for c in resumed.commitments)
+        assert resumed.goal.constraints[0].hard
+        from signal_gating.executive.authority import reference
+        from signal_gating.executive.demo import _Worker
+
+        principal_id = json.loads(resumed.rendered_input)["trusted_authority"]["principal"]["id"]
+        assert principal_id in retained.shared_with
+        assert reference(retained) in resumed.mandatory_read_set
+        assert reference(finding) not in resumed.mandatory_read_set
+        assert reference(finding) in resumed.manifest.observed_refs
+        assert gap["semantics"] == "observation_as_of_admission"
+        current_finding = next(r for r in state.records if r.id == finding.id)
+        assert current_finding.revision > finding.revision
+        assert current_finding.disposition == "accept"
+        assert current_finding.reason_code == "registered_check_passed"
+        check = next(a for a in actions if a.capability_id == "run_check")
+        assert not any(ref.id == finding.id for ref in check.read_set)
+        assert any(
+            ref.id == gap["criterion"]["id"] and ref.revision == 2
+            for ref in resumed.mandatory_read_set
+        )
+        assert not any(
+            isinstance(r, ActionRecord)
+            and r.capability_id == "run_check"
+            and r.status == "succeeded"
+            for r in before.records
+        )
+        # Each omission independently prevents repair, even with the phase selected.
+        for missing in ("useful_artifact", "compatibility_gap"):
+            data = json.loads(resumed.rendered_input)
+            evidence = data["untrusted_evidence"]
+            if missing == "useful_artifact":
+                evidence["artifacts"] = [
+                    a for a in evidence["artifacts"] if a["ref"]["id"] != retained.id
+                ]
+            else:
+                evidence["verification_status"] = [
+                    status
+                    for status in evidence["verification_status"]
+                    if status["criterion"]["id"] != resumed.goal.criteria[0].id
+                ]
+            worker = _Worker()
+            worker.phase = "repair"
+            blocked = await worker.run_episode(
+                resumed.model_copy(update={"rendered_input": json.dumps(data)})
+            )
+            assert blocked.stop_reason == "blocked" and not blocked.artifact_drafts
+            assert blocked.blocker.reason_code == "resume_context_incomplete"
         assert any(e.event_type == "goal.paused" for e in store.events())
         assert (
             sum(e.payload.get("reason_code") == "kernel_configuration" for e in store.events()) == 2
@@ -131,3 +230,16 @@ def test_static_310_checker_rejects_incompatible_project_then_checks_repair(tmp_
     assert compatible.returncode == 0
     assert "static Python 3.10 grammar and current-interpreter test PASS" in compatible.stdout
     assert not compatible.stderr
+
+
+async def test_repair_phase_alone_cannot_supply_missing_resume_context():
+    from signal_gating.executive.demo import _Worker
+
+    from .factories import packet
+
+    worker = _Worker()
+    worker.phase = "repair"
+    result = await worker.run_episode(packet())
+    assert result.stop_reason == "blocked"
+    assert not result.artifact_drafts
+    assert result.blocker.reason_code == "resume_context_incomplete"

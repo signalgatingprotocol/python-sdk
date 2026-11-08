@@ -600,6 +600,8 @@ class ContextManifest(Model):
     context_token_limit: PositiveInt | None = None
     included: tuple[Ref, ...] = ()
     omitted: tuple[Ref, ...] = ()
+    # Read-only status snapshots fenced at packet admission, never action proof.
+    observed_refs: tuple[Ref, ...] = ()
     selection_reasons: tuple[NonEmpty, ...] = ()
     required_tokens: NonNegativeInt = 0
     input_tokens: NonNegativeInt = 0

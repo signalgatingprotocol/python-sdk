@@ -241,6 +241,48 @@ def _compatibility_policy(inputs: Mapping[str, Record], config: KernelConfig) ->
     return decision("authorize", "fixture_compatibility_policy_intact")
 
 
+def _has_resume_context(packet: ContextPacket) -> bool:
+    """Require actual current inputs before the deterministic worker can repair."""
+    if not any(
+        c.hard and c.enforcement_id == "fixture-python310-v1" for c in packet.goal.constraints
+    ):
+        return False
+    criterion = next(
+        (
+            c
+            for c in packet.goal.criteria
+            if c.required and c.check_id == "static-python310" and c.revision == 2
+        ),
+        None,
+    )
+    if criterion is None or not any(
+        c.id == packet.task.commitment_id and c.goal_id == packet.goal.id
+        for c in packet.commitments
+    ):
+        return False
+    try:
+        evidence = json.loads(packet.rendered_input)["untrusted_evidence"]
+        reads = set(packet.mandatory_read_set)
+        retained = any(
+            a["text"] == "Unrelated fixture arithmetic test: 2+2 == 4 PASS\n"
+            and Ref.model_validate(a["ref"]) in reads
+            for a in evidence.get("artifacts", ())
+        )
+        unresolved = any(
+            Ref.model_validate(status["criterion"]) == reference(criterion)
+            and status["semantics"] == "observation_as_of_admission"
+            and Ref.model_validate(status["ref"]) in packet.manifest.observed_refs
+            and reference(criterion) in reads
+            and status["disposition"] == "insufficient_evidence"
+            and status["reason_code"] == "registered_check_unproven"
+            and any(gap["reason_code"] == "registered_check_unproven" for gap in status["gaps"])
+            for status in evidence.get("verification_status", ())
+        )
+        return retained and unresolved
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
 class _ProposalContext(TypedDict):
     episode_id: str
     fencing_token: int
@@ -298,10 +340,18 @@ class _Worker:
                 ),
             )
         if self.phase == "repair":
+            if not _has_resume_context(packet):
+                return EpisodeResult(
+                    stop_reason="blocked",
+                    usage=usage,
+                    blocker=WakeCondition(
+                        kind="human_decision", reason_code="resume_context_incomplete"
+                    ),
+                )
             self.phase = "write"
             return EpisodeResult(
                 stop_reason="blocked",
-                blocker=WakeCondition(kind="human_decision", reason_code="share_release_draft"),
+                blocker=WakeCondition(kind="new_evidence", reason_code="share_release_draft"),
                 artifact_drafts=(
                     ArtifactDraft(key="release", media_type="text/x-python", text=RELEASE_SOURCE),
                 ),
@@ -356,7 +406,7 @@ class _Worker:
     def _blocked(usage: Usage) -> EpisodeResult:
         return EpisodeResult(
             stop_reason="blocked",
-            blocker=WakeCondition(kind="human_decision", reason_code="fixture_owner_step"),
+            blocker=WakeCondition(kind="new_evidence", reason_code="fixture_owner_step"),
             usage=usage,
         )
 
@@ -402,6 +452,22 @@ async def _share(kernel: Kernel, artifacts: list[ArtifactRef], *, worker: bool =
                     principal_ids=selected,
                 ),
             )
+
+
+async def _notify_evidence(kernel: Kernel, artifact: ArtifactRef, *, purpose: str) -> None:
+    receipt = await kernel.ingest(
+        ExecutiveSignal(
+            signal_kind="evidence",
+            principal_id=OWNER.id,
+            producer_id="fixture-owner-evidence",
+            scope=_scope(),
+            artifacts=(reference(artifact),),
+            payload={"purpose": purpose},
+        ),
+        principal=OWNER,
+    )
+    if receipt.disposition != "admit":
+        raise RuntimeError("Demo evidence notification rejected: " + receipt.reason_code)
 
 
 async def run_demo(root: Path) -> EvaluationResult:
@@ -609,7 +675,16 @@ async def run_demo(root: Path) -> EvaluationResult:
         await kernel.run_until_idle()
         # A real local effect loses its reply and survives pause/restart unresolved.
         worker.phase = "stage"
-        await _submit(kernel, Reverify(goal_id=GOAL_ID))
+        await _submit(
+            kernel,
+            ShareArtifact(
+                artifact_id=unrelated.id,
+                expected_revision=unrelated.revision,
+                principal_ids=(kernel.worker_principals["fixture"].id,),
+            ),
+        )
+        retained = next(a for a in _records(kernel, ArtifactRef) if a.id == unrelated.id)
+        await _notify_evidence(kernel, retained, purpose="prepare_local_review_staging")
         await kernel.run_until_idle()
         await _approve(kernel)
         await kernel.run_until_idle()
@@ -666,15 +741,20 @@ async def run_demo(root: Path) -> EvaluationResult:
             before.st_ctime_ns,
         )
         assert _records(kernel, Goal)[0].status == "paused"
+        resume_packet_index = len(worker.packets)
         current = _records(kernel, Goal)[0]
         await _submit(kernel, ResumeGoal(goal_id=GOAL_ID, expected_revision=current.revision))
+        retained = next(a for a in _records(kernel, ArtifactRef) if a.id == unrelated.id)
+        await _notify_evidence(kernel, retained, purpose="resume_release_with_retained_evidence")
         await kernel.run_until_idle()
         draft = next(a for a in _records(kernel, ArtifactRef) if a.media_type == "text/x-python")
         assert not draft.shared_with
-        resumed_packet = worker.packets[-1]
+        resumed_packet = worker.packets[resume_packet_index]
+        assert _has_resume_context(resumed_packet)
         assert resumed_packet.goal.constraints and resumed_packet.goal.criteria[0] == corrected
         await _share(kernel, [draft], worker=True)
-        await _submit(kernel, Reverify(goal_id=GOAL_ID))
+        shared_draft = next(a for a in _records(kernel, ArtifactRef) if a.id == draft.id)
+        await _notify_evidence(kernel, shared_draft, purpose="apply_shared_release_repair")
         await kernel.run_until_idle()
         await _approve(kernel)  # Exact current write binding, not the delayed proposal.
         await kernel.run_until_idle()
@@ -703,8 +783,9 @@ async def run_demo(root: Path) -> EvaluationResult:
                 explanation="Reviewed synthetic artifact; authorize local release preparation only",
             ),
         )
+        await kernel.run_until_idle()  # Settle owner-requested verification before a new claim.
         worker.phase = "claim"
-        await _submit(kernel, Reverify(goal_id=GOAL_ID))
+        await _notify_evidence(kernel, review_artifact, purpose="complete_owner_reviewed_release")
         summary = await kernel.run_until_idle()
         state = kernel.store.view()
         receipts = tuple(_records(kernel, DecisionReceipt))
@@ -747,6 +828,7 @@ async def run_demo(root: Path) -> EvaluationResult:
                 for a in actions
             ),
             "journal_rebuild_matches": int(state == rebuild(kernel.store.events())),
+            "resumed_context_supplied": int(_has_resume_context(resumed_packet)),
             "interrupted_frames_retained": int(
                 paused.id == interrupted.id and paused.fencing_token > interrupted.fencing_token
             ),
@@ -761,6 +843,7 @@ async def run_demo(root: Path) -> EvaluationResult:
             "reconciled_effects": 1,
             "journal_rebuild_matches": 1,
             "interrupted_frames_retained": 1,
+            "resumed_context_supplied": 1,
         }
         failures = tuple(key for key, value in expected.items() if metrics[key] != value)
         if GOAL_ID not in summary.completed_goal_ids:
