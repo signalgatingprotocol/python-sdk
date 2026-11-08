@@ -1,6 +1,6 @@
 # Executive kernel delivery status
 
-This continuation implements Tasks 1–19 of the [implementation plan](2026-11-07-executive-kernel.md): the first usable experimental local executive kernel. The [approved design](../specs/2026-11-07-executive-kernel-design.md) remains the long-term target. The [operator guide](../../executive-kernel.md) covers installed use. No version bump, tag, publication or paid inference is part of this delivery.
+This continuation implements Tasks 1-19 of the [implementation plan](2026-11-07-executive-kernel.md): the first usable experimental local executive kernel. The [approved design](../specs/2026-11-07-executive-kernel-design.md) remains the long-term target. The [operator guide](../../executive-kernel.md) covers installed use. No version bump, tag, publication or paid inference is part of this delivery.
 
 ## Implemented
 
@@ -19,15 +19,15 @@ This continuation implements Tasks 1–19 of the [implementation plan](2026-11-0
 - Legacy observation/callable bridges, 69 full versioned DTO/union schemas and owner-only redacted observation export.
 - Installed executive console entrypoint, wheel tests from another cwd, temporary credential-free smoke and complete local operator documentation.
 
-Tasks 1–19 received independent scoped review. The subsequent whole-branch review found five integration defects: commitment episode budgets, historical grant fencing, false draft-rejection accounting conflicts, historical evidence requests and child-goal budget ancestry. The coordinated final fix addresses all five with cross-component regressions. Its independent scoped re-review and final-head CI remain controller gates. Self-review and local checks do not substitute for those gates. The retained continuation records preserve all earlier reports and evidence.
+Tasks 1–19 received independent scoped review. The subsequent whole-branch review found five integration defects: commitment episode budgets, historical grant fencing, false draft-rejection accounting conflicts, historical evidence requests and child-goal budget ancestry. The coordinated final fix addresses all five with cross-component regressions. Its independent scoped re-review and CI on the final head are still outstanding. Self-review and local checks do not substitute for them. The retained continuation records preserve all earlier reports and evidence.
 
 ## Validation and remaining limits
 
 Credential-free tests exercise real journal/coordinator/adapter/verification/recovery infrastructure with deterministic workers and fake provider responses. Installed-wheel checks remove checkout path injection, verify legacy exports, run the release scenario, load config/goals, restart/inspect/export and reject incomplete live setup before calls. The installed optional real-SDK check constructs/closes a client using a dummy named credential with requests/network blocked. This is constructor compatibility evidence only.
 
-The Task 19 report records clean-environment `make check`, `make package`, `make smoke`, acceptance/crash tests, explicit version validation and outside-checkout installation provenance. Python 3.10–3.14 final-head CI evidence belongs to the delivery gate; do not infer it from one local interpreter or the fixture's static grammar check. Existing SDK compatibility remains unchanged.
+The Task 19 report records clean-environment `make check`, `make package`, `make smoke`, acceptance/crash tests, explicit version validation and outside-checkout installation provenance. Python 3.10-3.14 final-head CI evidence belongs to the delivery gate; do not infer it from one local interpreter or the fixture's static grammar check. Existing SDK compatibility remains unchanged.
 
-Before the final integration fixes, local Python 3.14.3 validation passed all 1,597 tests with lint and strict type checks, and distribution/installed console checks passed. The pre-fix f4313e7 hosted Python 3.10–3.14, workflow lint and wheel smoke jobs also passed. These historical results do not validate the amended runtime. Final-fix source/package and fresh installation evidence is recorded separately below.
+Before the final integration fixes, local Python 3.14.3 validation passed all 1,597 tests with lint and strict type checks, and distribution/installed console checks passed. The pre-fix f4313e7 hosted Python 3.10-3.14, workflow lint and wheel smoke jobs also passed. These historical results do not validate the amended runtime. Final-fix source/package and fresh installation evidence is recorded separately below.
 
 The final coordinated fix passed one complete local Python 3.14.3 `make check`: 1,620 tests, Ruff and strict mypy across 61 source files. Sequential `make package smoke` passed both distribution checks, version validation and installed legacy/executive demos. The executive fixture completed with no failures and zero forbidden dispatches. The 23 new regression cases cover all five review findings, current commitment/ancestor ceilings, foreign scope rejection, in-flight revocation/expiry, durable request supersession and goal-ancestry CAS. The tested code snapshot is [971bd71ce7970961194f73dcb572003aac4ff365](https://github.com/signalgatingprotocol/python-sdk/commit/971bd71ce7970961194f73dcb572003aac4ff365); its following README pin/status update changes documentation only.
 

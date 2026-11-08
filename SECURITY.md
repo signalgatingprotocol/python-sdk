@@ -89,7 +89,6 @@ are not controlled by local budget accounting. Unknown usage remains held;
 deterministic fixtures and constructor-only SDK checks do not verify paid/live
 provider behavior or task quality.
 
-Outbound email in Preston's environment is human-only. Never configure a check
-or adapter to send, schedule or queue it on the owner's behalf. See the
+Do not configure a check or adapter to send, schedule, or queue outbound email on the owner's behalf. See the
 [operator guide](docs/executive-kernel.md) for supported local workflows,
 recovery semantics and explicitly deferred adaptive/federation behavior.

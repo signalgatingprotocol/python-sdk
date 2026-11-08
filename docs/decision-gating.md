@@ -1,4 +1,4 @@
-# Decision models that decide which work is let through
+# Decision-model gating
 
 Use a small decision model to judge an ambiguous event, then let SGP enforce
 the routing policy and trace what happened. The example uses Jev's Noul

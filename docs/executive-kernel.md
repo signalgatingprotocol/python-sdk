@@ -11,7 +11,7 @@ state or grant themselves permissions. This is an experimental API under
 Use the full tested Git revision in the [README install commands](../README.md#install).
 The base install needs Pydantic and PyYAML. The `llm` extra supplies the optional
 OpenAI SDK; importing the executive and running the demo do not need it.
-Use Python 3.10–3.14. The local single-writer implementation requires POSIX
+Use Python 3.10-3.14. The local single-writer implementation requires POSIX
 filesystem locking and descriptor-relative filesystem operations; it fails
 closed on unsupported writer platforms. Run in a private directory on a local
 filesystem, with one writer per store. Network filesystems are not a supported
@@ -22,9 +22,9 @@ From any directory after installation:
 ```bash
 signal-gating-executive --help
 signal-gating-demo
-DEMO_DIR="$(mktemp -d)"
-signal-gating-executive demo --store "$DEMO_DIR/release"
-signal-gating-executive inspect --store "$DEMO_DIR/release/store" --json
+EXECUTIVE_DEMO_DIR="$(mktemp -d)"
+signal-gating-executive demo --store "$EXECUTIVE_DEMO_DIR/release"
+signal-gating-executive inspect --store "$EXECUTIVE_DEMO_DIR/release/store" --json
 ```
 
 `python -m signal_gating.executive` exposes the same operations. The executive
@@ -36,7 +36,7 @@ retained context and verified completion. Its JSON evaluation must have
 `metrics.forbidden_dispatches: 0`. It is a synthetic fixture, not evidence of
 model quality, production savings or protection against hostile host code.
 The static Python 3.10 grammar check in this fixture does not replace the
-Python 3.10–3.14 CI matrix.
+Python 3.10-3.14 CI matrix.
 
 ## Bootstrap an owner and a real local goal
 
@@ -223,9 +223,7 @@ The numbers above are illustrative. Use inspected values, not guessed
 revisions. Change `decision` to `deny` to reject. Approval is bound to those
 arguments, current intent, constraints and authority; it does not authorize
 changed arguments or later effects. No configured approver means review stays
-pending. This distribution provides no outbound email adapter. In Preston's
-environment outbound email is human-only and must never be queued or sent by
-the kernel, including through a configured program.
+pending. This distribution provides no outbound email adapter.
 
 ## Correct, share, verify and approve evidence
 
@@ -328,7 +326,7 @@ the provider's actual charge. Observed overages remain recorded and cannot be
 erased by resolution. A reservation without a usable maximum needs evidence of
 known usage; never guess a zero to clear a hold.
 
-## Export and subsequent horizons
+## Export and later work
 
 ```bash
 signal-gating-executive export --store ./readiness-state --goal GOAL_ID \
@@ -354,8 +352,8 @@ validation does not establish cross-field policy, freshness or conformance.
 `LegacyWorker` wraps an explicitly supplied callable. Both label independent
 legacy execution `external_runtime_unmediated`; they do not sandbox Agent/Mesh.
 
-Tasks 1–19 now supply the first local kernel. Adaptive control remains a
-subsequent horizon: use recorded events/receipts and explicit evaluations for
+Tasks 1-19 now supply the first local kernel. Adaptive control is later work:
+use recorded events/receipts and explicit evaluations for
 offline policy promotion, with no live modification of grants, hard constraints,
 verification criteria or ceilings. Federation requires a second implementation
 and transport conformance before commitment negotiation. Preserve scoped

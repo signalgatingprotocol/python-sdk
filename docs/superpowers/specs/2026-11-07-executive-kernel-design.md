@@ -238,7 +238,7 @@ The outbox dispatcher rechecks current authority, dependencies, expiry, and budg
 
 Persist the stable action ID and idempotency key before dispatch. After a crash, a `dispatching` action is treated as `outcome_unknown`. If the adapter supports durable idempotency, retry with the same key within its documented scope and retention window. Otherwise reconcile through a status lookup or ask a human. Do not claim exactly-once execution or blindly repeat a non-idempotent effect. Compensation is a separate authorized action, never an assumed rollback.
 
-No configured approver means review remains pending. Human-only actions can be prepared as artifacts but have no executable capability in the agent's grant. In Preston's environment, outbound email is human-only and must never be queued or transmitted by this kernel.
+No configured approver means review remains pending. Human-only actions can be prepared as artifacts but have no executable capability in the agent's grant.
 
 ## 12. Budgets and bounded deliberation
 
@@ -306,7 +306,7 @@ These are capability horizons, not a detailed implementation plan or calendar pr
 | D. Portable contracts | Versioned schemas, transport binding, independent implementation, conformance suite | Cross-runtime lifecycle and failure interoperability |
 | E. Federated executives | Delegated commitments, scoped authority, evidence exchange, revocation and reconciliation across owners | Partition, duplicate-delivery, stale-state, and trust-boundary tests plus useful joint tasks |
 
-Long-term federation uses local authority and causal references, not a globally synchronized mind. A delegation specifies outcome, evidence requirements, budget responsibility, expiry, and cancellation semantics. Receiving kernels explicitly accept or reject responsibility. A remote claim of completion is evidence submitted to local verification. Partitions leave commitments visibly pending or uncertain; they do not manufacture success. Broader trust and transport details belong to horizon D/E designs.
+Long-term federation uses local authority and causal references, not a single shared state across kernels. A delegation specifies outcome, evidence requirements, budget responsibility, expiry, and cancellation semantics. Receiving kernels explicitly accept or reject responsibility. A remote claim of completion is evidence submitted to local verification. Partitions leave commitments visibly pending or uncertain; they do not manufacture success. Broader trust and transport details belong to horizon D/E designs.
 
 ## 18. Evaluation and definition of excellence
 

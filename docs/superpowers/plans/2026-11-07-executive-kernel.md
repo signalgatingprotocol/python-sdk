@@ -1,12 +1,12 @@
 # Executive Kernel Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> For agentic workers: implement this plan task by task, with a review gate per task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver a usable local executive kernel that preserves intent, selectively updates state, mediates real work, handles corrections and restarts, and verifies completion, with foundations for adaptive control and federation.
 
 **Architecture:** One authoritative SQLite writer commits journal events, materialized state, receipts, reservations, and outbox entries atomically. Bounded workers propose changes against versioned context; kernel transitions enforce authority, freshness, and budgets. The first release includes a real model adapter, local tools, foreground operator controls, and recovery, not just interfaces or a scripted demo.
 
-**Tech Stack:** Python 3.10–3.14, asyncio, stdlib SQLite/argparse/JSON/filesystem/subprocess, existing Pydantic v2 and optional `openai` dependency, pytest/pytest-asyncio, Ruff, mypy, build, twine. No new mandatory runtime dependency.
+**Tech Stack:** Python 3.10-3.14, asyncio, stdlib SQLite/argparse/JSON/filesystem/subprocess, existing Pydantic v2 and optional `openai` dependency, pytest/pytest-asyncio, Ruff, mypy, build, twine. No new mandatory runtime dependency.
 
 **Spec:** [Approved executive-kernel design](../specs/2026-11-07-executive-kernel-design.md). Read both documents before execution. Design approved 2026-11-07; this plan awaits execution-method selection.
 
@@ -22,7 +22,7 @@
 - "Do not claim exactly-once execution or blindly repeat a non-idempotent effect."
 - "In Preston's environment, outbound email is human-only and must never be queued or transmitted by this kernel."
 - "Live self-modification of grants, hard constraints, verification criteria, or budget ceilings is prohibited."
-- Python minimum remains `>=3.10`; existing CI covers 3.10–3.14. Keep exports in `signal_gating.executive`, not `core` or package-root exports.
+- Python minimum remains `>=3.10`; existing CI covers 3.10-3.14. Keep exports in `signal_gating.executive`, not `core` or package-root exports.
 - Preserve unrelated changes, including untracked decision-routing files. No attribution in commits or PRs. No credential values in logs, fixtures, or git.
 
 ## Review Focus

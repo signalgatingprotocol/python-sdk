@@ -1,6 +1,6 @@
 # SGP Python SDK
 
-Typed signals, composable gates, and a record of which signals were let through, for Python agents.
+A Python SDK for agent systems: typed signals, gates that decide which signals reach which agent, and a record of every decision.
 
 Multi-agent systems degrade when every event reaches every agent: context fills
 with noise, stale information displaces relevant state, and one bad output can
@@ -93,8 +93,8 @@ critical_incidents_preserved=3/3
 result=PASS
 ```
 
-The scenario sends six low-priority alerts and two exact copies of three
-critical incidents through real `by_priority` and `deduplicate` gates. It
+The scenario sends six low-priority alerts and three critical incidents, each
+one sent twice, through real `by_priority` and `deduplicate` gates. It
 derives each drop count from SDK trace spans and records 75% fewer handler
 invocations than the ungated 12-alert baseline while preserving all three
 unique critical incidents. `PASS` requires every expected fixture metric to
@@ -126,7 +126,7 @@ Follow the [executive operator guide](docs/executive-kernel.md) for owner
 bootstrap, a real local goal, grants, exact approvals, correction,
 pause/restart/resume, inspection, uncertainty resolution and portable export.
 The API is experimental and separate from the stable compatibility core.
-Adaptive policy promotion and federation remain subsequent horizons. See
+Adaptive policy promotion and federation are not in this release. See
 [delivery status](docs/superpowers/plans/2026-11-07-executive-kernel-status.md)
 for implementation and review coverage.
 
@@ -872,8 +872,8 @@ bit-rot) before replay. The digest is keyless, so it is not a cryptographic
 signature; to make a persisted trajectory tamper-evident against a motivated
 actor, sign or HMAC the file with a key the verifier holds out of band.
 
-A trajectory is more than readable: its signal-carrying receipts are
-**reconstructable**. Each receipt stores the full signal wire envelope, so a run
+A trajectory can be rebuilt from its receipts. Each receipt stores the full
+signal wire envelope, so a run
 persisted to disk reloads as verifiable receipts and exact typed signals. In a
 fresh process, import the modules that define your signal subclasses before
 replay so their wire names are registered; strict replay raises
@@ -913,7 +913,7 @@ structured `intercepted` and `edge_rejected` receipts for blocked attempts.
 
 ### Wire format & durability
 
-Signals serialize to a self-describing JSON envelope and reconstruct as their **original subclass**:
+Signals serialize to a self-describing JSON envelope and reconstruct as their original subclass:
 the foundation for persistence, durable replay, and crossing process or network
 boundaries. Subclasses register themselves automatically when their defining
 module is imported; no manual registration boilerplate:
