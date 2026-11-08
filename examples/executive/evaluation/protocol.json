@@ -1,0 +1,50 @@
+{
+  "version": "executive-comparison-v1",
+  "manifest_sha256": "c430db43d328d120c8bb54ef0e84c9a731203f7a0ddf90cbc4f4b6bcaf87958b",
+  "tuning_case_ids": [
+    "4249b428038757d9a7210096ac959d0a",
+    "4d2eee12674c59789565c7fb62d9d825",
+    "c3343a6d244b59b3bc595d402380f3cb",
+    "c36678ae55015ac7b08d7d8cd135129c",
+    "70a607401ff85f94b9415910b2f9091c",
+    "8c3a6f187d5158b08d52fa83df7cd46c"
+  ],
+  "heldout_case_ids": [
+    "4b4b25dbb6c25d369aee5f35697ae174",
+    "9d3cca9bb7de50c7a2b8771a0aa22ffb",
+    "9c7dee20df805fcb9a9c39d0653d9a10",
+    "10fe3a36f1b55f51933f6d65a68d9e81",
+    "c2a3a68a4ba85b4aad38cff58c7b1963",
+    "6468baa29d45531db46b8a781d6734bc",
+    "75bf02bc056a586c80612c140527c32c",
+    "5ca9fa3ba40f553486ae70cab83b6788",
+    "d1c9396de1f155fe85a57216f05b1cde",
+    "2c7f1fec1d8e5194b784ddac56d9a678",
+    "6a013eb2986450e3b5d860c98238168c",
+    "4b27935fdecf50f78bd4eb9b58e986b6",
+    "153c28c488175434b5b101c927d1aa9a",
+    "c997901f908c5ebfb4189c6a8153db87",
+    "c2dc3119b5d65b0aacf956fd43bd7ed5",
+    "25faca6c19205fe399a6c581b091ded0",
+    "4eb875a697e25f48b11cef7aaa63669b",
+    "5b660320260a5d25a3974a292d008d69",
+    "f2d8bfb70bcc5468b722f685fe4ec80f",
+    "d41fe828b87b54f89d1356024e3e100f",
+    "25e9900f6e065da59fff62d117c96525",
+    "a9350dd8575a548ca5148511d7fedb7e",
+    "a1bc923a65cb5b7596ef3ce922004217",
+    "a031ab9e60b45213ad41e7f615a1bb46"
+  ],
+  "arms": [
+    "notes",
+    "rules",
+    "executive",
+    "executive_no_memory_gating",
+    "executive_no_priority_scheduling"
+  ],
+  "trials": 3,
+  "minimum_resumption": 0.9,
+  "completion_improvement": 0.1,
+  "cost_reduction": 0.2,
+  "live": null
+}

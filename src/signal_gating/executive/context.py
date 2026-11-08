@@ -544,16 +544,7 @@ class ContextAssembler:
                 and principal.id not in r.shared_with
             )
         ]
-        candidates.sort(
-            key=lambda r: (
-                r.id not in linked,
-                not (
-                    r.id in supported or isinstance(r, Belief) and r.epistemic_status == "supported"
-                ),
-                -r.created_at.timestamp(),
-                r.id,
-            )
-        )
+        candidates = self._order_candidates(candidates, linked=linked, supported=supported)
         omitted: list[Ref] = []
         reasons: list[str] = []
         for candidate in candidates:
@@ -646,6 +637,27 @@ class ContextAssembler:
         except BaseException:
             self.artifacts.release_staged(staged.values())
             raise
+
+    def _order_candidates(
+        self, candidates: list[Belief | ArtifactRef], *, linked: set[str], supported: set[str]
+    ) -> list[Belief | ArtifactRef]:
+        """Rank optional evidence only; required inputs never enter this hook.
+
+        Trusted host overrides cannot bypass the later ACL/integrity/capacity
+        checks. Selected inputs still become mandatory reads and exact persisted
+        messages. The default policy is unchanged.
+        """
+        return sorted(
+            candidates,
+            key=lambda r: (
+                r.id not in linked,
+                not (
+                    r.id in supported or isinstance(r, Belief) and r.epistemic_status == "supported"
+                ),
+                -r.created_at.timestamp(),
+                r.id,
+            ),
+        )
 
     def _read(self, ref: ArtifactRef, *, principal: Principal, goal: Goal) -> str | None:
         if ref.media_type == CONTEXT_MEDIA_TYPE and principal.id not in ref.shared_with:

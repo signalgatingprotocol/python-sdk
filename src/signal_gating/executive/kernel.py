@@ -124,6 +124,10 @@ class Kernel:
     principals using ShareArtifact; publication never broadens access.
     """
 
+    # Trusted host subclasses may vary optional working-context selection.
+    # Admission, persistence and all mandatory authority checks remain here.
+    _context_assembler_type = ContextAssembler
+
     @classmethod
     def open(
         cls,
@@ -1008,7 +1012,7 @@ class Kernel:
                     and r.signal_kind == "evidence_request"
                     and r.scope.goal_id == goal.id
                 )
-                packet = ContextAssembler(
+                packet = self._context_assembler_type(
                     self.artifacts,
                     worker=wc,
                     counter=counter,

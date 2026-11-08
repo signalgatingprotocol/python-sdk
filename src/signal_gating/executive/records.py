@@ -759,6 +759,11 @@ class EvaluationResult(Model):
     # Optional measured fixture projection. passed/summary retain their meanings.
     metrics: dict[str, int] = Field(default_factory=dict)
     scope: Literal["synthetic_fixture", "observed_run"] = "synthetic_fixture"
+    trial: NonNegativeInt = 0
+    arm: str = ""
+    store_path: str | None = None
+    measurements: dict[str, NonNegativeInt | NonNegativeNumber | None] = Field(default_factory=dict)
+    usage_observations: tuple[Usage, ...] = ()
 
     case_id: Identifier
     policy_version: NonEmpty
@@ -776,3 +781,41 @@ class EvaluationReport(Model):
     results: tuple[EvaluationResult, ...]
     scope: Literal["synthetic_fixture", "observed_run"] = "synthetic_fixture"
     policy_versions: tuple[NonEmpty, ...] = ()
+    arm: str = ""
+    configuration_digest: str = ""
+    manifest_digest: str = ""
+    evaluation_kind: Literal["fresh", "replay"] = "fresh"
+    case_names: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def attempts(self) -> int:
+        return len(self.results)
+
+    @property
+    def accepted(self) -> bool:
+        return bool(self.results) and all(result.passed for result in self.results)
+
+    @property
+    def worker_calls(self) -> int:
+        return sum(r.metrics.get("worker_calls", 0) for r in self.results)
+
+    @property
+    def control_calls(self) -> int:
+        return sum(r.metrics.get("control_calls", 0) for r in self.results)
+
+    @property
+    def verifier_calls(self) -> int:
+        return sum(r.metrics.get("verifier_calls", 0) for r in self.results)
+
+    @property
+    def total_calls(self) -> int:
+        return self.worker_calls + self.control_calls + self.verifier_calls
+
+    @property
+    def cost_status(self) -> Literal["known", "unknown"]:
+        return (
+            "known"
+            if self.results
+            and all(r.measurements.get("cost_microunits") is not None for r in self.results)
+            else "unknown"
+        )
