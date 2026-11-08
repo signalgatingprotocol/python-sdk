@@ -186,6 +186,7 @@ class ArtifactVerifier:
 
     async def verify(self, criterion: Criterion, state: StateView) -> VerificationResult:
         goal = _goal(criterion, state)
+        refs = self.evidence
         try:
             reads = self._support(criterion, state)
             declared = tuple(
@@ -218,7 +219,14 @@ class ArtifactVerifier:
                 policy="artifact-integrity-v1",
             )
         except (ExecutiveError, ValueError, OSError):
-            return self._result(criterion, state, "insufficient_evidence", "artifact_unavailable")
+            return self._result(
+                criterion,
+                state,
+                "insufficient_evidence",
+                "artifact_unavailable",
+                evidence=refs,
+                policy="artifact-integrity-v1",
+            )
 
 
 class HumanApprovalVerifier(ArtifactVerifier):
@@ -283,6 +291,9 @@ class HumanApprovalVerifier(ArtifactVerifier):
 
 def _historical(artifacts: ArtifactStore, ref: Ref) -> Record | None:
     """Canonical post-images, including embedded definitions, for lineage only."""
+    current = records_by_id(artifacts.store.view()).get(ref.id)
+    if current is not None and current.revision == ref.revision:
+        return current
     for event in artifacts.store.events():
         if event.event_type != "state.changed":
             continue
@@ -293,6 +304,14 @@ def _historical(artifacts: ArtifactStore, ref: Ref) -> Record | None:
                     from pydantic import TypeAdapter
 
                     return TypeAdapter(PersistentRecord).validate_python(candidate)
+    # Goal controls/invalidation derive revisions instead of carrying explicit
+    # state.changed images. Replay is the authoritative source for those images.
+    historical = StateView()
+    for event in artifacts.store.events():
+        historical = reduce_event(historical, event)
+        candidate_record = records_by_id(historical).get(ref.id)
+        if candidate_record is not None and candidate_record.revision == ref.revision:
+            return candidate_record
     return None
 
 
@@ -763,6 +782,7 @@ class VerificationService:
         disposition: Disposition,
         reason: str,
         events: tuple[JournalEvent, ...] = (),
+        proof: tuple[Ref, ...] = (),
     ) -> CommitBatch:
         receipt = DecisionReceipt(
             created_at=self.clock(),
@@ -771,6 +791,7 @@ class VerificationService:
             reason_code=reason,
             policy_version="verification-v1",
             event_ids=tuple(e.id for e in events),
+            state_revisions=proof,
         )
         event = self._event((receipt,), Ref(id=self.principal.id))
         return CommitBatch(
@@ -886,6 +907,154 @@ class VerificationService:
                     return True
         return False
 
+    def _selected_evidence(
+        self, criterion: Criterion, goal: Goal, state: StateView
+    ) -> tuple[Ref, ...]:
+        """Reuse a stable selection, never discover an arbitrary latest artifact.
+
+        Finding creation is a trusted typed journal boundary. Its named Goal
+        image binds the full material criterion/configuration; lifecycle-only
+        revisions preserve that intent. Every selected ref is re-read afterward.
+        Failed rechecks retain the selection so absence cannot switch identities.
+        """
+        for finding in state.records:
+            if (
+                not isinstance(finding, VerificationResult)
+                or finding.criterion_id != criterion.id
+                or finding.verifier_id != criterion.verifier_id
+                or finding.policy_version != "artifact-integrity-v1"
+                or criterion.verifier_id != "artifact-integrity-v1"
+            ):
+                continue
+            goal_ref = next((r for r in finding.read_set if r.id == goal.id), None)
+            original = _historical(self.artifacts, goal_ref) if goal_ref is not None else None
+            if (
+                isinstance(original, Goal)
+                and goal_definition_digest(original) == goal_definition_digest(goal)
+                and criterion in original.criteria
+            ):
+                return finding.evidence
+        return ()
+
+    def _prerequisites(
+        self,
+        roots: tuple[Ref, ...],
+        goal: Goal,
+        state: StateView,
+        findings: Mapping[str, VerificationResult],
+    ) -> tuple[bool, tuple[Ref, ...]]:
+        """Revalidate explicit proof, including nested support and real bytes.
+
+        Only explicit dependencies demand completion/acceptance. Definition/data
+        reads still fence versions; an unrelated hypothesis or unverified
+        criterion definition cannot become a prerequisite merely by being read.
+        """
+        indexed = records_by_id(state)
+        materialized = {r.id: r for r in state.records}
+        pending = [(r, True) for r in roots]
+        seen: set[tuple[str, bool]] = set()
+        reads: list[Ref] = []
+        valid = True
+
+        def finding_support(finding: VerificationResult) -> None:
+            for support in finding.read_set:
+                current = indexed.get(support.id)
+                if isinstance(current, (Goal, TaskFrame, Episode)) and _lineage_current(
+                    self.artifacts, support, state, lifecycle_ids=frozenset((support.id,))
+                ):
+                    reads.append(support)
+                    support = reference(current)
+                pending.append((support, False))
+            pending.extend(
+                (r, isinstance(indexed.get(r.id), (Belief, VerificationResult)))
+                for r in finding.evidence
+            )
+
+        while pending:
+            ref, explicit = pending.pop()
+            item = indexed.get(ref.id)
+            if item is None:
+                valid = False
+                continue
+            reads.append(ref)
+            if item.revision != ref.revision or (
+                ref.kind != "record" and ref.kind != getattr(item, "kind", None)
+            ):
+                valid = False
+                reads.append(reference(item))
+            if (item.id, explicit) in seen:
+                continue
+            seen.add((item.id, explicit))
+            if isinstance(item, ArtifactRef):
+                try:
+                    self.artifacts.read(item, principal=self.principal, goal_id=goal.id)
+                except (ExecutiveError, OSError, ValueError):
+                    valid = False
+            elif isinstance(item, Belief):
+                if explicit and item.epistemic_status != "supported":
+                    valid = False
+                if explicit or item.epistemic_status == "supported":
+                    now = self.clock()
+                    if (item.valid_from is not None and now < item.valid_from) or (
+                        item.valid_until is not None and now >= item.valid_until
+                    ):
+                        valid = False
+                    pending.extend(
+                        (r, isinstance(indexed.get(r.id), (Belief, VerificationResult)))
+                        for r in item.evidence
+                    )
+            elif isinstance(item, Criterion):
+                if explicit:
+                    finding = findings.get(item.id) or next(
+                        (
+                            r
+                            for r in state.records
+                            if isinstance(r, VerificationResult) and r.criterion_id == item.id
+                        ),
+                        None,
+                    )
+                    if finding is None or finding.disposition != "accept":
+                        valid = False
+                    elif item.id in findings:
+                        finding_support(finding)
+                    else:
+                        pending.append((reference(finding), True))
+                pending.extend(
+                    (r, explicit and isinstance(indexed.get(r.id), (Belief, VerificationResult)))
+                    for r in (*item.inputs, *item.required_evidence)
+                )
+            elif isinstance(item, VerificationResult):
+                if explicit and item.disposition != "accept":
+                    valid = False
+                if item.disposition == "accept":
+                    finding_support(item)
+            elif isinstance(item, (TaskFrame, Commitment, Goal, ActionRecord)):
+                if explicit and not _dependency_satisfied(item, materialized):
+                    valid = False
+                if isinstance(item, (TaskFrame, Commitment)):
+                    if explicit:
+                        pending.extend((r, True) for r in item.dependencies)
+                    if isinstance(item, Commitment) and explicit:
+                        pending.extend(
+                            (reference(r), True)
+                            for r in state.records
+                            if isinstance(r, TaskFrame) and r.commitment_id == item.id
+                        )
+                elif isinstance(item, Goal) and explicit:
+                    pending.extend((reference(c), True) for c in item.criteria if c.required)
+                    pending.extend(
+                        (reference(r), True)
+                        for r in state.records
+                        if isinstance(r, Commitment)
+                        and r.goal_id == item.id
+                        and (r.required or r.id in item.required_commitment_ids)
+                    )
+                elif isinstance(item, ActionRecord) and explicit:
+                    pending.extend((r, False) for r in (*item.read_set, *item.evidence))
+            elif explicit:
+                valid = False
+        return valid, tuple(dict.fromkeys(reads))
+
     async def _evaluate(
         self,
         goal: Goal,
@@ -901,7 +1070,9 @@ class VerificationService:
         # Intake requests are durable evidence selection, not success. Preserve
         # their selection across later rechecks, while every byte/version/access
         # check still happens below against current authoritative state.
-        attached: dict[str, tuple[Ref, ...]] = dict(extras)
+        attached: dict[str, tuple[Ref, ...]] = {
+            c.id: extras.get(c.id) or self._selected_evidence(c, goal, state) for c in goal.criteria
+        }
         for signal in state.records:
             if (
                 not isinstance(signal, ExecutiveSignal)
@@ -1045,10 +1216,45 @@ class VerificationService:
         passed = all(
             r.disposition == "accept" for r in results if r.criterion_id in required
         ) and bool(required)
-        clear = constraints.disposition == "authorize" and not self._unsettled(goal, state)
+        findings = {r.criterion_id: r for r in results}
+        commitments = {
+            r.id: r for r in state.records if isinstance(r, Commitment) and r.goal_id == goal.id
+        }
+        needed = set(goal.required_commitment_ids) | {
+            r.id for r in commitments.values() if r.required
+        }
+        prerequisites: dict[str, tuple[bool, tuple[Ref, ...]]] = {
+            c.id: self._prerequisites(c.dependencies, goal, state, findings)
+            for c in commitments.values()
+        }
+        for frame in state.records:
+            if isinstance(frame, TaskFrame) and frame.goal_id == goal.id:
+                associated = commitments.get(frame.commitment_id)
+                roots = (*frame.dependencies, *(associated.dependencies if associated else ()))
+                prerequisites[frame.id] = self._prerequisites(roots, goal, state, findings)
+        required_support = all(prerequisites[identifier][0] for identifier in needed) and all(
+            prerequisites[r.id][0]
+            for r in state.records
+            if isinstance(r, TaskFrame) and r.goal_id == goal.id and r.commitment_id in needed
+        )
+        proof = tuple(dict.fromkeys(r for _, reads in prerequisites.values() for r in reads))
+        clear = (
+            constraints.disposition == "authorize"
+            and not self._unsettled(goal, state)
+            and required_support
+        )
         events: list[JournalEvent] = []
         working = state
-        if goal.status == "completed" and not (passed and clear):
+        if (goal.status == "completed" and not (passed and clear)) or (
+            not required_support
+            and any(
+                isinstance(r, (TaskFrame, Commitment))
+                and r.status == "completed"
+                and r.id in prerequisites
+                and not prerequisites[r.id][0]
+                for r in state.records
+            )
+        ):
             for event in invalidate_dependents(state, (reference(goal),)):
                 event = event.model_copy(update={"sequence": working.sequence + 1})
                 working = reduce_event(working, event)
@@ -1084,13 +1290,14 @@ class VerificationService:
             and (task is None or r.id == task.id)
         ]
         for frame in verifying:
-            dependencies = all(
+            associated = commitments.get(frame.commitment_id)
+            dependencies = prerequisites[frame.id][0] and all(
                 (item := current.get(ref.id)) is not None
                 and item.revision == ref.revision
                 and _dependency_satisfied(
                     item, {r.id: r for r in (*working.records, *writes.values())}
                 )
-                for ref in frame.dependencies
+                for ref in (*frame.dependencies, *(associated.dependencies if associated else ()))
             )
             effects = all(
                 getattr(current.get(identifier), "status", None) == "succeeded"
@@ -1148,10 +1355,39 @@ class VerificationService:
                         "revision": frame.revision + 1,
                         "status": "blocked",
                         "wake_condition": WakeCondition(
-                            kind="human_decision", reason_code="completion_dependencies_unsettled"
+                            kind="dependency_change" if not dependencies else "human_decision",
+                            refs=prerequisites[frame.id][1],
+                            reason_code="completion_prerequisites_unsettled"
+                            if not dependencies
+                            else "completion_dependencies_unsettled",
                         ),
                     }
                 )
+        # Reopened completed work and pending frames must not remain runnable
+        # merely because a now-expired belief still says supported in its DTO.
+        for candidate in working.records:
+            if (
+                not isinstance(candidate, (TaskFrame, Commitment))
+                or candidate.id not in prerequisites
+                or prerequisites[candidate.id][0]
+                or candidate.id in writes
+            ):
+                continue
+            if (
+                candidate.status not in {"ready", "running", "verifying", "suspended", "blocked"}
+                or current_goal.status != "active"
+            ):
+                continue
+            updates: dict[str, Any] = {"revision": candidate.revision + 1, "status": "blocked"}
+            if isinstance(candidate, TaskFrame):
+                updates["wake_condition"] = WakeCondition(
+                    kind="dependency_change",
+                    refs=prerequisites[candidate.id][1],
+                    reason_code="completion_prerequisites_unsettled",
+                )
+                if candidate.status == "running":
+                    updates["fencing_token"] = candidate.fencing_token + 1
+            writes[candidate.id] = candidate.model_copy(update=updates)
         # Material evidence can release a verification-only block; scheduler owns
         # readiness and corrected-frame resumption after this suspended handoff.
         if passed:
@@ -1159,7 +1395,17 @@ class VerificationService:
                 if (
                     isinstance(candidate_frame, TaskFrame)
                     and candidate_frame.goal_id == goal.id
-                    and candidate_frame.failure_reason == "verification_failed"
+                    and (
+                        candidate_frame.failure_reason == "verification_failed"
+                        or (
+                            current_goal.status == "active"
+                            and candidate_frame.status == "blocked"
+                            and candidate_frame.wake_condition is not None
+                            and candidate_frame.wake_condition.reason_code
+                            == "completion_prerequisites_unsettled"
+                            and prerequisites[candidate_frame.id][0]
+                        )
+                    )
                     and candidate_frame.id not in writes
                 ):
                     writes[candidate_frame.id] = candidate_frame.model_copy(
@@ -1190,6 +1436,7 @@ class VerificationService:
             ]
             if (
                 frames
+                and prerequisites[commitment.id][0]
                 and all(r.status == "completed" for r in frames)
                 and all(
                     (item := current.get(ref.id)) is not None
@@ -1221,11 +1468,6 @@ class VerificationService:
                     update={"revision": value.revision + 1, "status": "completed"}
                 )
                 combined[value.id] = writes[value.id]
-        needed = set(goal.required_commitment_ids) | {
-            r.id
-            for r in combined.values()
-            if isinstance(r, Commitment) and r.goal_id == goal.id and r.required
-        }
         if (
             passed
             and clear
@@ -1278,6 +1520,18 @@ class VerificationService:
             "accept" if passed and clear else "insufficient_evidence",
             reason,
             tuple(events),
+            proof=tuple(
+                dict.fromkeys(
+                    (
+                        *proof,
+                        *(
+                            reference(r)
+                            for r in writes.values()
+                            if isinstance(r, VerificationResult)
+                        ),
+                    )
+                )
+            ),
         )
 
     def _repair_inputs(self, criterion: Criterion) -> dict[str, str] | None:

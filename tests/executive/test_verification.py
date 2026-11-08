@@ -1150,3 +1150,225 @@ async def test_failed_recheck_blocks_explicit_prerequisite_instead_of_invalid_re
     store.commit(await service(setup).evaluate(proposal, store.view()))
     assert get(store, TASK_ID).status == "blocked"
     assert finding(store).disposition == "insufficient_evidence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dependency_owner", ["task", "commitment"])
+@pytest.mark.parametrize("after_completion", [False, True])
+async def test_explicit_prerequisite_expiry_after_claim_blocks_completion(
+    setup, dependency_owner, after_completion
+):
+    store, artifacts, a = setup
+    prerequisite = Belief(
+        claim="Explicit prerequisite",
+        scope=Scope(goal_id=GOAL_ID),
+        epistemic_status="supported",
+        valid_until=NOW + timedelta(seconds=1),
+    )
+    store.commit(CommitBatch(events=(event((prerequisite,)),)))
+    target = get(store, TASK_ID if dependency_owner == "task" else COMMITMENT_ID)
+    change(store, target, dependencies=(reference(prerequisite),))
+    proposal = claim(store, (reference(a),))
+    if after_completion:
+        store.commit(await service(setup).evaluate(proposal, store.view()))
+        assert get(store, GOAL_ID).status == "completed"
+    svc = VerificationService(
+        artifacts, principal=owner(), clock=lambda: NOW + timedelta(seconds=2)
+    )
+    batch = await (
+        svc.reverify(GOAL_ID, store.view())
+        if after_completion
+        else svc.evaluate(proposal, store.view())
+    )
+    store.commit(batch)
+    assert get(store, GOAL_ID).status == "active"
+    assert get(store, COMMITMENT_ID).status != "completed"
+    assert get(store, TASK_ID).status == "blocked"
+    assert reference(prerequisite) in batch.response_receipt.state_revisions
+    assert reference(prerequisite) in batch.expected_revisions
+    assert rebuild(store.events()) == store.view()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dependency_owner", ["task", "commitment"])
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "revoked"])
+@pytest.mark.parametrize("after_completion", [False, True])
+async def test_explicit_prerequisite_transitive_artifact_support_rechecked(
+    setup, dependency_owner, damage, after_completion
+):
+    store, artifacts, a = setup
+    verifier = owner(id="a" * 32, roles=("verifier",))
+    store.commit(CommitBatch(events=(event((verifier,)),)))
+    prerequisite_artifact = artifacts.put(
+        b"prerequisite bytes", principal=owner(), goal_id=GOAL_ID, media_type="text/plain"
+    )
+    for artifact in (a, prerequisite_artifact):
+        store.commit(
+            Intake(store).accept(
+                ShareArtifact(artifact_id=artifact.id, principal_ids=(verifier.id,)),
+                principal=owner(),
+                state=store.view(),
+            )
+        )
+    a, prerequisite_artifact = get(store, a.id), get(store, prerequisite_artifact.id)
+    g = get(store, GOAL_ID)
+    change(
+        store,
+        g,
+        criteria=(
+            g.criteria[0].model_copy(update={"revision": 3, "required_evidence": (reference(a),)}),
+        ),
+    )
+    inner = Belief(
+        claim="Underlying support",
+        scope=Scope(goal_id=GOAL_ID),
+        epistemic_status="supported",
+        evidence=(reference(prerequisite_artifact),),
+    )
+    outer = Belief(
+        claim="Explicit transitive prerequisite",
+        scope=Scope(goal_id=GOAL_ID),
+        epistemic_status="supported",
+        evidence=(reference(inner),),
+    )
+    store.commit(CommitBatch(events=(event((inner, outer)),)))
+    target = get(store, TASK_ID if dependency_owner == "task" else COMMITMENT_ID)
+    change(store, target, dependencies=(reference(outer),))
+    svc = VerificationService(artifacts, principal=verifier, clock=lambda: NOW)
+    proposal = claim(store, (reference(a),))
+    if after_completion:
+        store.commit(await svc.evaluate(proposal, store.view()))
+        assert get(store, GOAL_ID).status == "completed"
+    if damage == "missing":
+        (store.root / prerequisite_artifact.storage_location).unlink()
+    elif damage == "corrupt":
+        (store.root / prerequisite_artifact.storage_location).write_bytes(b"corrupt")
+    else:
+        change(store, prerequisite_artifact, shared_with=())
+    batch = await (
+        svc.reverify(GOAL_ID, store.view())
+        if after_completion
+        else svc.evaluate(proposal, store.view())
+    )
+    store.commit(batch)
+    assert get(store, GOAL_ID).status == "active"
+    assert get(store, TASK_ID).status == "blocked"
+    assert get(store, COMMITMENT_ID).status != "completed"
+    assert {outer.id, inner.id, prerequisite_artifact.id} <= {
+        r.id for r in batch.response_receipt.state_revisions
+    }
+    if damage == "missing":
+        (store.root / prerequisite_artifact.storage_location).write_bytes(b"prerequisite bytes")
+        store.commit(await svc.reverify(GOAL_ID, store.view()))
+        assert get(store, TASK_ID).status == "suspended"
+        assert get(store, TASK_ID).wake_condition is None
+        assert get(store, GOAL_ID).status == "active"
+    assert rebuild(store.events()) == store.view()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["invalid", "missing", "corrupt"])
+async def test_claim_only_selection_survives_reverify_and_real_restart(setup, damage):
+    store, artifacts, a = setup
+    g = get(store, GOAL_ID)
+    change(
+        store,
+        g,
+        criteria=(g.criteria[0].model_copy(update={"revision": 3, "required_evidence": ()}),),
+    )
+    store.commit(await service(setup).evaluate(claim(store, (reference(a),)), store.view()))
+    initial = finding(store)
+    assert initial.disposition == "accept"
+    assert get(store, GOAL_ID).status == "completed"
+    store.commit(await service(setup).reverify(GOAL_ID, store.view()))
+    assert get(store, GOAL_ID).status == "completed"
+    assert finding(store).disposition == "accept"
+    root = store.root
+    store.close()
+    with Store.open(root) as reopened:
+        svc = VerificationService(ArtifactStore(reopened), principal=owner(), clock=lambda: NOW)
+        reopened.commit(await svc.reverify(GOAL_ID, reopened.view()))
+        assert get(reopened, GOAL_ID).status == "completed"
+        assert finding(reopened).id == initial.id
+        assert finding(reopened).evidence == (reference(a),)
+        if damage == "invalid":
+            ArtifactStore(reopened).delete(get(reopened, a.id), principal=owner())
+        elif damage == "missing":
+            (root / a.storage_location).unlink()
+        else:
+            (root / a.storage_location).write_bytes(b"corrupt")
+        ArtifactStore(reopened).put(
+            b"newer unselected content", principal=owner(), goal_id=GOAL_ID, media_type="text/plain"
+        )
+        reopened.commit(await svc.reverify(GOAL_ID, reopened.view()))
+        assert get(reopened, GOAL_ID).status == "active"
+        assert finding(reopened).disposition == "insufficient_evidence"
+        assert finding(reopened).evidence == (reference(a),)
+        reopened.commit(await svc.reverify(GOAL_ID, reopened.view()))
+        assert finding(reopened).evidence == (reference(a),)
+        assert finding(reopened).disposition == "insufficient_evidence"
+        assert rebuild(reopened.events()) == reopened.view()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("correction", ["outcome", "criterion"])
+async def test_claim_only_selection_does_not_survive_material_correction(setup, correction):
+    store, _, a = setup
+    g = get(store, GOAL_ID)
+    change(
+        store,
+        g,
+        criteria=(g.criteria[0].model_copy(update={"revision": 3, "required_evidence": ()}),),
+    )
+    store.commit(await service(setup).evaluate(claim(store, (reference(a),)), store.view()))
+    g = get(store, GOAL_ID)
+    changes = (
+        {"outcome": "Different material goal"}
+        if correction == "outcome"
+        else {
+            "criteria": (
+                g.criteria[0].model_copy(
+                    update={"revision": 4, "description": "Different artifact selection"}
+                ),
+            )
+        }
+    )
+    store.commit(
+        Intake(store).accept(
+            ReviseGoal(goal_id=g.id, expected_revision=g.revision, **changes),
+            principal=owner(),
+            state=store.view(),
+        )
+    )
+    # The existence of any newer artifact cannot stand in for a selected input.
+    setup[1].put(b"unselected", principal=owner(), goal_id=GOAL_ID, media_type="text/plain")
+    store.commit(await service(setup).reverify(GOAL_ID, store.view()))
+    assert get(store, GOAL_ID).status == "active"
+    assert finding(store).disposition == "insufficient_evidence"
+    assert finding(store).evidence == ()
+
+
+@pytest.mark.asyncio
+async def test_prerequisite_definition_evidence_is_not_an_unverified_prerequisite(setup):
+    store, _, a = setup
+    data = Belief(claim="Uncertain definition input", scope=Scope(goal_id=GOAL_ID))
+    store.commit(CommitBatch(events=(event((data,)),)))
+    definition = criterion(
+        id="e" * 32,
+        verifier_id="unconfigured-definition",
+        required=False,
+        inputs=(reference(data),),
+    )
+    g = get(store, GOAL_ID)
+    change(store, g, criteria=(*g.criteria, definition))
+    supported = Belief(
+        claim="Support names a current definition",
+        scope=Scope(goal_id=GOAL_ID),
+        epistemic_status="supported",
+        evidence=(reference(definition),),
+    )
+    store.commit(CommitBatch(events=(event((supported,)),)))
+    change(store, get(store, TASK_ID), dependencies=(reference(supported),))
+    store.commit(await service(setup).evaluate(claim(store, (reference(a),)), store.view()))
+    assert get(store, TASK_ID).status == "completed"
+    assert get(store, GOAL_ID).status == "completed"
